@@ -1294,19 +1294,35 @@ def _build_channel_identity_directive(channel_phone: Optional[str]) -> str:
     if not channel_phone:
         return (
             "============================================================\n"
-            "CHANNEL IDENTITY: NONE AVAILABLE\n"
+            "CHANNEL IDENTITY: NONE AVAILABLE - HARD OVERRIDE\n"
             "============================================================\n"
-            "There is no verified channel number for this conversation, so "
-            "the \"shall we use this same WhatsApp number?\" question does "
-            "not apply - ask the user to type their number when one is "
-            "genuinely needed.\n\n"
+            "There is NO verified WhatsApp/channel number for this "
+            "conversation (this is a web-widget/Messenger conversation, "
+            "not WhatsApp).\n\n"
+            "THIS OVERRIDES ANY OTHER INSTRUCTION BELOW, INCLUDING ONES "
+            "THAT SAY \"ALWAYS ASK\" OR \"NOT OPTIONAL\": those instructions "
+            "(STEP NB6 in the NEW BOOKING flow, and the equivalent step in "
+            "the COMPLAINT flow) are written assuming a channel identity "
+            "exists. It does NOT exist in this conversation, so they do "
+            "NOT apply here.\n\n"
+            "Concretely: NEVER ask \"shall we continue with the same "
+            "WhatsApp number?\" / \"نكمل بنفس رقم الواتساب ده؟\" or any "
+            "variant of that yes/no question anywhere in this "
+            "conversation - there is no number for it to refer to, so the "
+            "question would be meaningless and confusing. Instead, "
+            "whenever a phone number is genuinely needed, ask the user "
+            "directly and openly for their mobile number (with country "
+            "code), then proceed with the normal validate -> "
+            "`compare_phone` -> `send_otp`/`verify_otp` flow exactly as "
+            "you would for any first-time number.\n\n"
         )
 
     return (
         "============================================================\n"
         f"CHANNEL IDENTITY (THE USER'S OWN WHATSAPP NUMBER): {channel_phone}\n"
         "============================================================\n"
-        "Wherever any flow below needs the user's WhatsApp/channel "
+        "This conversation DOES have a verified WhatsApp/channel number "
+        "(shown above, never to be printed in a reply). Wherever any flow "
         f"number as a VALUE - passing it to a tool, saving it on a "
         f"booking or a complaint - that number is {channel_phone}. Use it "
         "directly; never ask them to type a number they are already "
@@ -1733,7 +1749,17 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive
         + booking_confirmation_directive + booking_success_directive
-        + channel_identity_directive + scoped_prompt
+        + scoped_prompt
+        # CHANNEL IDENTITY goes LAST, after scoped_prompt (STEP NB6/
+        # complaint flow), not before it. Confirmed real production bug:
+        # with this directive earlier in the concatenation, the model
+        # still obeyed STEP NB6's own "ALWAYS ASK THIS - NOT OPTIONAL"
+        # wording and asked the same-WhatsApp-number question even with
+        # an empty channel_phone, because that later, more emphatic
+        # instruction won out. Placing the (now equally emphatic, and
+        # explicitly overriding) channel-identity directive AFTER it
+        # gives it the final word for this turn.
+        + channel_identity_directive
     )
 
     if not state.get("greeted"):
