@@ -83,8 +83,6 @@ _TOOL_GROUPS: Dict[str, tuple] = {
         "find_available_doctors",
         "find_best_doctor_in_specialty",
         "list_specialties",
-        "match_entity_for_booking",
-        "match_entity_info",
     ),
 
     "searching_branches": (
@@ -138,6 +136,23 @@ _TOOL_GROUPS: Dict[str, tuple] = {
 _GROUP_FOR_TOOL: Dict[str, str] = {
     tool: group for group, tools in _TOOL_GROUPS.items() for tool in tools
 }
+
+# Fast entity-resolution tools that finish almost instantly and are
+# ALWAYS immediately followed, within the same turn, by the actual slow
+# thing the patient is waiting for (a slot search, a booking lookup...).
+# Confirmed real production bug: `match_entity_for_booking` alone was
+# enough to fire "جاري البحث عن الأطباء" - by the time the patient saw
+# it, that quick resolver had already finished and the turn had moved on
+# to a genuinely slow call (e.g. list_available_days_for_booking), but
+# "one message per turn" meant the now-stale wording never got
+# corrected. So a schedule() call made up ENTIRELY of these tools is
+# deliberately a no-op: no timer, no delivery - leaving the turn's timer
+# unarmed so the next (slower, real) tool call is what actually fires
+# the message, with the RIGHT wording.
+_SILENT_RESOLVER_TOOLS = frozenset({
+    "match_entity_for_booking",
+    "match_entity_info",
+})
 
 # Order of precedence when one turn calls several tools at once: the
 # patient should be told about the most significant thing happening, not
@@ -285,6 +300,13 @@ def schedule(
     try:
         names = list(tool_names or [])
         if not names:
+            return
+
+        if names and all(n in _SILENT_RESOLVER_TOOLS for n in names):
+            # Nothing worth announcing yet - see _SILENT_RESOLVER_TOOLS.
+            # Leave any already-armed timer from earlier in this turn
+            # alone; just don't let THIS call arm one or overwrite the
+            # pending wording with a resolver-only description.
             return
 
         text = message_for(names, language, templates)
