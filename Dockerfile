@@ -29,4 +29,7 @@ COPY . .
 # Railway sets PORT at runtime; 8000 is only the local default.
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# No shell, no variable expansion: start.py reads PORT itself. See the
+# comment at the top of that file for why $PORT in a start command is
+# unreliable across launchers.
+CMD ["python", "start.py"]
