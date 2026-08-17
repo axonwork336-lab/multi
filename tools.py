@@ -2047,11 +2047,18 @@ def _is_generic_entity_word(user_input: str, entity_type: str) -> bool:
 
 
 # Words that make a message a REQUEST TO SEE THE LIST rather than a name.
+# Both the definite and bare forms are listed on purpose: patients drop
+# the "ال" constantly ("اعرض الدكاتره متاحه"), and a cue list that only
+# had "المتاحه" let that exact sentence fall through to name matching -
+# confirmed in production.
 _LIST_REQUEST_CUES = (
     "اعرض", "اعرضلي", "عرض", "وريني", "اوريني", "ورني", "شوفني", "اشوف",
     "شوف", "هات", "هاتلي", "جبلي", "ادينى", "ادينی", "قائمه", "قائمة",
-    "لستة", "لسته", "كل", "جميع", "كافه", "كافة", "المتاح", "المتاحه",
-    "المتاحين", "المتوفرين", "المتوفره", "الموجودين", "مين", "ايه", "ما",
+    "لستة", "لسته", "كل", "جميع", "كافه", "كافة", "مين", "ايه", "ما",
+    "متاح", "متاحه", "متاحة", "متاحين", "المتاح", "المتاحه", "المتاحة",
+    "المتاحين", "متوفر", "متوفره", "متوفرين", "المتوفر", "المتوفره",
+    "المتوفرين", "موجود", "موجوده", "موجودين", "الموجودين", "الموجوده",
+    "عندكو", "فاضي", "فاضيين",
     "show", "list", "all", "available", "who", "which", "see", "view",
 )
 
@@ -2195,7 +2202,54 @@ def match_entity_for_booking(
 
     if entity_type == "doctor":
         branch_filter = [session["branch_id"]] if session.get("branch_id") else None
-        result = api.get_doctors(base_url, branch_ids=branch_filter, page_size=200, language=conversation_language(state))
+
+        # NARROW THE QUERY. This used to ask the hospital's API for every
+        # doctor in the system with no filters at all, which on a real
+        # tenant took longer than the 15s HTTP timeout and ended the turn
+        # with "فيه مشكلة تقنية" - while find_available_doctors, hitting
+        # the SAME endpoint with these filters applied, answered the same
+        # question in under a second. Confirmed against production logs
+        # minutes apart.
+        #
+        # It is also the more correct list: this tool exists to pick a
+        # doctor for a NEW BOOKING, and a doctor with no published
+        # service or no schedule cannot be booked, so listing them only
+        # offers the patient choices that dead-end.
+        now = datetime.utcnow()
+        window_start = now.isoformat() + "Z"
+        window_end = (now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat() + "Z"
+
+        result = api.get_doctors(
+            base_url,
+            specialty_ids=session.get("specialty_ids") or None,
+            branch_ids=branch_filter,
+            has_published_service=True,
+            has_service_schedule=True,
+            intersection_start=window_start,
+            intersection_end=window_end,
+            page_size=200,
+            language=conversation_language(state),
+        )
+
+        # RESOLVE MODE SAFETY NET: the patient named a specific doctor
+        # and the narrowed list didn't contain them. Widen once before
+        # concluding "no such doctor" - they may be real but fully
+        # booked, and "we couldn't find that doctor" would be wrong and
+        # confusing. Deliberately NOT done for list mode, where an empty
+        # narrowed list is the honest answer.
+        wants_specific_doctor = bool((user_input or "").strip())
+        if wants_specific_doctor and result.get("success"):
+            narrowed = (result["data"] or {}).get("items", [])
+            if not narrowed:
+                logger.info(
+                    "match_entity_for_booking: narrowed doctor list was empty for %r - widening once",
+                    user_input,
+                )
+                result = api.get_doctors(
+                    base_url, branch_ids=branch_filter, page_size=200,
+                    language=conversation_language(state),
+                )
+
         name_keys = ["formatedName", "altName", "name"]
     elif session.get("doctor_id"):
         # A doctor is already confirmed - only offer branches where THIS
