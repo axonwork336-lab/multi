@@ -1,0 +1,58 @@
+id,client_id,clinic_name,clinic_name_ar,agent_name,agent_name_ar,dialect_instruction,timezone,country_codes_hint,phone_example,base_url,whatsapp_phone_number_id,staff_alert_number,trunk_number_3cx,webhook_3cx,escalation_api_key,media_proxy_url,branch1_name,branch1_name_ar,branch1_lat,branch1_lng,branch1_address,branch2_name,branch2_name_ar,branch2_lat,branch2_lng,branch2_address,msg_unknown_fallback,msg_media_canned,msg_handoff_confirmation,msg_back_to_ai,msg_patient_booking_number,msg_booking_confirmation,msg_booking_success,msg_On_failure,media_proxy_key,Dialect,Dialect_id,createdAt,updatedAt,doctors_base_url,knowledge_base_file,complaint_email_to
+1,Dar El Oyoun-demo,Dar El Oyoun Hospitals,مستشفى دار العيون,Latifa,لطيفة,"Egyptian Arabic dialect (العامية المصرية) with emojis unless the user writes in another language. Sound like a warm, friendly Egyptian receptionist. Canonical reply examples: «مش لاقي دكتور بالاسم ده 🔍، حابب تشوف قائمة الدكاتره؟», «حصل خطأ في جلب المواعيد ❌، حابب نحاول تاني؟», «تمام! هنرجع لـ… 🔄», «كل المواعيد محجوزة ❌، حابب يوم تاني؟», «حابب تبدأ بالدكتور ولا بالفرع؟ 😊», «الدكتور عنده أكتر من خدمة، اختار الخدمة:», «ممكن رقم موبايلك؟», «حاضر يا فندم، ثواني واحدة». Use هـ/حـ future marker, «حابب», «مش», «أكتر», «ده/دي». Never use Gulf markers: «راح», «تبغى», «تبي», «ابي», «وش», «بهالاسم», «هالـ».",Africa/Cairo,"+966, +20",+966555123456 أو +201155611045,https://demo.catalystsystems.io:1102,950703348137680,966568199862,9710000000004,https://axon.3cx.ae/sms/generic/4c47069bbe164669bb6dbde20e97ec89,232090540920391140,https://n8n.axonbi.com/webhook/89d742a9-2ce1-4ef7-805f-c5f0089ea55e,Al Sheikh Zayed,الشيخ زايد,30.0221732,31.0066937,"First Al Sheikh Zayed, Giza Governorate 3245501",Dokki,الدقي,30.0386099,31.2096194,"11 Mohammed El-Ghazaly, Ad Doqi, Dokki, Giza Governorate 3751112","أهلاً بيك 👋
+أنا لطيفة، المساعدة الافتراضية في مستشفى دار العيون، وسعيدة إني أخدمك النهارده 🌷
+أقدر أساعدك في:
+🗓️ حجز معاد جديد
+✏️ تعديل أو إلغاء معاد قائم
+🩺 التوجيه الطبي لاختيار التخصص أو الدكتور المناسب
+ℹ️ الاستفسار عن خدمات المستشفى والأطباء
+📝 تقديم شكوى أو اقتراح
+👤 الكلام مع أحد ممثلي خدمة العملاء
+
+أقدر أساعدك إزاي النهارده؟ 😊","وصلني الملف اللي بعتّه 📎
+للأسف مش بقدر أفتح الصور أو الملفات دلوقتي، لكن أقدر أحوّلك لموظف خدمة العملاء يشوفه ويساعدك — بس اكتب لي «موظف» وهحوّلك فوراً 👤
+أو اكتب لي طلبك كتابةً (حجز، استفسار، تعديل معاد…) وهكمّل معاك على طول 😊","تم تحويلك لأحد ممثلي خدمة العملاء 🌷
+هيتم الرد عليك هنا في أقرب وقت.","تم إنهاء المحادثة مع خدمة العملاء ✅
+أنا لطيفة، المساعدة الافتراضية، تحت أمرك تاني 😊",حابب تحجز على نفس رقم الواتساب ده؟ ✅,"
+تمام، خليني أراجع معاك بيانات الحجز قبل ما نأكده:
+  🏥 الفرع: [branchName]
+  👨‍⚕️ الدكتور: [doctorName]
+  📅 التاريخ: [اسم اليوم] [DD-MM-YYYY]
+  🕐 الميعاد: [slotStartViewAr]
+  👤 الاسم: [patientFullName]
+  📱 رقم الموبايل: [mobileNumber]
+  📧 الإيميل: [email]
+
+ البيانات دي كلها صح؟ تحب نأكد الحجز؟","✅ تم تأكيد حجز موعدك بنجاح
+🎉 رقم الحجز: [booking id]
+📌 احتفظ برقم الحجز ده عشان هتحتاجه لو حبيت تلغي الحجز أو تغيّر ميعاده.","""حدث خطأ تقني 😕. تحب تحاول مرة ثانية؟""",232090540920391140,Egyptian,1,2026-07-12T10:09:16.369Z,2026-07-16T10:48:42.321Z,,,
+2,tanasuq-saudi,Tanasuq Medical Center,مستشفى تناسق الطبية,Latifa,لطيفة,"Saudi Arabic dialect with emojis unless the user writes in another language. Warm, respectful Saudi tone. Canonical reply examples: «ما لقيت دكتور بهالاسم 🔍، تبغى تشوف قائمة الدكاتره؟», «حدث خطأ في جلب المواعيد ❌، تبي نحاول مرة ثانية؟», «تمام! راح نرجع لـ… 🔄», «كل المواعيد محجوزة ❌، تبغى يوم ثاني؟», «تفضل تبدأ بالدكتور أو بالفرع؟ 😊», «أبشر، لحظة واحدة», «ممكن رقم جوالك؟». Use «تبغى», «راح», «وش». Never use Egyptian markers: «عايز», «هـ» future, «يا فندم», «معاد», «دلوقتي».",Asia/Riyadh,"+966, +20",+966555123456 أو +201155611045,https://demo.catalystsystems.io:1302,950703348137680,966568199862,9710000000003,https://axon.3cx.ae/sms/generic/4c47069bbe164669bb6dbde20e97ec89,232090540920391140,https://n8n.axonbi.com/webhook/tanasuq-demo-media,Al Nozha,النزهة,24.756069,46.706579,"QP44+CJG An Nuzhah, Riyadh Saudi Arabia",Al Manar,المنار,24.723,46.7928,"Al Manar, Riyadh, Saudi Arabia","أهلاً وسهلاً بك 👋
+أنا لطيفة، المساعدة الافتراضية في مستشفى تناسق الطبية، ويسعدني خدمتك اليوم 🌷
+يمكنني مساعدتك في:
+🗓️ حجز موعد جديد
+✏️ تعديل أو إلغاء موعد قائم
+🩺 التوجيه الطبي لاختيار التخصص أو الطبيب المناسب
+ℹ️ الاستفسار عن خدمات المستشفى والأطباء
+📝 تقديم شكوى أو اقتراح
+👤 التحدث مع أحد ممثلي خدمة العملاء، فقط اطلب مني ذلك وسأقوم بتحويلك
+
+كيف أستطيع مساعدتك اليوم؟ 😊","وصلني الملف اللي أرسلته 📎
+حالياً ما أقدر أفتح الصور أو الملفات مباشرة، لكن أقدر أحوّلك لموظف خدمة العملاء يطّلع عليه ويساعدك — بس اكتب لي «موظف» وأحوّلك فوراً 👤
+أو اكتب لي طلبك نصياً (حجز، استفسار، تعديل موعد…) وأكمل معك مباشرة 😊","تم تحويلك إلى أحد ممثلي خدمة العملاء 🌷
+سيتم الرد عليك هنا في أقرب وقت.","تم إنهاء المحادثة مع خدمة العملاء ✅
+أنا لطيفة، المساعدة الافتراضية، بخدمتك مرة أخرى 😊",تبغى تحجز على نفس رقم واتساب هذا؟ ✅,"
+  يرجى مراجعة بيانات الحجز:
+  🏥 الفرع: [branchName]
+  👨‍⚕️ الطبيب: [doctorName]
+  📅 التاريخ: [اسم اليوم] [DD-MM-YYYY]
+  🕐 الوقت: [slotStartViewAr]
+  👤 الاسم: [patientFullName]
+  📱 الجوال: [mobileNumber]
+  📧 البريد الإلكتروني: [email]
+
+  ✅ هل جميع البيانات صحيحة وتود تأكيد الحجز؟
+","  ✅ تم تأكيد حجز موعدك بنجاح
+
+  🎉 رقم الحجز: [booking id]
+
+  📌 احتفظ برقم الحجز — تقدر تستخدمه لإلغاء الموعد أو إعادة جدولة الموعد.","""حدث خطأ تقني 😕. تحاول مرة ثانية؟""",232090540920391140,Saudi,10,2026-07-12T10:09:16.369Z,2026-07-19T09:58:55.395Z,https://demo.catalystsystems.io:1302,knowledge_base/tanasuq-saudi.txt,"f.naser@axonbi.com,h.ayman@axonbi.com"

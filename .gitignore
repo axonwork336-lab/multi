@@ -1,0 +1,28 @@
+# Secrets - NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# LangGraph local dev state
+.langgraph_api/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local archives / logs
+*.rar
+*.zip
+*.log
