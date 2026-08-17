@@ -2200,6 +2200,28 @@ def match_entity_for_booking(
         logger.warning("match_entity_for_booking called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
         return {"matched": False, "ambiguous": False, "status": "not_configured"}
 
+    # DECIDE LIST-VS-NAME BEFORE FETCHING, not after.
+    #
+    # This check used to sit further down, AFTER the API call, purely
+    # because it only needed to blank `user_input` before matching ran.
+    # That ordering had a real cost once the fetch started depending on
+    # the answer: "اعرض الدكاتره المتاحه" still looked like a name up
+    # here, so the resolve-mode widening retry below could fire for it -
+    # turning one query into two, and one timeout into a 25-second one.
+    # Deciding it once, up front, is both correct and cheaper.
+    wants_list = (
+        not (user_input or "").strip()
+        or _is_generic_entity_word(user_input, entity_type)
+        or _is_entity_list_request(user_input, entity_type)
+    )
+
+    if wants_list and (user_input or "").strip():
+        logger.info(
+            "match_entity_for_booking: %r is asking to SEE the %ss, not naming one - list mode",
+            user_input, entity_type,
+        )
+        user_input = ""
+
     if entity_type == "doctor":
         branch_filter = [session["branch_id"]] if session.get("branch_id") else None
 
@@ -2219,6 +2241,15 @@ def match_entity_for_booking(
         window_start = now.isoformat() + "Z"
         window_end = (now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat() + "Z"
 
+        # TIMED, and logged with the filters that were actually sent.
+        # Without this, a slow tenant API and a slow QUERY look identical
+        # in the logs - both just appear as "timeout" - and there is no
+        # way to tell whether narrowing the query helped or whether the
+        # endpoint is simply slow. Confirmed need: two consecutive
+        # production incidents on this exact call could not be told apart
+        # from the log alone.
+        started_at = time.monotonic()
+
         result = api.get_doctors(
             base_url,
             specialty_ids=session.get("specialty_ids") or None,
@@ -2231,23 +2262,40 @@ def match_entity_for_booking(
             language=conversation_language(state),
         )
 
+        elapsed = time.monotonic() - started_at
+        logger.info(
+            "match_entity_for_booking: doctor query took %.1fs (mode=%s, specialty_ids=%s, branch_ids=%s, filtered=True) -> success=%s items=%d",
+            elapsed,
+            "list" if wants_list else "name",
+            session.get("specialty_ids"), branch_filter,
+            result.get("success"),
+            len((result.get("data") or {}).get("items", [])) if result.get("success") else -1,
+        )
+
         # RESOLVE MODE SAFETY NET: the patient named a specific doctor
         # and the narrowed list didn't contain them. Widen once before
         # concluding "no such doctor" - they may be real but fully
         # booked, and "we couldn't find that doctor" would be wrong and
-        # confusing. Deliberately NOT done for list mode, where an empty
-        # narrowed list is the honest answer.
-        wants_specific_doctor = bool((user_input or "").strip())
-        if wants_specific_doctor and result.get("success"):
+        # confusing.
+        #
+        # Deliberately NOT done in list mode: there, an empty narrowed
+        # list is the honest answer, and widening would double the cost
+        # of the exact request that was already too slow.
+        if not wants_list and result.get("success"):
             narrowed = (result["data"] or {}).get("items", [])
             if not narrowed:
                 logger.info(
                     "match_entity_for_booking: narrowed doctor list was empty for %r - widening once",
                     user_input,
                 )
+                widen_started = time.monotonic()
                 result = api.get_doctors(
                     base_url, branch_ids=branch_filter, page_size=200,
                     language=conversation_language(state),
+                )
+                logger.info(
+                    "match_entity_for_booking: widened doctor query took %.1fs -> success=%s",
+                    time.monotonic() - widen_started, result.get("success"),
                 )
 
         name_keys = ["formatedName", "altName", "name"]
@@ -2314,17 +2362,6 @@ def match_entity_for_booking(
         }
 
     shaped_items = [_shape(i) for i in items]
-
-    # A bare "فرع"/"دكتور" is the user CHOOSING that path, not naming
-    # one - see _is_generic_entity_word. A full sentence asking to see
-    # them ("اعرض كل الدكاتره المتاحه") is the same request, just spelled
-    # out - see _is_entity_list_request. Both fall through to list mode.
-    if _is_generic_entity_word(user_input, entity_type) or _is_entity_list_request(user_input, entity_type):
-        logger.info(
-            "match_entity_for_booking: %r is asking to SEE the %ss, not naming one - showing the list instead of matching",
-            user_input, entity_type,
-        )
-        user_input = ""
 
     if not user_input or not user_input.strip():
         _remember_list(state, entity_type, shaped_items)
