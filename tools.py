@@ -1117,6 +1117,7 @@ def find_available_doctors(
     specialty_ids: list,
     days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
     branch_name: str = "",
+    allow_broader_search: bool = True,
 ) -> dict:
     """Find doctors who currently have a bookable service AND an available
     schedule slot within the next `days_ahead` days, across one or more
@@ -1146,9 +1147,21 @@ def find_available_doctors(
     so a doctor registered under any of them is found. Do not conclude
     "no doctors available" after checking only one plausible specialty.
 
+    `allow_broader_search`: pass False whenever the specialty was chosen
+    to match a SYMPTOM the patient described. With True (the default)
+    this tool falls back to every doctor in the clinic when the given
+    specialties have nobody - useful while BOOKING, where the patient has
+    already decided they want to be seen here and just needs someone
+    available. It is actively wrong for medical guidance: a patient with
+    abdominal pain offered a list of retina surgeons has been given a
+    worse answer than "we don't have that specialty". Confirmed real
+    production failure - pass False in the MEDICAL GUIDANCE flow, every
+    time.
+
     Returns:
     {"status": "found", "doctors": [{"id", "name", "specialtyName", "degreeName"}, ...]}
-    {"status": "found_broader_search", "doctors": [...]}  # the given specialty_ids had nobody available, but other doctors clinic-wide currently are - present these honestly as a broader alternative, not as an exact specialty match
+    {"status": "found_broader_search", "doctors": [...]}  # the given specialty_ids had nobody available, but other doctors clinic-wide currently are. These are NOT a specialty match - never offer them as an answer to a symptom
+    {"status": "not_found_in_specialty"}  # allow_broader_search=False and these specialties have nobody available. Say so plainly; do NOT substitute other doctors
     {"status": "not_found"}  # nobody at all currently has availability, even clinic-wide
     {"status": "branch_not_matched"}  # branch_name given but no branch matches it - show the branch list instead
     {"status": "not_found_in_branch", "branch": {...}}  # the branch is real, but has nobody in these specialties - offer other branches
@@ -1239,6 +1252,19 @@ def find_available_doctors(
         }
 
     if not available:
+        if not allow_broader_search:
+            # Symptom-driven search. Broadening here would answer
+            # "which doctor suits my abdominal pain?" with a list of
+            # retina surgeons - a confidently wrong answer, which is
+            # worse for the patient than an honest "we don't have
+            # anyone for that". Confirmed real production failure.
+            logger.info(
+                "find_available_doctors: no doctors in specialty_ids=%s and "
+                "allow_broader_search=False - not substituting other specialties",
+                specialty_ids,
+            )
+            return {"status": "not_found_in_specialty"}
+
         # Safety net: the given specialty_ids found nobody, but a related
         # specialty under a different name might still have doctors -
         # confirmed real, repeated production bug where the model only
