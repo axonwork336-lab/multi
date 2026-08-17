@@ -55,4 +55,4 @@ id,client_id,clinic_name,clinic_name_ar,agent_name,agent_name_ar,dialect_instruc
 
   🎉 رقم الحجز: [booking id]
 
-  📌 احتفظ برقم الحجز — تقدر تستخدمه لإلغاء الموعد أو إعادة جدولة الموعد.","""حدث خطأ تقني 😕. تحاول مرة ثانية؟""",232090540920391140,Saudi,10,2026-07-12T10:09:16.369Z,2026-07-19T09:58:55.395Z,https://portal-api.tanasuq.med.sa,knowledge_base/tanasuq-saudi.txt,"f.naser@axonbi.com,h.ayman@axonbi.com"
+  📌 احتفظ برقم الحجز — تقدر تستخدمه لإلغاء الموعد أو إعادة جدولة الموعد.","""حدث خطأ تقني 😕. تحاول مرة ثانية؟""",232090540920391140,Saudi,10,2026-07-12T10:09:16.369Z,2026-07-19T09:58:55.395Z,https://demo.catalystsystems.io:1302,knowledge_base/tanasuq-saudi.txt,"f.naser@axonbi.com,h.ayman@axonbi.com"
