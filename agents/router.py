@@ -141,6 +141,23 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         (6, r"\b(?:pain|ache|fever|headache|migraine|nausea|dizzy|dizziness|cough|rash|"
              r"swelling|bleeding|sore\s+throat|shortness\s+of\s+breath)\b"),
         (6, r"(?:تعبان|تعبانه|مريض|مريضه|مش\s*قادر\s*اتنفس|ما\s*اقدر\s*اتنفس)"),
+        # BODY PART + a hurting verb, with no "عندي/بحس" lead-in. Arabic
+        # attaches the pronoun to both words ("بطني بتوجعني", "راسي
+        # بيوجعني", "ضهري وجعان"), which the "عندي + symptom" patterns
+        # above cannot see. Confirmed miss in production: "بطني بتوجعني"
+        # routed to the concierge instead of medical guidance.
+        (10, r"(?:بطني|معدتي|راسي|رأسي|ضهري|ظهري|صدري|رقبتي|عيني|عينيا|سناني|"
+             r"ضرسي|حلقي|زوري|قلبي|كتفي|ركبتي|رجلي|ايدي|جسمي|صدرى)\s*"
+             r"\w*\s*(?:بتوجع|بيوجع|توجع|يوجع|وجعان|وجعانه|بتألم|بيألم|تعبان|تعبانه|"
+             r"مولعه|مولع|بتحرق|بيحرق|منتفخ|منتفخه)"),
+        (10, r"\bmy\s+(?:stomach|head|back|chest|neck|throat|tooth|teeth|eye|eyes|"
+             r"knee|leg|arm|shoulder|belly|tummy)\s+"
+             r"(?:hurts?|aches?|is\s+(?:hurting|aching|sore|swollen|killing))"),
+        # Pain severe enough to be described by its effect rather than
+        # named as a symptom.
+        (6, r"(?:مش\s*قادر|ما\s*اقدر|مش\s*عارف|مو\s*قادر)\s*\w*\s*"
+            r"(?:من\s*)?(?:الوجع|الالم|الالام|التعب|الصداع)"),
+        (6, r"(?:الوجع|الالم)\s*(?:مش|ما)\s*(?:بيروح|يروح|بينتهي)"),
         (3, r"(?:نصيحه\s*طبيه|استشاره\s*طبيه|توجيه\s*طبي)"),
         (3, r"\bmedical\s+(?:advice|guidance|consultation)\b"),
     ],
