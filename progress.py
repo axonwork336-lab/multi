@@ -36,6 +36,22 @@ A single turn can make six tool calls in sequence. Six "please wait"
 lines for one question is spam, so only the first one to fire is
 delivered; the rest are suppressed until the next user message.
 
+THE CLOCK RUNS FROM THE START OF THE TURN
+-----------------------------------------
+Not from each tool call - and the difference matters. A turn made of
+three 1.2s tool calls takes 3.6s, which is exactly the kind of wait the
+patient should be told about. But if every new tool call re-armed the
+timer, each one would reset the countdown before the previous had
+elapsed, and the message would never fire at all - the LONGEST turns
+would be the ones that went silent. Confirmed by scenario 4 in
+test_progress_scenarios.py, which existed before this was fixed and
+caught it.
+
+So the elapsed time is measured against when the turn began. A later
+tool call in the same turn only updates the WORDING of the pending
+message (so it describes whatever is running now); it never restarts
+the clock.
+
 OFF BY DEFAULT
 --------------
 This needs a webhook URL and a corresponding n8n branch to exist, so
@@ -46,6 +62,7 @@ changes until it is switched on - see README_MULTIAGENT.md.
 import json
 import logging
 import threading
+import time
 from typing import Dict, Iterable, List, Optional
 
 import config
@@ -199,6 +216,16 @@ _lock = threading.Lock()
 _timers: Dict[str, threading.Timer] = {}
 _delivered: Dict[str, bool] = {}
 
+# When the current turn began, per session. The countdown is measured
+# against this, not against whenever a tool call happened to be armed -
+# see "THE CLOCK RUNS FROM THE START OF THE TURN" above.
+_turn_started: Dict[str, float] = {}
+
+# The message a pending timer will send when it fires: (client_id, text).
+# Held separately from the timer so a later tool call in the same turn
+# can update the WORDING without touching the countdown.
+_pending: Dict[str, tuple] = {}
+
 # Last message actually delivered, per session. Exposed for tests and for
 # PROGRESS_MODE=log, where there is no webhook to inspect.
 last_delivered: Dict[str, str] = {}
@@ -210,6 +237,7 @@ def begin_turn(session_id: str) -> None:
     with _lock:
         _cancel_locked(session_id)
         _delivered[session_id] = False
+        _turn_started[session_id] = time.monotonic()
 
 
 def end_turn(session_id: str) -> None:
@@ -222,6 +250,8 @@ def end_turn(session_id: str) -> None:
     with _lock:
         _cancel_locked(session_id)
         _delivered.pop(session_id, None)
+        _turn_started.pop(session_id, None)
+        _pending.pop(session_id, None)
 
 
 def _cancel_locked(session_id: str) -> None:
@@ -247,11 +277,12 @@ def schedule(
         return
 
     try:
-        names = list(tool_names)
+        names = list(tool_names or [])
         if not names:
             return
 
         text = message_for(names, language, templates)
+        fire_now = False
 
         with _lock:
             if _delivered.get(session_id):
@@ -259,19 +290,49 @@ def schedule(
                 # the next tool call in the same turn is spam.
                 return
 
-            _cancel_locked(session_id)
+            # Newest wording wins, so the message describes what is
+            # actually running when it goes out.
+            _pending[session_id] = (client_id, text)
 
-            timer = threading.Timer(
-                config.PROGRESS_DELAY_SECONDS,
-                _deliver,
-                args=(session_id, client_id, text),
-            )
-            timer.daemon = True
-            _timers[session_id] = timer
-            timer.start()
+            if session_id in _timers:
+                # A countdown from this turn's start is already running.
+                # Leaving it alone is the whole point - re-arming here is
+                # what used to make long turns silent.
+                return
+
+            started = _turn_started.get(session_id)
+            elapsed = (time.monotonic() - started) if started else 0.0
+            remaining = config.PROGRESS_DELAY_SECONDS - elapsed
+
+            if remaining <= 0:
+                # The turn has already been slow enough - no reason to
+                # wait any longer.
+                fire_now = True
+            else:
+                timer = threading.Timer(remaining, _fire, args=(session_id,))
+                timer.daemon = True
+                _timers[session_id] = timer
+                timer.start()
+
+        if fire_now:
+            _fire(session_id)
 
     except Exception:
         logger.warning("progress: could not schedule an interim message", exc_info=True)
+
+
+def _fire(session_id: str) -> None:
+    """Timer callback: send whatever wording is pending for this turn."""
+
+    with _lock:
+        _timers.pop(session_id, None)
+        pending = _pending.get(session_id)
+
+    if not pending:
+        return
+
+    client_id, text = pending
+    _deliver(session_id, client_id, text)
 
 
 def _deliver(session_id: str, client_id: str, text: str) -> None:
