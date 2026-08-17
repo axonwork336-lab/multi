@@ -45,6 +45,7 @@ from config import (
     CANCELLED_STATUS_NAME,
     DEFAULT_COUNTRY_CODE,
     DOCTOR_AVAILABILITY_WINDOW_DAYS,
+    DOCTOR_LIST_CACHE_SECONDS,
     OTP_PROVIDER,
     OTP_TTL_SECONDS,
     TEST_OTP,
@@ -2123,6 +2124,135 @@ def _is_entity_list_request(user_input: str, entity_type: str) -> bool:
     return not residue
 
 
+# ==========================================================
+# Doctor list fetch for booking: cached, with a cheaper fallback
+# ==========================================================
+
+# (base_url, specialty_key, branch_key) -> (fetched_at, result)
+_DOCTOR_LIST_CACHE: dict = {}
+
+
+def _fetch_doctors_for_booking(
+    state: AgentState,
+    base_url: str,
+    specialty_ids: Optional[list],
+    branch_ids: Optional[list],
+) -> dict:
+    """Fetch the bookable-doctor list, defensively.
+
+    WHY THIS IS NOT JUST ONE api.get_doctors CALL - measured, in
+    production, on the same tenant within one hour:
+
+        10:12  same payload, unfiltered by specialty  ->  8 doctors, 0.5s
+        11:18  same payload, unfiltered by specialty  ->  TIMEOUT, 29.4s
+
+    The request was byte-identical both times, so the query wasn't wrong;
+    the endpoint's own latency moved by two orders of magnitude. Three
+    things follow from that, and this function does all three:
+
+      1. CACHE briefly. A patient who asks to see the doctors, picks one,
+         then changes their mind should not pay for that call three
+         times. The TTL is short (DOCTOR_LIST_CACHE_SECONDS) because a
+         roster does change - this is a latency shield, not a data store.
+
+      2. DROP THE EXPENSIVE FILTER ON FAILURE. `intersectionStart/End`
+         asks the API to compute each doctor's schedule intersection with
+         a 14-day window - almost certainly the costly part of the query,
+         since the plain list has no such join. On timeout, retry once
+         without it: the result then includes doctors who may not have a
+         free slot, which the booking flow checks anyway at the slot
+         step. A slightly looser list beats "فيه مشكلة تقنية".
+
+      3. ASK FOR LESS. page_size drops on the retry too. A clinic with
+         eight bookable doctors does not need a 200-row page.
+
+    Returns api.get_doctors' own result dict, so callers are unchanged.
+    """
+
+    cache_key = (
+        base_url,
+        tuple(sorted(specialty_ids)) if specialty_ids else None,
+        tuple(sorted(branch_ids)) if branch_ids else None,
+    )
+
+    cached = _DOCTOR_LIST_CACHE.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < DOCTOR_LIST_CACHE_SECONDS:
+        age = time.monotonic() - cached[0]
+        logger.info(
+            "doctor list: served from cache (age %.1fs, %d items)",
+            age, len((cached[1].get("data") or {}).get("items", [])),
+        )
+        return cached[1]
+
+    language = conversation_language(state)
+    now = datetime.utcnow()
+    window_start = now.isoformat() + "Z"
+    window_end = (now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat() + "Z"
+
+    # --- Attempt 1: the precise query -----------------------------
+    started = time.monotonic()
+    result = api.get_doctors(
+        base_url,
+        specialty_ids=specialty_ids or None,
+        branch_ids=branch_ids,
+        has_published_service=True,
+        has_service_schedule=True,
+        intersection_start=window_start,
+        intersection_end=window_end,
+        page_size=200,
+        language=language,
+    )
+    elapsed = time.monotonic() - started
+
+    if result.get("success"):
+        items = (result.get("data") or {}).get("items", [])
+        logger.info(
+            "doctor list: precise query took %.1fs -> %d items "
+            "(specialty_ids=%s branch_ids=%s)",
+            elapsed, len(items), specialty_ids, branch_ids,
+        )
+        _DOCTOR_LIST_CACHE[cache_key] = (time.monotonic(), result)
+        return result
+
+    logger.warning(
+        "doctor list: precise query FAILED after %.1fs (error=%s) - retrying "
+        "without the schedule-intersection window",
+        elapsed, result.get("error"),
+    )
+
+    # --- Attempt 2: drop the expensive join, ask for less ---------
+    started = time.monotonic()
+    fallback = api.get_doctors(
+        base_url,
+        specialty_ids=specialty_ids or None,
+        branch_ids=branch_ids,
+        has_published_service=True,
+        has_service_schedule=True,
+        page_size=50,
+        language=language,
+    )
+    elapsed = time.monotonic() - started
+
+    if fallback.get("success"):
+        items = (fallback.get("data") or {}).get("items", [])
+        logger.info(
+            "doctor list: fallback query took %.1fs -> %d items (no window, page_size=50)",
+            elapsed, len(items),
+        )
+        # Cached too: if the precise query is currently unhealthy, the
+        # next few turns should not each rediscover that the slow way.
+        _DOCTOR_LIST_CACHE[cache_key] = (time.monotonic(), fallback)
+        return fallback
+
+    logger.error(
+        "doctor list: fallback query ALSO failed after %.1fs (error=%s) - "
+        "the Doctors/GetList endpoint is not responding",
+        elapsed, fallback.get("error"),
+    )
+
+    return result
+
+
 @tool
 def match_entity_for_booking(
     state: Annotated[AgentState, InjectedState],
@@ -2237,37 +2367,11 @@ def match_entity_for_booking(
         # doctor for a NEW BOOKING, and a doctor with no published
         # service or no schedule cannot be booked, so listing them only
         # offers the patient choices that dead-end.
-        now = datetime.utcnow()
-        window_start = now.isoformat() + "Z"
-        window_end = (now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat() + "Z"
+        result = _fetch_doctors_for_booking(state, base_url, session.get("specialty_ids"), branch_filter)
 
-        # TIMED, and logged with the filters that were actually sent.
-        # Without this, a slow tenant API and a slow QUERY look identical
-        # in the logs - both just appear as "timeout" - and there is no
-        # way to tell whether narrowing the query helped or whether the
-        # endpoint is simply slow. Confirmed need: two consecutive
-        # production incidents on this exact call could not be told apart
-        # from the log alone.
-        started_at = time.monotonic()
-
-        result = api.get_doctors(
-            base_url,
-            specialty_ids=session.get("specialty_ids") or None,
-            branch_ids=branch_filter,
-            has_published_service=True,
-            has_service_schedule=True,
-            intersection_start=window_start,
-            intersection_end=window_end,
-            page_size=200,
-            language=conversation_language(state),
-        )
-
-        elapsed = time.monotonic() - started_at
         logger.info(
-            "match_entity_for_booking: doctor query took %.1fs (mode=%s, specialty_ids=%s, branch_ids=%s, filtered=True) -> success=%s items=%d",
-            elapsed,
+            "match_entity_for_booking: doctor fetch (mode=%s) -> success=%s items=%d",
             "list" if wants_list else "name",
-            session.get("specialty_ids"), branch_filter,
             result.get("success"),
             len((result.get("data") or {}).get("items", [])) if result.get("success") else -1,
         )
@@ -2290,7 +2394,7 @@ def match_entity_for_booking(
                 )
                 widen_started = time.monotonic()
                 result = api.get_doctors(
-                    base_url, branch_ids=branch_filter, page_size=200,
+                    base_url, branch_ids=branch_filter, page_size=50,
                     language=conversation_language(state),
                 )
                 logger.info(
