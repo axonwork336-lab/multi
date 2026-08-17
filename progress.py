@@ -82,10 +82,13 @@ _TOOL_GROUPS: Dict[str, tuple] = {
     "searching_doctors": (
         "find_available_doctors",
         "find_best_doctor_in_specialty",
-        "list_branches_for_specialty",
         "list_specialties",
         "match_entity_for_booking",
         "match_entity_info",
+    ),
+
+    "searching_branches": (
+        "list_branches_for_specialty",
     ),
 
     "searching_slots": (
@@ -146,6 +149,7 @@ _GROUP_PRIORITY = (
     "sending_complaint",
     "sending_otp",
     "searching_slots",
+    "searching_branches",
     "searching_doctors",
     "finding_booking",
     "checking_info",
@@ -160,6 +164,8 @@ _GROUP_PRIORITY = (
 _DEFAULT_MESSAGES: Dict[str, Dict[str, str]] = {
     "searching_doctors":  {"ar": "لحظة من فضلك، جاري البحث عن الأطباء المتاحين… 🔎",
                            "en": "One moment please - looking up the available doctors… 🔎"},
+    "searching_branches": {"ar": "لحظة من فضلك، جاري البحث عن الفروع المتاحة… 🏥",
+                           "en": "One moment please - looking up the available branches… 🏥"},
     "searching_slots":    {"ar": "لحظة من فضلك، جاري البحث عن المواعيد المتاحة… 🗓️",
                            "en": "One moment please - checking the available times… 🗓️"},
     "finding_booking":    {"ar": "لحظة من فضلك، جاري البحث عن الحجز… 🔎",
