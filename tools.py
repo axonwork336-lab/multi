@@ -2046,6 +2046,76 @@ def _is_generic_entity_word(user_input: str, entity_type: str) -> bool:
     return any(normalized == _normalize_arabic(word) for word in candidates)
 
 
+# Words that make a message a REQUEST TO SEE THE LIST rather than a name.
+_LIST_REQUEST_CUES = (
+    "اعرض", "اعرضلي", "عرض", "وريني", "اوريني", "ورني", "شوفني", "اشوف",
+    "شوف", "هات", "هاتلي", "جبلي", "ادينى", "ادينی", "قائمه", "قائمة",
+    "لستة", "لسته", "كل", "جميع", "كافه", "كافة", "المتاح", "المتاحه",
+    "المتاحين", "المتوفرين", "المتوفره", "الموجودين", "مين", "ايه", "ما",
+    "show", "list", "all", "available", "who", "which", "see", "view",
+)
+
+# Filler that carries no naming information, so it doesn't count as a
+# leftover "name" when we check what the message is really asking for.
+_LIST_REQUEST_FILLER = (
+    "لو", "سمحت", "من", "فضلك", "ممكن", "عايز", "عاوز", "عايزه", "عاوزه",
+    "ابغى", "ابغي", "اريد", "بدي", "حابب", "حابه", "لي", "لى", "عندك",
+    "عندكم", "عندنا", "في", "فى", "هو", "هي", "دول", "ديه", "ده", "دي",
+    "please", "can", "you", "me", "i", "want", "the", "a", "for", "us",
+    "your", "have", "do",
+)
+
+
+def _is_entity_list_request(user_input: str, entity_type: str) -> bool:
+    """True when the message asks to SEE the doctors/branches rather than
+    naming one.
+
+    WHY THIS IS SEPARATE FROM _is_generic_entity_word: that function
+    requires the whole message to BE the bare word ("دكتور"). A real
+    patient writes a sentence - "اعرض كل الدكاتره المتاحه" - which
+    slipped straight past it into fuzzy name matching, and from there
+    into a live API lookup that timed out after 16 seconds and ended the
+    turn with "فيه مشكلة تقنية". Confirmed real production failure. The
+    patient asked a perfectly clear question; nothing about it was a
+    name.
+
+    The test is deliberately conservative: the message must contain a
+    generic entity word AND a list cue, and after removing those plus
+    ordinary filler there must be NOTHING meaningful left. That last
+    part is what keeps "اعرض مواعيد دكتور محمد" out of list mode - the
+    residue "مواعيد محمد" shows a real name was given, so it still goes
+    to name matching.
+    """
+
+    normalized = _normalize_arabic((user_input or "").strip().lower())
+
+    # Arabic punctuation (؟ ، ؛ ٪ ...) lives INSIDE the \u0600-\u06FF
+    # block, so a range-based "keep Arabic letters" rule keeps it glued
+    # to the word. That left "المتاحين؟" as one token, which matched
+    # nothing, and a plain question like "مين الدكاترة المتاحين؟" fell
+    # through to name matching. Strip it explicitly first.
+    normalized = re.sub(r"[\u060C\u061B\u061F\u066A-\u066D\u06D4\u00BF]+", " ", normalized)
+    normalized = re.sub(r"[^\w\u0600-\u06FF ]+", " ", normalized)
+
+    tokens = [t for t in normalized.split() if t]
+    if not tokens:
+        return False
+
+    generic = {_normalize_arabic(w) for w in _GENERIC_ENTITY_WORDS.get(entity_type, set())}
+    cues = {_normalize_arabic(w) for w in _LIST_REQUEST_CUES}
+    filler = {_normalize_arabic(w) for w in _LIST_REQUEST_FILLER}
+
+    has_entity_word = any(token in generic for token in tokens)
+    has_list_cue = any(token in cues for token in tokens)
+
+    if not (has_entity_word and has_list_cue):
+        return False
+
+    residue = [t for t in tokens if t not in generic and t not in cues and t not in filler]
+
+    return not residue
+
+
 @tool
 def match_entity_for_booking(
     state: Annotated[AgentState, InjectedState],
@@ -2192,10 +2262,12 @@ def match_entity_for_booking(
     shaped_items = [_shape(i) for i in items]
 
     # A bare "فرع"/"دكتور" is the user CHOOSING that path, not naming
-    # one - see _is_generic_entity_word. Fall through to list mode.
-    if _is_generic_entity_word(user_input, entity_type):
+    # one - see _is_generic_entity_word. A full sentence asking to see
+    # them ("اعرض كل الدكاتره المتاحه") is the same request, just spelled
+    # out - see _is_entity_list_request. Both fall through to list mode.
+    if _is_generic_entity_word(user_input, entity_type) or _is_entity_list_request(user_input, entity_type):
         logger.info(
-            "match_entity_for_booking: %r is the generic word for %s, not a name - showing the list instead of matching",
+            "match_entity_for_booking: %r is asking to SEE the %ss, not naming one - showing the list instead of matching",
             user_input, entity_type,
         )
         user_input = ""
