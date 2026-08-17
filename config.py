@@ -83,7 +83,7 @@ DIALECT_TEMPLATES_CSV: Path = DATA_DIR / "dialect_templates.csv"
 # os.getenv(..., default) - we need to distinguish "not set" from "set
 # to the default" to know whether the env var should override the CSV).
 
-_DEFAULT_BASE_URL: str = "https://portal-api.tanasuq.med.sa"
+_DEFAULT_BASE_URL: str = "https://demo.catalystsystems.io:1102"
 
 _ENV_BASE_URL_OVERRIDE: Optional[str] = os.getenv("BOOKING_API_BASE_URL") or None
 
@@ -126,6 +126,16 @@ _ENV_DOCTORS_BASE_URL_OVERRIDE: Optional[str] = os.getenv("DOCTORS_API_BASE_URL"
 # How many days ahead to search for doctor availability by default, when
 # the user doesn't specify a particular day - see
 # tools.find_available_doctors().
+# How long a fetched doctor list stays reusable. Short on purpose: this
+# is a latency shield, not a data store - the roster does change. It
+# exists because the tenant's Doctors/GetList endpoint was measured
+# returning the SAME query in 0.5s and then, an hour later, timing out at
+# 29s; a patient who lists doctors, picks one, then changes their mind
+# should not pay that cost three times in one conversation.
+DOCTOR_LIST_CACHE_SECONDS: float = float(
+    os.getenv("DOCTOR_LIST_CACHE_SECONDS", "90")
+)
+
 DOCTOR_AVAILABILITY_WINDOW_DAYS: int = int(
     os.getenv("DOCTOR_AVAILABILITY_WINDOW_DAYS", "14")
 )
