@@ -167,7 +167,13 @@ def _turn_signals(messages: list) -> dict:
     for msg in messages:
         name = getattr(msg, "name", None)
         if name == "request_human_handoff":
-            escalate = True
+            # Only a tool result that ACTUALLY raised the handoff counts.
+            # The tool returns "not_requested" when the patient hasn't
+            # agreed yet (see tools.request_human_handoff), and treating
+            # that as an escalation would defeat the whole consent check
+            # by re-adding it one layer up.
+            if "handoff_requested" in str(getattr(msg, "content", "")):
+                escalate = True
         elif name == "share_branch_location":
             content = getattr(msg, "content", "")
             match = re.search(r"'branch_name':\s*'([^']*)'|\"branch_name\":\s*\"([^\"]*)\"", str(content))
