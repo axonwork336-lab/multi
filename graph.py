@@ -1064,36 +1064,45 @@ def _build_greeting(templates: dict, user_message: str, target_language: str) ->
     """
     Build the deterministic opening greeting for this conversation.
 
-    For Arabic (or undetermined) conversations, this is the clinic's own
-    CSV-authored `msg_unknown_fallback` text, verbatim, with only its
-    fixed opening line optionally swapped for a time-of-day salutation
-    (see _personalized_greeting).
+    Always the clinic's own configured `msg_unknown_fallback` text
+    (from n8n's client_config Data Table, or the CSV as a fallback -
+    whichever config.get_messages() resolved this turn), verbatim, with
+    only its fixed opening line optionally swapped for a time-of-day
+    salutation (see _personalized_greeting) - regardless of which
+    language the conversation is in. _personalized_greeting already
+    handles both Arabic and Latin-script cues correctly, so there is no
+    need for a separate English-only template here.
 
-    For English conversations, there is no English column in the CSV to
-    reuse, so a fixed English template - built here, following the exact
-    same structure (persona intro, service list, closing question) as
-    the Arabic one - is used instead, so English speakers ALSO get a
-    consistent, deterministic greeting rather than one freely composed
-    by the LLM each time.
+    The hardcoded English fallback below is a LAST RESORT ONLY, for a
+    client whose config genuinely has no `msg_unknown_fallback` set at
+    all (should be rare once every client's config source sets one) -
+    it must never override a real, configured greeting just because the
+    conversation happens to be in English. Confirmed real production
+    bug: an English-language conversation was ALWAYS given this
+    hardcoded generic template instead of the clinic's own configured
+    greeting, even when one was properly set - so a fully-configured
+    client (correct dialect, agent name, branches, everything) still
+    showed a generic, un-branded opening line the moment the patient
+    happened to type in English.
     """
 
-    if target_language == "en":
-        lowered = (user_message or "").lower()
-        if any(cue in lowered for cue in _MORNING_CUES):
-            salutation = "Good morning! \U0001F60A"
-        elif any(cue in lowered for cue in _EVENING_CUES):
-            salutation = "Good evening! \U0001F60A"
-        else:
-            salutation = "Hi there! \U0001F44B"
-
-        return _ENGLISH_GREETING_TEMPLATE.format(
-            salutation=salutation,
-            agent_name=templates.get("_agent_name") or "the assistant",
-            clinic_name=templates.get("_clinic_name") or "the clinic",
-        )
-
     greeting = templates.get("msg_unknown_fallback")
+
     if not greeting:
+        if target_language == "en":
+            lowered = (user_message or "").lower()
+            if any(cue in lowered for cue in _MORNING_CUES):
+                salutation = "Good morning! \U0001F60A"
+            elif any(cue in lowered for cue in _EVENING_CUES):
+                salutation = "Good evening! \U0001F60A"
+            else:
+                salutation = "Hi there! \U0001F44B"
+
+            return _ENGLISH_GREETING_TEMPLATE.format(
+                salutation=salutation,
+                agent_name=templates.get("_agent_name") or "the assistant",
+                clinic_name=templates.get("_clinic_name") or "the clinic",
+            )
         return ""
 
     # Normalize line endings FIRST. The CSV can arrive with \r\n (Excel/
