@@ -182,6 +182,8 @@ warmly in one sentence and offer what you can help with instead.""",
             "cancel_appointment",
             "match_entity_info",
             "reset_booking_session",
+            "request_human_handoff",
+            "share_branch_location",
         ),
         job="""\
 ============================================================
@@ -214,6 +216,8 @@ move something instead, just take the next natural step with them.""",
             "resolve_available_day",
             "match_entity_info",
             "reset_booking_session",
+            "request_human_handoff",
+            "share_branch_location",
         ),
         job="""\
 ============================================================
@@ -249,6 +253,8 @@ and never alter a slot value returned by
             "get_next_weekday_date",
             "match_entity_info",
             "reset_booking_session",
+            "request_human_handoff",
+            "share_branch_location",
         ),
         job="""\
 ============================================================
@@ -277,6 +283,8 @@ the flow below.""",
             "list_hospital_services",
             "match_entity_info",
             "get_doctor_fees",
+            "request_human_handoff",
+            "share_branch_location",
         ),
         job="""\
 ============================================================
@@ -308,6 +316,8 @@ only ever name a doctor a tool returned in this conversation.""",
             "find_available_doctors",
             "match_entity_info",
             "get_doctor_fees",
+            "request_human_handoff",
+            "share_branch_location",
         ),
         job="""\
 ============================================================
@@ -333,6 +343,8 @@ unchanged. Never state a fee unless they asked about cost and
             "validate_phone_format",
             "compare_phone",
             "match_entity_info",
+            "request_human_handoff",
+            "share_branch_location",
         ),
         job="""\
 ============================================================
