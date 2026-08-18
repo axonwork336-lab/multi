@@ -111,8 +111,10 @@ def _llm_for(agent_name: str):
 # ==========================================================
 
 def load_config(state: AgentState) -> AgentState:
-    """Loads client_config.csv/dialect_templates.csv (config.get_messages,
-    UNCHANGED) and builds the system prompt EVERY turn.
+    """Loads this turn's client config - from `state["raw_client_config"]`
+    if n8n sent one this turn, otherwise falling back to
+    client_config.csv/dialect_templates.csv by client_id (config.py,
+    UNCHANGED for that path) - and builds the system prompt EVERY turn.
 
     CHANGED: this used to skip rebuilding once state["templates"] was
     already set for a thread (a caching optimization). The real-world
@@ -126,7 +128,7 @@ def load_config(state: AgentState) -> AgentState:
     no network calls), so there's no real performance reason to keep
     the old per-thread caching."""
 
-    templates = config.get_messages(state["client_id"])
+    templates = config.get_messages(state["client_id"], client_row_override=state.get("raw_client_config"))
 
     state["templates"] = templates
     state["system_prompt"] = build_system_prompt(templates)
