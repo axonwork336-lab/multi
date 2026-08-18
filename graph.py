@@ -43,7 +43,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage, trim_messages
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
@@ -1786,7 +1786,29 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         )
 
     system_message = SystemMessage(content=system_content)
-    response = _llm_for(agent_name).invoke([system_message] + state["messages"])
+
+    # Cap how much history actually gets sent to the LLM (config.MAX_HISTORY_MESSAGES).
+    # start_on="human" guarantees the trimmed slice begins on a HumanMessage,
+    # so we never cut in the middle of an AIMessage(tool_calls=...) /
+    # ToolMessage pair and leave a dangling, invalid tool call behind.
+    # The checkpointer still keeps the untrimmed full history for the
+    # thread - this only shrinks what's sent on THIS call.
+    trimmed_history = trim_messages(
+        state["messages"],
+        strategy="last",
+        token_counter=len,  # count messages, not real tokens - simple cap
+        max_tokens=config.MAX_HISTORY_MESSAGES,
+        start_on="human",
+        include_system=False,
+        allow_partial=False,
+    )
+    # Safety net: for a pathologically small MAX_HISTORY_MESSAGES (or an
+    # unusual message-shape edge case), trim_messages can legitimately
+    # return an empty list rather than violate the start_on="human"
+    # constraint. Sending the LLM an empty turn would be worse than
+    # sending it the untrimmed history, so fall back rather than trim.
+    history = trimmed_history if trimmed_history else state["messages"]
+    response = _llm_for(agent_name).invoke([system_message] + history)
 
     updates: dict = {}
 
