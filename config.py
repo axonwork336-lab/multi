@@ -563,7 +563,11 @@ def get_messages(client_id: str, dialect: Optional[str] = None, client_row_overr
     merged["_clinic_name_ar"] = client_row.get("clinic_name_ar")
     merged["_agent_name"] = client_row.get("agent_name")
     merged["_agent_name_ar"] = client_row.get("agent_name_ar")
-    merged["_base_url"] = _ENV_BASE_URL_OVERRIDE or client_row.get("base_url") or BASE_URL
+    merged["_base_url"] = (
+        _ENV_BASE_URL_OVERRIDE
+        or client_row.get("base_url")
+        or (BASE_URL if client_row else None)
+    )
     # doctors_base_url falls back to base_url when the client's own
     # config row doesn't set one explicitly - most clients run doctors/
     # specialties off the SAME server as bookings, and requiring a
@@ -578,7 +582,6 @@ def get_messages(client_id: str, dialect: Optional[str] = None, client_row_overr
         _ENV_DOCTORS_BASE_URL_OVERRIDE
         or client_row.get("doctors_base_url")
         or merged["_base_url"]
-        or None
     )
     merged["_phone_example"] = client_row.get("phone_example")
     merged["_country_codes_hint"] = client_row.get("country_codes_hint")
