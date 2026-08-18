@@ -69,24 +69,95 @@ logger = logging.getLogger(__name__)
 # are data transforms, not user-facing text, so they stay)
 # ==========================================================
 
-def normalize_phone_number(phone: Optional[str]) -> Optional[str]:
-    """Normalize a phone number to E.164 (e.g. "+201001255864")."""
+"""Country calling codes, longest first, so the longest matching prefix
+wins (e.g. "971" is checked before "97"). Used to recognize a number
+that ALREADY carries a country code, whatever country that is.
+
+This list only has to be good enough to tell "this already starts with
+a country code" from "this is a bare local number" - it is not a
+validation list, and an unknown code simply falls through to the
+client's own default."""
+_KNOWN_COUNTRY_CODES = (
+    "966", "971", "973", "974", "965", "968", "962", "961", "970", "964", "963",
+    "212", "213", "216", "218", "249", "252", "253", "222", "220",
+    "234", "254", "255", "256", "233", "251",
+    "353", "351", "352", "358", "359", "370", "371", "372", "380", "381", "385", "386",
+    "420", "421", "852", "853", "855", "856", "886", "880", "886", "960", "961",
+    "20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43", "44",
+    "45", "46", "47", "48", "49", "51", "52", "53", "54", "55", "56", "57", "58",
+    "60", "61", "62", "63", "64", "65", "66", "81", "82", "84", "86", "90", "91",
+    "92", "93", "94", "95", "98",
+    "7", "1",
+)
+
+
+def _client_default_country_code(state=None) -> str:
+    """The country code to assume for a BARE LOCAL number (one written
+    with a leading 0, or with no country code at all), for this client.
+
+    Read from the client's own config (`country_codes_hint`, e.g.
+    "+966, +20" -> "966") so a Saudi clinic assumes Saudi and an
+    Egyptian one assumes Egypt, instead of every tenant sharing one
+    hardcoded country. Falls back to DEFAULT_COUNTRY_CODE when the
+    client hasn't configured a hint."""
+
+    hint = ((state or {}).get("templates") or {}).get("_country_codes_hint")
+    if hint:
+        match = re.search(r"\+?(\d{1,4})", str(hint))
+        if match:
+            return match.group(1)
+
+    return DEFAULT_COUNTRY_CODE
+
+
+def normalize_phone_number(phone: Optional[str], state=None) -> Optional[str]:
+    """Normalize a phone number to E.164 (e.g. "+201001255864").
+
+    A number that ALREADY carries a country code is kept as-is, no
+    matter which country that is - patients travel and register with
+    foreign numbers, so an Egyptian number given to a Saudi clinic (or
+    the reverse) is perfectly normal and must not be rewritten. Only a
+    genuinely LOCAL number (leading 0, or no country code at all) gets
+    this client's default country code attached.
+
+    Confirmed real production bug: the default country code was a single
+    global constant ("20"), so a Saudi number like "966568000000" was
+    silently turned into "+20966568000000" - a number belonging to
+    nobody - before being sent to the booking API.
+
+    Pass `state` wherever it's available so the client's own configured
+    country is used; without it, DEFAULT_COUNTRY_CODE applies."""
 
     if not phone:
         return phone
 
-    cleaned = re.sub(r"[\s\-().]", "", phone.strip())
+    cleaned = re.sub(r"[\s\-().]", "", str(phone).strip())
 
     if cleaned.startswith("+"):
         return cleaned
     if cleaned.startswith("00"):
         return "+" + cleaned[2:]
-    if cleaned.startswith(DEFAULT_COUNTRY_CODE):
-        return "+" + cleaned
-    if cleaned.startswith("0"):
-        return "+" + DEFAULT_COUNTRY_CODE + cleaned[1:]
 
-    return "+" + DEFAULT_COUNTRY_CODE + cleaned
+    default_code = _client_default_country_code(state)
+
+    # Leading zero = local format for whichever country this client is
+    # in ("01158877175" -> Egypt, "0568000000" -> Saudi).
+    if cleaned.startswith("0"):
+        return "+" + default_code + cleaned[1:]
+
+    # No leading zero: this may already be a full international number
+    # written without its "+". Accept it as such when it starts with a
+    # real country code AND is long enough to be a complete number -
+    # the length check is what stops a bare local number that happens to
+    # begin with those digits from being misread as international.
+    if cleaned.startswith(default_code) and len(cleaned) >= len(default_code) + 8:
+        return "+" + cleaned
+
+    for code in _KNOWN_COUNTRY_CODES:
+        if cleaned.startswith(code) and len(cleaned) >= len(code) + 8:
+            return "+" + cleaned
+
+    return "+" + default_code + cleaned
 
 
 def _is_valid_phone_format(phone: Optional[str]) -> bool:
@@ -373,26 +444,41 @@ def _base_url(state: AgentState) -> str:
 # ==========================================================
 
 @tool
-def validate_phone_format(phone: str) -> dict:
-    """Validate that a phone number is in international format
-    (starts with + and a country code). Returns {"status": "valid",
-    "normalized": "+201234567890"} or {"status": "invalid"}."""
+def validate_phone_format(
+    state: Annotated[AgentState, InjectedState],
+    phone: str,
+) -> dict:
+    """Validate that a phone number is usable, and return it normalized
+    to international format. Returns {"status": "valid",
+    "normalized": "+201234567890"} or {"status": "invalid"}.
 
-    if not _is_valid_phone_format(phone):
+    A number from ANOTHER country is perfectly valid - patients
+    routinely register with a foreign number - so never reject one for
+    not matching the clinic's own country, and never rewrite its country
+    code. Only a bare local number (leading 0, or no country code) is
+    assumed to belong to this clinic's country."""
+
+    normalized = normalize_phone_number(phone, state)
+
+    if not _is_valid_phone_format(normalized):
         return {"status": "invalid"}
 
-    return {"status": "valid", "normalized": normalize_phone_number(phone)}
+    return {"status": "valid", "normalized": normalized}
 
 
 @tool
-def compare_phone(provided_phone: str, channel_phone: str = "") -> dict:
+def compare_phone(
+    state: Annotated[AgentState, InjectedState],
+    provided_phone: str,
+    channel_phone: str = "",
+) -> dict:
     """Compare a user-provided phone number against the verified channel
     identity phone number (if any). Returns {"status": "match"} or
     {"status": "no_match"}. Never decide this yourself - always call
     this tool."""
 
-    a = normalize_phone_number(provided_phone)
-    b = normalize_phone_number(channel_phone) if channel_phone else None
+    a = normalize_phone_number(provided_phone, state)
+    b = normalize_phone_number(channel_phone, state) if channel_phone else None
 
     match = bool(a and b and a == b)
 
@@ -471,7 +557,7 @@ def lookup_appointment(
         result = api.get_bookings_by_ref(base_url, ref_number, language=language)
     elif phone:
         result = api.get_bookings_by_phone(
-            base_url, normalize_phone_number(phone), language=language,
+            base_url, normalize_phone_number(phone, state), language=language,
             status_list=list(CANCELLABLE_STATUS_CODES),
         )
     else:
@@ -604,10 +690,10 @@ def send_otp(state: Annotated[AgentState, InjectedState], phone: str) -> dict:
     this is a defensive backstop in case that step was skipped, not a
     replacement for calling `compare_phone` first."""
 
-    normalized = normalize_phone_number(phone)
+    normalized = normalize_phone_number(phone, state)
 
     channel_phone = state.get("channel_phone")
-    normalized_channel = normalize_phone_number(channel_phone) if channel_phone else None
+    normalized_channel = normalize_phone_number(channel_phone, state) if channel_phone else None
 
     if normalized_channel and normalized and normalized_channel == normalized:
         logger.warning(
@@ -3036,7 +3122,16 @@ SHOW THE SOONEST AVAILABLE DAY ONLY: `limit` defaults to 1 on
      "has_more": true, "total_available_days": 9, "next_offset": 3}
     {"status": "not_found"}  # this doctor has no open slot at all in the booking window
     {"status": "no_more_days"}  # `offset` is past the last available day
-    {"status": "missing_doctor"} / {"status": "missing_branch"}
+    {"status": "missing_doctor"}
+    {"status": "missing_branch", "branches": [{"name": ...}, ...]}
+        # This doctor works at MORE THAN ONE branch, so which one they
+        # want must be settled first - their days and times differ per
+        # branch. `branches` lists that doctor's real branches: show
+        # those names, ask which one, confirm it with
+        # `match_entity_for_booking(entity_type="branch")`, then call
+        # this again. Never name a branch that isn't in this list.
+        # A doctor working at only ONE branch never returns this - the
+        # branch is confirmed silently and the days come back directly.
     {"status": "not_configured"} / {"status": "error"}
 
     Pass a chosen day's `from_date`/`to_date` VERBATIM into
@@ -3061,13 +3156,71 @@ SHOW THE SOONEST AVAILABLE DAY ONLY: `limit` defaults to 1 on
         # make, so don't manufacture a question about it.
         schedule_result = api.get_doctor_schedule(base_url, doctor_ids=[doctor_id], language=conversation_language(state))
         if schedule_result["success"]:
-            branch_ids = {s.get("branchId") for s in (schedule_result["data"] or {}).get("items", []) if s.get("branchId")}
+            schedule_items = (schedule_result["data"] or {}).get("items", [])
+            branch_ids = {s.get("branchId") for s in schedule_items if s.get("branchId")}
             if len(branch_ids) == 1:
                 branch_id = next(iter(branch_ids))
                 session["branch_id"] = branch_id
-                logger.info("list_available_days_for_booking: auto-confirmed single branch_id=%s for doctor_id=%s", branch_id, doctor_id)
+                # Record the NAME too, not just the id. The booking
+                # confirmation message prints the branch from
+                # branch_display_name, so auto-confirming the id alone
+                # left it blank - confirmed real production failure: a
+                # confirmation went out reading "🏥 الفرع:" with nothing
+                # after it, while every other line was filled in.
+                if not session.get("branch_display_name"):
+                    display_name = next(
+                        (s.get("branchName") for s in schedule_items if s.get("branchId") == branch_id and s.get("branchName")),
+                        None,
+                    )
+                    try:
+                        branches_result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
+                        if branches_result["success"]:
+                            match = next(
+                                (b for b in (branches_result["data"] or {}).get("items", []) if b.get("id") == branch_id),
+                                None,
+                            )
+                            if match:
+                                display_name = _arabic_preferred_name(match) or display_name
+                    except Exception:
+                        logger.exception("list_available_days_for_booking: failed to enrich auto-confirmed branch name")
+                    session["branch_display_name"] = display_name
+                logger.info(
+                    "list_available_days_for_booking: auto-confirmed single branch_id=%s (%s) for doctor_id=%s",
+                    branch_id, session.get("branch_display_name"), doctor_id,
+                )
 
     if not branch_id:
+        # Hand back the actual branches this doctor works at, not just a
+        # bare "missing_branch". Without them the model has to either ask
+        # a vague "أي فرع تفضل؟" or - worse - name branches from its own
+        # memory that this doctor may not work at.
+        branch_options = []
+        try:
+            if schedule_result and schedule_result.get("success"):
+                branches_lookup = {}
+                branches_result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
+                if branches_result["success"]:
+                    branches_lookup = {b.get("id"): b for b in (branches_result["data"] or {}).get("items", []) if b.get("id")}
+                seen = set()
+                for item in (schedule_result["data"] or {}).get("items", []):
+                    item_branch_id = item.get("branchId")
+                    if not item_branch_id or item_branch_id in seen:
+                        continue
+                    seen.add(item_branch_id)
+                    match = branches_lookup.get(item_branch_id)
+                    name = (_arabic_preferred_name(match) if match else None) or item.get("branchName")
+                    if name:
+                        branch_options.append({"name": name})
+        except Exception:
+            logger.exception("list_available_days_for_booking: failed to build branch options for missing_branch")
+
+        if branch_options:
+            logger.info(
+                "list_available_days_for_booking: missing_branch for doctor_id=%s -> %d branch option(s)",
+                doctor_id, len(branch_options),
+            )
+            return {"status": "missing_branch", "branches": branch_options}
+
         return {"status": "missing_branch"}
 
     timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
@@ -3256,6 +3409,13 @@ def create_new_booking(
     {"status": "success", "booking_ref": "GBN-..."}
     {"status": "slot_unavailable"}  # the requested slot is no longer free - tell the user and offer to pick again
     {"status": "missing_doctor"} / {"status": "missing_branch"}
+    {"status": "invalid_details", "rejected": [{"field": ..., "message": ...}]}
+        # the booking system REFUSED one of the patient's own details
+        # (e.g. field "MobileNumber" -> "Mobile Number Not Valid"). This
+        # is NOT a technical fault and NOT worth retrying: tell the
+        # patient plainly which detail wasn't accepted, ask for a
+        # corrected one, and try the booking again with it. Never
+        # describe this as a temporary technical problem.
     {"status": "not_configured"} / {"status": "error"}"""
 
     session_id = state.get("session_id")
@@ -3336,10 +3496,27 @@ def create_new_booking(
         )
         return {"status": "slot_unavailable"}
 
+    # Normalize to E.164 at the API boundary. The channel identity
+    # (WhatsApp's wa_id) arrives as bare digits - "201158877175" - and
+    # the booking API rejects that shape outright with
+    # MobileNumber -> "Mobile Number Not Valid", even though the number
+    # itself is perfectly valid and the patient can do nothing about it.
+    # Confirmed real production failure: a booking collected all the way
+    # to confirmation, then failed at the final step for exactly this,
+    # and the patient was told to try again later. Everything the user
+    # sees already goes through normalize_phone_number; this is the one
+    # place that was still passing the raw form through.
+    normalized_mobile = normalize_phone_number(mobile_number, state) or mobile_number
+    if normalized_mobile != mobile_number:
+        logger.info(
+            "create_new_booking: normalized mobile_number %r -> %r for the booking API",
+            mobile_number, normalized_mobile,
+        )
+
     result = api.create_booking(
         base_url,
         patient_full_name=patient_full_name,
-        mobile_number=mobile_number,
+        mobile_number=normalized_mobile,
         branch_id=matched_slot.get("branchId") or branch_id,
         doctor_id=matched_slot.get("doctorId") or doctor_id,
         service_id=matched_slot.get("serviceId"),
@@ -3353,7 +3530,20 @@ def create_new_booking(
     )
 
     if not result["success"]:
-        logger.error("create_new_booking API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
+        details = result.get("details") or []
+        logger.error(
+            "create_new_booking API call failed: status_code=%s error=%s rejected_fields=%s",
+            result.get("status_code"), result.get("error"),
+            [d.get("field") for d in details] or "unknown",
+        )
+        # A field-level rejection (bad phone format, missing email, ...)
+        # is NOT a transient technical fault: retrying later changes
+        # nothing, and telling the patient to try again wastes their
+        # time on something they could fix in one message. Pass the
+        # rejected field(s) back so the reply can name what needs
+        # correcting instead of blaming a generic outage.
+        if result.get("error") == "validation_error" and details:
+            return {"status": "invalid_details", "rejected": details}
         return {"status": "error"}
 
     new_booking_id = result["data"]
