@@ -18,6 +18,7 @@ implementation necessarily changed along with the graph shape.
 """
 
 import logging
+import re
 import threading
 import time
 from typing import Dict
@@ -145,10 +146,47 @@ def _cancellation_just_succeeded(messages: list) -> bool:
     return False
 
 
+def _turn_signals(messages: list) -> dict:
+    """Scan this turn's new messages for the two n8n-facing signal tools
+    (tools.request_human_handoff / tools.share_branch_location) and
+    return the flat dict the HTTP layer (app.py) forwards to n8n
+    alongside the reply text.
+
+    These tools are pure signals - they carry no patient-facing text of
+    their own, so this is the only place their effect is read back out
+    of the conversation. Scanning tool-call *messages* (rather than
+    trying to infer intent from the final reply text) is deterministic
+    and costs no extra tokens: the LLM already made these calls, if at
+    all, as part of the single turn it just ran.
+    """
+
+    escalate = False
+    location = False
+    branch_name = None
+
+    for msg in messages:
+        name = getattr(msg, "name", None)
+        if name == "request_human_handoff":
+            escalate = True
+        elif name == "share_branch_location":
+            content = getattr(msg, "content", "")
+            match = re.search(r"'branch_name':\s*'([^']*)'|\"branch_name\":\s*\"([^\"]*)\"", str(content))
+            if match:
+                location = True
+                branch_name = match.group(1) or match.group(2)
+
+    return {"escalate": escalate, "location": location, "branch_name": branch_name}
+
+
 def send_message(client_id: str, session_id: str, message: str, channel_phone: str = None) -> str:
     """
     Send one user message for `session_id` and return the agent's reply
     text for this turn.
+
+    Thin wrapper around send_message_with_signals() kept for backward
+    compatibility (CLI, existing tests) - anything that also needs the
+    escalate/location signals (currently app.py's /chat endpoint) should
+    call send_message_with_signals() instead.
 
     This is the ONLY public function this file needs now: whether it's
     the first message of a brand new conversation or a follow-up to an
@@ -166,6 +204,27 @@ def send_message(client_id: str, session_id: str, message: str, channel_phone: s
          after cancelling stays in the same conversation (no repeated
          greeting); only silence past that shorter window starts fresh.
     See _config_for() for exactly how these two triggers are evaluated.
+    """
+
+    return send_message_with_signals(client_id, session_id, message, channel_phone=channel_phone)["reply"]
+
+
+def send_message_with_signals(client_id: str, session_id: str, message: str, channel_phone: str = None) -> Dict:
+    """
+    Same as send_message(), but returns a dict with the reply text PLUS
+    the two n8n-facing signals for this turn:
+
+      {"reply": str, "escalate": bool, "location": bool, "branch_name": Optional[str]}
+
+    - escalate=True means the patient asked for (or is being given) a
+      human staff handoff this turn - n8n's own "IF - Escalate?" node
+      reads this to kick off the 3CX handoff.
+    - location=True (with branch_name set) means a branch's address was
+      just given - n8n looks branch_name up in its own client_config
+      data table for lat/lng and sends the map pin.
+
+    See send_message()'s docstring for the reset/session behavior, which
+    is identical here.
     """
 
     logger.info("session_id=%s: sending message", session_id)
@@ -232,12 +291,16 @@ def send_message(client_id: str, session_id: str, message: str, channel_phone: s
                     session_id, POST_SUCCESS_TIMEOUT_SECONDS,
                 )
 
+            signals = _turn_signals(new_messages_this_turn)
+            if signals["escalate"] or signals["location"]:
+                logger.info("session_id=%s: turn signals=%s", session_id, signals)
+
     finally:
         # Whatever happened above, the turn is over: cancel any interim
         # "please wait" timer that hasn't fired yet.
         progress.end_turn(session_id)
 
-    return reply
+    return {"reply": reply, **signals}
 
 
 # ==========================================================
