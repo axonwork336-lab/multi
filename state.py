@@ -32,6 +32,17 @@ class AgentState(TypedDict):
     session_id: str
     channel_phone: Optional[str]  # verified channel identity (e.g. WhatsApp sender), used by compare_phone
 
+    # The client's full config row, straight from n8n's own client_config
+    # Data Table (sent fresh in every /chat request body, since n8n
+    # already fetches it before calling us) - this is n8n's single
+    # source of truth for client config, taking over from this project's
+    # bundled client_config.csv when present. NotRequired/optional: the
+    # CLI and anything invoking the graph directly (no n8n in front)
+    # legitimately never sends this, and load_config falls back to the
+    # CSV lookup by client_id in that case - see config.get_messages()'s
+    # client_row_override parameter.
+    raw_client_config: NotRequired[Optional[dict]]
+
     # ==========================================================
     # Cached per-tenant config (loaded once per thread by graph.py's
     # load_config node, not re-derived every turn)
