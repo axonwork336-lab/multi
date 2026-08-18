@@ -102,19 +102,36 @@ _TOOL_GROUPS: Dict[str, tuple] = {
         "list_branches_for_specialty",
     ),
 
+    # Looking for which DAYS a doctor has anything open.
     "searching_slots": (
         "list_available_days_for_booking",
-        "get_available_slots_for_booking",
         "get_doctor_schedule_for_booking",
         "get_doctor_schedule",
-        "get_available_reschedule_slots",
         "resolve_available_day",
         "get_next_weekday_date",
+    ),
+
+    # Looking for the TIMES inside a day the patient has already been
+    # given and accepted. Kept separate from "searching_slots" on
+    # purpose: by this point the date is settled, so saying "جاري البحث
+    # عن المواعيد" again reads as if the appointment that was just
+    # offered is being searched for all over again.
+    "searching_times": (
+        "get_available_slots_for_booking",
+        "get_available_reschedule_slots",
     ),
 
     "finding_booking": (
         "lookup_appointment",
         "check_booking_status",
+    ),
+
+    # Pulling up the PATIENT's own saved details (name, phone, email) to
+    # show them for review. Kept out of "finding_booking" on purpose:
+    # during a NEW booking there is no booking to look up yet, so
+    # "جاري البحث عن الحجز" describes something that doesn't exist and
+    # reads like the not-yet-created appointment is being searched for.
+    "finding_patient_details": (
         "get_patient_info",
     ),
 
@@ -195,9 +212,13 @@ _DEFAULT_MESSAGES: Dict[str, Dict[str, str]] = {
     "searching_branches": {"ar": "لحظة من فضلك، جاري البحث عن الفروع المتاحة… 🏥",
                            "en": "One moment please - looking up the available branches… 🏥"},
     "searching_slots":    {"ar": "لحظة من فضلك، جاري البحث عن المواعيد المتاحة… 🗓️",
-                           "en": "One moment please - checking the available times… 🗓️"},
+                           "en": "One moment please - checking the available days… 🗓️"},
+    "searching_times":    {"ar": "لحظة من فضلك، جاري البحث عن الأوقات المتاحة… 🕐",
+                           "en": "One moment please - checking the available times… 🕐"},
     "finding_booking":    {"ar": "لحظة من فضلك، جاري البحث عن الحجز… 🔎",
                            "en": "One moment please - looking up your booking… 🔎"},
+    "finding_patient_details": {"ar": "لحظة من فضلك، جاري البحث عن بياناتك… 🔎",
+                           "en": "One moment please - looking up your details… 🔎"},
     "creating_booking":   {"ar": "لحظة من فضلك، جاري تأكيد الحجز… ⏳",
                            "en": "One moment please - confirming your booking… ⏳"},
     "cancelling":         {"ar": "لحظة من فضلك، جاري تنفيذ طلب الإلغاء… ⏳",
