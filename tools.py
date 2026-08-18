@@ -3899,17 +3899,35 @@ def send_complaint_email(
 def request_human_handoff(
     state: Annotated[AgentState, InjectedState],
     reason: str,
+    patient_agreed: bool,
 ) -> dict:
-    """Signal the surrounding system (n8n) that this patient must be
-    handed off to a human staff member RIGHT NOW.
+    """Signal the surrounding system (n8n) to hand this patient off to a
+    human staff member RIGHT NOW.
 
-    Call this in the SAME turn you:
-      - the patient explicitly asks to speak to a person/customer
-        service/staff member ("موظف", "عايز أتكلم مع حد", "حد يرد
-        عليا", "human agent"), or
-      - you have genuinely exhausted what you can do for them (repeated
-        tool failures, a request truly outside this assistant's scope)
-        and are offering/confirming a staff handoff as the fallback.
+    A handoff ENDS the patient's conversation with you and puts them in a
+    queue, so it only ever happens with the patient's own say-so. There
+    are exactly two ways to get that, and `patient_agreed` must be True
+    for both:
+      - They ASKED for a person themselves ("موظف", "عايز أتكلم مع حد",
+        "حد يرد عليا", "human agent"), or
+      - You OFFERED a handoff in an earlier turn (e.g. after a real
+        failure you couldn't work around) and they said yes to that
+        offer in this turn.
+
+    Frustration is NOT agreement. A patient complaining that this isn't
+    working, insulting you, or saying "انت مش بتعرف تعمل حاجة" is telling
+    you they're upset - not asking to be transferred. In that situation
+    do NOT call this tool: apologize, and ASK whether they'd like you to
+    transfer them to a staff member. Then call it only after they say
+    yes. Confirmed real production failure: a frustrated patient who
+    never asked for anyone was transferred out of the conversation
+    immediately, with the reason logged as "patient frustrated,
+    requested human agent" when no such request had been made.
+
+    Pass `patient_agreed=False` if you are unsure whether they actually
+    agreed - the handoff is then NOT raised, and you should ask them
+    instead. Never set it True to describe a handoff you are about to
+    offer but they haven't accepted yet.
 
     This tool does NOT contact anyone itself and returns no
     patient-facing text - it only raises a flag that n8n reads from this
@@ -3918,11 +3936,21 @@ def request_human_handoff(
     in this same turn, exactly as usual.
 
     `reason` is for logs only, never shown to the patient - one short
-    phrase (e.g. "patient asked for staff", "repeated technical
-    failure"). Do NOT call this speculatively "just in case" - only when
-    a handoff is actually happening this turn.
+    phrase describing what they actually said (e.g. "patient asked for
+    staff", "patient accepted handoff offer after booking API failure").
 
-    Returns {"status": "handoff_requested"}."""
+    Returns {"status": "handoff_requested"} when raised, or
+    {"status": "not_requested", "reason": "patient_has_not_agreed"} when
+    `patient_agreed` was False - in which case ask them first."""
+
+    if not patient_agreed:
+        # Fail closed: an unconfirmed handoff silently drops rather than
+        # ending someone's conversation on an inference about their mood.
+        logger.info(
+            "request_human_handoff: NOT raised (patient has not agreed) session_id=%s client_id=%s reason=%r",
+            state.get("session_id"), state.get("client_id"), reason,
+        )
+        return {"status": "not_requested", "reason": "patient_has_not_agreed"}
 
     logger.info(
         "request_human_handoff: session_id=%s client_id=%s reason=%r",
