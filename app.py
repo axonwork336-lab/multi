@@ -47,6 +47,14 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    # Read by n8n's "IF - Escalate?" node - true the moment
+    # tools.request_human_handoff was called this turn (patient asked
+    # for staff, or a tool failure is being handed off).
+    escalate: bool = False
+    # Read by n8n to decide whether to look branch_name up in its own
+    # client_config data table (for lat/lng) and send a map pin.
+    location: bool = False
+    branch_name: str | None = None
 
 
 @app.get("/health")
@@ -62,16 +70,24 @@ def chat(req: ChatRequest) -> ChatResponse:
     )
 
     try:
-        reply = agent.send_message(req.client_id, req.session_id, req.message, channel_phone=req.channel_phone)
+        result = agent.send_message_with_signals(
+            req.client_id, req.session_id, req.message, channel_phone=req.channel_phone
+        )
     except Exception:
         logger.exception(
             "Graph invocation failed for session_id=%s client_id=%s", req.session_id, req.client_id
         )
         raise HTTPException(status_code=500, detail="internal_error: failed to process message")
 
-    logger.info("session_id=%s reply=%r", req.session_id, reply)
+    logger.info("session_id=%s reply=%r escalate=%s location=%s branch_name=%r",
+                req.session_id, result["reply"], result["escalate"], result["location"], result["branch_name"])
 
-    return ChatResponse(reply=reply)
+    return ChatResponse(
+        reply=result["reply"],
+        escalate=result["escalate"],
+        location=result["location"],
+        branch_name=result["branch_name"],
+    )
 
 
 @app.exception_handler(Exception)
