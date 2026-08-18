@@ -564,7 +564,22 @@ def get_messages(client_id: str, dialect: Optional[str] = None, client_row_overr
     merged["_agent_name"] = client_row.get("agent_name")
     merged["_agent_name_ar"] = client_row.get("agent_name_ar")
     merged["_base_url"] = _ENV_BASE_URL_OVERRIDE or client_row.get("base_url") or BASE_URL
-    merged["_doctors_base_url"] = _ENV_DOCTORS_BASE_URL_OVERRIDE or client_row.get("doctors_base_url") or None
+    # doctors_base_url falls back to base_url when the client's own
+    # config row doesn't set one explicitly - most clients run doctors/
+    # specialties off the SAME server as bookings, and requiring a
+    # second, separately-configured column for that (when it's usually
+    # identical) is one more place for the two to silently drift apart.
+    # A client that genuinely has no doctors/specialties feature at all
+    # (a real, deliberate distinction - not just an unset field) should
+    # set its OWN column to something falsy/blank explicitly if their
+    # config source supports that, or the environment override below can
+    # still force it off/on globally.
+    merged["_doctors_base_url"] = (
+        _ENV_DOCTORS_BASE_URL_OVERRIDE
+        or client_row.get("doctors_base_url")
+        or merged["_base_url"]
+        or None
+    )
     merged["_phone_example"] = client_row.get("phone_example")
     merged["_country_codes_hint"] = client_row.get("country_codes_hint")
     merged["_timezone"] = client_row.get("timezone") or DEFAULT_TIMEZONE
