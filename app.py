@@ -38,10 +38,20 @@ app = FastAPI(
 
 class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1, description="Stable per-conversation id (e.g. Messenger sender id)")
-    client_id: str = Field(..., min_length=1, description="Which client_config.csv row to use (clinic/tenant)")
+    client_id: str = Field(..., min_length=1, description="Which client_config.csv row to use (clinic/tenant) - only used as a fallback when client_config isn't sent")
     message: str = Field(..., min_length=1, description="The user's message text")
     channel_phone: str | None = Field(
         None, description="Optional verified channel identity phone (e.g. WhatsApp sender number)"
+    )
+    client_config: dict | None = Field(
+        None,
+        description=(
+            "The client's full config row, straight from n8n's own client_config "
+            "Data Table (n8n's single source of truth). When given, this is used "
+            "INSTEAD of looking client_id up in this project's bundled "
+            "client_config.csv - so n8n's Data Table no longer needs a matching "
+            "CSV row to work. Omit to keep the old CSV-lookup-by-client_id behavior."
+        ),
     )
 
 
@@ -71,7 +81,8 @@ def chat(req: ChatRequest) -> ChatResponse:
 
     try:
         result = agent.send_message_with_signals(
-            req.client_id, req.session_id, req.message, channel_phone=req.channel_phone
+            req.client_id, req.session_id, req.message,
+            channel_phone=req.channel_phone, client_config=req.client_config,
         )
     except Exception:
         logger.exception(
