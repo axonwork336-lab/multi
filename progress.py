@@ -36,21 +36,34 @@ A single turn can make six tool calls in sequence. Six "please wait"
 lines for one question is spam, so only the first one to fire is
 delivered; the rest are suppressed until the next user message.
 
-THE CLOCK RUNS FROM THE START OF THE TURN
------------------------------------------
-Not from each tool call - and the difference matters. A turn made of
-three 1.2s tool calls takes 3.6s, which is exactly the kind of wait the
-patient should be told about. But if every new tool call re-armed the
-timer, each one would reset the countdown before the previous had
-elapsed, and the message would never fire at all - the LONGEST turns
-would be the ones that went silent. Confirmed by scenario 4 in
-test_progress_scenarios.py, which existed before this was fixed and
-caught it.
+THE CLOCK RUNS FROM THE FIRST TOOL PHASE, NOT THE START OF THE TURN
+--------------------------------------------------------------------
+Not from each tool call individually, and NOT from when the patient's
+message first arrived either - both matter, for different reasons.
 
-So the elapsed time is measured against when the turn began. A later
-tool call in the same turn only updates the WORDING of the pending
-message (so it describes whatever is running now); it never restarts
-the clock.
+Not from the start of the turn: the time between the message arriving
+and the model deciding to call a tool is pure LLM "thinking" latency,
+often 1-1.5s on its own - nothing to do with how slow the tool phase
+itself is. Confirmed real production complaint: the interim message was
+firing on almost every tool call, including ones backed by an instant
+local check with no real external request at all, simply because that
+upstream decision latency had already eaten most of the delay budget
+before the first tool was even chosen. So the clock is anchored lazily,
+the first time THIS turn actually calls schedule() - i.e. right when a
+tool call is first decided - not at begin_turn().
+
+Not per individual tool call either: a turn made of three 1.2s tool
+calls takes 3.6s, which is exactly the kind of wait the patient should
+be told about. But if every new tool call re-armed the timer, each one
+would reset the countdown before the previous had elapsed, and the
+message would never fire at all - the LONGEST turns would be the ones
+that went silent. Confirmed by scenario 4 in test_progress_scenarios.py,
+which existed before this was fixed and caught it.
+
+So the elapsed time is measured against the first schedule() call of
+the turn. A later tool call in the same turn only updates the WORDING
+of the pending message (so it describes whatever is running now); it
+never restarts the clock.
 
 OFF BY DEFAULT
 --------------
@@ -237,9 +250,23 @@ _lock = threading.Lock()
 _timers: Dict[str, threading.Timer] = {}
 _delivered: Dict[str, bool] = {}
 
-# When the current turn began, per session. The countdown is measured
-# against this, not against whenever a tool call happened to be armed -
-# see "THE CLOCK RUNS FROM THE START OF THE TURN" above.
+# When the tool-running part of the current turn began, per session -
+# i.e. the moment schedule() is FIRST called for this turn (right when
+# the LLM decides to call a tool), NOT when the turn itself started.
+#
+# Deliberately NOT set in begin_turn(): the time between the patient's
+# message arriving and the model deciding to call a tool is pure LLM
+# "thinking" latency, not tool latency, and is typically 1-1.5s on its
+# own - i.e. it can consume the entire PROGRESS_DELAY_SECONDS budget by
+# itself. Confirmed real production complaint: the interim message was
+# firing on effectively every tool call, including ones backed by an
+# instant local check (e.g. "not_configured", no real request at all),
+# because the clock had already been ticking since before the tool was
+# even chosen. Anchoring here instead means the countdown measures only
+# the part the patient is actually shown a message about: how long the
+# tool phase itself is taking. A genuinely slow external call still
+# fires normally; a fast/instant one - even inside a turn where the LLM
+# calls themselves took a while - correctly does not.
 _turn_started: Dict[str, float] = {}
 
 # The message a pending timer will send when it fires: (client_id, text).
@@ -258,7 +285,11 @@ def begin_turn(session_id: str) -> None:
     with _lock:
         _cancel_locked(session_id)
         _delivered[session_id] = False
-        _turn_started[session_id] = time.monotonic()
+        # NOT set here on purpose - see _turn_started's comment above.
+        # Left over from a PRIOR turn shouldn't leak in either, so it's
+        # explicitly cleared; schedule() sets it fresh the first time
+        # it's actually called for this turn.
+        _turn_started.pop(session_id, None)
 
 
 def end_turn(session_id: str) -> None:
@@ -323,13 +354,20 @@ def schedule(
             _pending[session_id] = (client_id, text)
 
             if session_id in _timers:
-                # A countdown from this turn's start is already running.
-                # Leaving it alone is the whole point - re-arming here is
-                # what used to make long turns silent.
+                # A countdown from this turn's tool phase is already
+                # running. Leaving it alone is the whole point - re-arming
+                # here is what used to make long turns silent.
                 return
 
+            # Lazily anchor the clock HERE, the first time this turn
+            # actually reaches a tool call - not back at begin_turn(). See
+            # _turn_started's module-level comment for why.
             started = _turn_started.get(session_id)
-            elapsed = (time.monotonic() - started) if started else 0.0
+            if started is None:
+                started = time.monotonic()
+                _turn_started[session_id] = started
+
+            elapsed = time.monotonic() - started
             remaining = config.PROGRESS_DELAY_SECONDS - elapsed
 
             if remaining <= 0:
