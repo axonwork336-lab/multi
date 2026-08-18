@@ -910,11 +910,17 @@ def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list
     return doctors
 
 
-def _resolve_branch_by_name(base_url: str, branch_name: str, language: str = "ar") -> Optional[dict]:
+def _resolve_branch_by_name(base_url: str, branch_name: str, language: str = "ar", state=None) -> Optional[dict]:
     """Fuzzy-match the user's raw branch text against the clinic's real
     branch list. Returns the raw branch row, or None if nothing matched
     confidently. Used by the specialty -> branch -> doctor sequence so
-    the model never has to carry a branch id itself."""
+    the model never has to carry a branch id itself.
+
+    `state` is optional only so existing/direct callers keep working;
+    pass it whenever available, since it carries the client's configured
+    bilingual branch names - without it, a branch typed in a different
+    language than the API returns it in silently fails to match (see
+    _with_branch_aliases)."""
 
     branches_result = api.get_branches(base_url, page_size=200, language=language)
 
@@ -926,7 +932,9 @@ def _resolve_branch_by_name(base_url: str, branch_name: str, language: str = "ar
         return None
 
     branch_items = (branches_result["data"] or {}).get("items", [])
-    match_result = _fuzzy_match(branch_name, branch_items, ["name", "altName", "formatedName", "cityName"])
+    if state is not None:
+        branch_items = _with_branch_aliases(branch_items, state)
+    match_result = _fuzzy_match(branch_name, branch_items, ["name", "altName", "formatedName", "cityName", "_configAliases"])
 
     if match_result["result"] == "matched":
         return match_result["item"]
@@ -1187,7 +1195,7 @@ def find_available_doctors(
     matched_branch = None
 
     if branch_name and branch_name.strip():
-        matched_branch = _resolve_branch_by_name(base_url, branch_name, conversation_language(state))
+        matched_branch = _resolve_branch_by_name(base_url, branch_name, conversation_language(state), state=state)
 
         if matched_branch is None:
             logger.info("find_available_doctors: branch_name=%r did not match any branch", branch_name)
@@ -1842,6 +1850,65 @@ def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
     return {"result": "ambiguous", "items": close_matches[:5]}
 
 
+def _branch_alias_map(state) -> dict:
+    """Build {normalized alias -> [all normalized names for that branch]}
+    from the client's configured bilingual branch names.
+
+    Lets a branch typed in one language match an API record that only
+    carries the other one - see config.get_messages()'s _branch_aliases
+    for why this can't be solved by fuzzy matching alone."""
+
+    templates = (state or {}).get("templates") or {}
+    alias_map: dict = {}
+
+    for entry in templates.get("_branch_aliases") or []:
+        names = [_normalize_arabic(n) for n in (entry.get("aliases") or []) if n]
+        names = [n for n in names if n]
+        if len(names) < 2:
+            continue
+        for name in names:
+            alias_map.setdefault(name, [])
+            for other in names:
+                if other not in alias_map[name]:
+                    alias_map[name].append(other)
+
+    return alias_map
+
+
+def _with_branch_aliases(items: list, state) -> list:
+    """Return `items` with each branch's configured other-language
+    name(s) attached under `_configAliases`, so _fuzzy_match can match
+    against those too (it's given "_configAliases" as a name key).
+
+    Non-destructive: works on shallow copies, so the original API items
+    (and the ids/fields every caller relies on) are untouched."""
+
+    alias_map = _branch_alias_map(state)
+    if not alias_map:
+        return items
+
+    enriched = []
+    for item in items:
+        extra: list = []
+        for key in ("name", "altName", "formatedName"):
+            normalized = _normalize_arabic(item.get(key))
+            if not normalized:
+                continue
+            for alias in alias_map.get(normalized, []):
+                if alias and alias not in extra:
+                    extra.append(alias)
+        if extra:
+            copied = dict(item)
+            # _fuzzy_match reads one string per name key, so join with a
+            # separator it will still substring-match against.
+            copied["_configAliases"] = " | ".join(extra)
+            enriched.append(copied)
+        else:
+            enriched.append(item)
+
+    return enriched
+
+
 @tool
 def match_entity_info(
     state: Annotated[AgentState, InjectedState],
@@ -1891,13 +1958,17 @@ def match_entity_info(
         name_keys = ["formatedName", "altName", "name"]
     else:
         result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
-        name_keys = ["name", "altName", "formatedName", "cityName"]
+        name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
 
     if not result["success"]:
         logger.error("match_entity_info API call failed: entity_type=%s status_code=%s error=%s", entity_type, result.get("status_code"), result.get("error"))
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
+    if entity_type == "branch":
+        # Let a branch typed in one language match an API record
+        # carrying only the other one - see _with_branch_aliases.
+        items = _with_branch_aliases(items, state)
 
     if not user_input or not user_input.strip():
         if entity_type == "doctor":
@@ -2429,16 +2500,19 @@ def match_entity_for_booking(
 
         all_branch_items = (all_branches_result["data"] or {}).get("items", [])
         result = {"success": True, "data": {"items": [b for b in all_branch_items if b.get("id") in doctor_branch_ids]}, "error": None}
-        name_keys = ["name", "altName", "formatedName", "cityName"]
+        name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
     else:
         result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
-        name_keys = ["name", "altName", "formatedName", "cityName"]
+        name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
 
     if not result["success"]:
         logger.error("match_entity_for_booking API call failed: entity_type=%s status_code=%s error=%s", entity_type, result.get("status_code"), result.get("error"))
         return {"matched": False, "ambiguous": False, "status": "error"}
 
     items = (result["data"] or {}).get("items", [])
+    if entity_type == "branch":
+        # Same bilingual-name bridge as match_entity_info above.
+        items = _with_branch_aliases(items, state)
 
     def _shape(i):
         if entity_type == "doctor":
