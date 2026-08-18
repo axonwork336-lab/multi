@@ -3821,6 +3821,73 @@ def send_complaint_email(
     return {"status": "sent", "via": "smtp"}
 
 
+@tool
+def request_human_handoff(
+    state: Annotated[AgentState, InjectedState],
+    reason: str,
+) -> dict:
+    """Signal the surrounding system (n8n) that this patient must be
+    handed off to a human staff member RIGHT NOW.
+
+    Call this in the SAME turn you:
+      - the patient explicitly asks to speak to a person/customer
+        service/staff member ("موظف", "عايز أتكلم مع حد", "حد يرد
+        عليا", "human agent"), or
+      - you have genuinely exhausted what you can do for them (repeated
+        tool failures, a request truly outside this assistant's scope)
+        and are offering/confirming a staff handoff as the fallback.
+
+    This tool does NOT contact anyone itself and returns no
+    patient-facing text - it only raises a flag that n8n reads from this
+    turn's response and acts on. It does NOT replace your own reply:
+    still say the clinic's own handoff-confirmation line to the patient
+    in this same turn, exactly as usual.
+
+    `reason` is for logs only, never shown to the patient - one short
+    phrase (e.g. "patient asked for staff", "repeated technical
+    failure"). Do NOT call this speculatively "just in case" - only when
+    a handoff is actually happening this turn.
+
+    Returns {"status": "handoff_requested"}."""
+
+    logger.info(
+        "request_human_handoff: session_id=%s client_id=%s reason=%r",
+        state.get("session_id"), state.get("client_id"), reason,
+    )
+    return {"status": "handoff_requested"}
+
+
+@tool
+def share_branch_location(
+    state: Annotated[AgentState, InjectedState],
+    branch_name: str,
+) -> dict:
+    """Signal the surrounding system (n8n) to send this branch's map
+    location/pin to the patient.
+
+    Call this ONLY right after `match_entity_info` (entity_type=
+    "branch") has ACTUALLY matched a real branch and you are telling the
+    patient its address this turn - never call this with a branch name
+    you have not just confirmed exists via that tool, and never guess or
+    invent one. `branch_name` must be exactly the `name` field
+    `match_entity_info` returned for that branch (not the patient's raw
+    typed text, not a translation of it).
+
+    This tool does not send anything itself and returns no patient-
+    facing text - it only raises a flag (with the branch name) that n8n
+    reads from this turn's response, looks up that branch's coordinates,
+    and sends the actual map pin. Still give the patient the address in
+    text in this same reply, exactly as usual.
+
+    Returns {"status": "location_requested", "branch_name": branch_name}."""
+
+    logger.info(
+        "share_branch_location: session_id=%s client_id=%s branch_name=%r",
+        state.get("session_id"), state.get("client_id"), branch_name,
+    )
+    return {"status": "location_requested", "branch_name": branch_name}
+
+
 ALL_TOOLS = [
     validate_phone_format,
     compare_phone,
@@ -3850,4 +3917,6 @@ ALL_TOOLS = [
     get_available_slots_for_booking,
     find_best_doctor_in_specialty,
     send_complaint_email,
+    request_human_handoff,
+    share_branch_location,
 ]
