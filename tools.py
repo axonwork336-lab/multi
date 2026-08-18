@@ -846,10 +846,26 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
     call this before suggesting a specialty to a user describing a
     symptom/concern - never guess whether this clinic has a given
     specialty. Returns:
-    {"status": "found", "specialties": [{"id": ..., "name": ...}, ...]}
+    {"status": "found", "specialties": [{"id": ..., "name": ...,
+      "has_available_doctors": true}, ...]}
+    {"status": "no_bookable_specialties", "unstaffed_specialties": [names]}
+        # The clinic offers specialties on paper but has NO bookable
+        # doctor behind ANY of them right now. Say that plainly in your
+        # very next reply and offer a staff handoff - do NOT name these
+        # specialties as a recommendation, and never ask "shall I fetch
+        # the available doctors?" about them; nobody is available.
     {"status": "not_found"}  # this clinic has no specialties registered
     {"status": "not_configured"}  # this clinic doesn't have this feature set up yet
     {"status": "error"}  # the API call itself failed
+
+    IMPORTANT: `specialties` contains ONLY specialties that actually
+    have a bookable doctor right now. Ones with no available doctor are
+    deliberately left out, so anything in this list is safe to
+    recommend, and you can never accidentally walk a patient toward an
+    empty specialty. Never add a specialty of your own that isn't here.
+    (When availability couldn't be checked at all this call, the
+    `has_available_doctors` field is omitted and nothing is filtered -
+    treat that as unknown, not as unavailable.)
 
     IMPLEMENTATION NOTE: this uses the Specialties/GetList endpoint
     directly. An earlier version derived specialties from the doctors
@@ -902,9 +918,77 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
 
         specialties.append({"id": item["id"], "name": str(name).strip()})
 
-    logger.info("list_specialties: %d specialties returned, %d usable", len(items), len(specialties))
+    # Flag which specialties actually have a BOOKABLE doctor behind them.
+    # The specialties endpoint lists everything the clinic has
+    # registered, including specialties with nobody currently staffed or
+    # schedulable - which is correct for answering "do you offer X?",
+    # but on its own it leads the booking/guidance flows into a dead
+    # end. Confirmed real production failure: a patient describing
+    # headaches and insomnia was recommended "طب نفسي / علاج نفسي",
+    # asked whether to fetch doctors, said yes - and only then was told
+    # nobody is available in either, after being led all the way there.
+    # One extra call here lets the flow steer to a specialty that can
+    # actually be booked BEFORE making an offer it can't keep.
+    doctors_result = api.get_doctors(base_url, page_size=200, language=conversation_language(state))
+    staffed_specialty_ids = set()
+    availability_known = False
+    if doctors_result["success"]:
+        availability_known = True
+        for doctor in (doctors_result["data"] or {}).get("items", []):
+            # Apply the SAME hasSlots filter find_available_doctors uses.
+            # Counting every registered doctor here made this check
+            # weaker than the tool it's meant to protect: a specialty
+            # whose only doctors have no bookable slots passed as
+            # "available", and find_available_doctors then returned
+            # nothing for it - reproducing the exact dead end this check
+            # exists to prevent. "hasSlots is not False" (rather than
+            # "is True") mirrors that tool exactly, so a missing field
+            # stays optimistic in both places instead of silently
+            # hiding a bookable specialty.
+            if doctor.get("hasSlots") is False:
+                continue
+            specialty_id = doctor.get("specialtyId")
+            if specialty_id:
+                staffed_specialty_ids.add(specialty_id)
+    else:
+        logger.warning(
+            "list_specialties: could not check doctor availability per specialty (status_code=%s error=%s) - "
+            "returning specialties without availability flags",
+            doctors_result.get("status_code"), doctors_result.get("error"),
+        )
+
+    unstaffed_names = []
+
+    if availability_known:
+        for specialty in specialties:
+            specialty["has_available_doctors"] = specialty["id"] in staffed_specialty_ids
+
+        # Physically SEPARATE the unstaffed specialties out of the main
+        # list rather than just flagging them. The prompt already forbids
+        # recommending a specialty with has_available_doctors=false, and
+        # it kept happening anyway: confirmed real production failure
+        # (twice) - a patient with headaches and insomnia was recommended
+        # two psychiatry specialties, asked "تحبين أجيب لك دكاترة متاحين
+        # في هالتخصصات؟", said yes, and only THEN was told nobody is
+        # available in either. A flag the model has to remember to check
+        # is not a guarantee; a specialty that isn't in the list it reads
+        # from cannot be recommended at all.
+        staffed = [s for s in specialties if s.get("has_available_doctors")]
+        unstaffed = [s for s in specialties if not s.get("has_available_doctors")]
+        unstaffed_names = [s.get("name") for s in unstaffed if s.get("name")]
+        specialties = staffed
+
+    logger.info(
+        "list_specialties: %d specialties returned, %d bookable, %d with no available doctors (%s)",
+        len(items), len(specialties), len(unstaffed_names), unstaffed_names or "none",
+    )
 
     if not specialties:
+        # Every specialty this clinic offers is currently unstaffed (or
+        # none matched). Say so in the FIRST reply instead of offering to
+        # look for doctors that don't exist.
+        if unstaffed_names:
+            return {"status": "no_bookable_specialties", "unstaffed_specialties": unstaffed_names}
         return {"status": "not_found"}
 
     return {"status": "found", "specialties": specialties}
@@ -3963,10 +4047,67 @@ def send_complaint_email(
     Use one bullet point per distinct issue if there are several.
     `branch` can be an empty string / "غير محدد" if not applicable.
 
+    Every other field is genuinely required and is checked before
+    anything is sent: an incomplete complaint comes back as
+    "incomplete" and is NOT delivered. Never call this in the same turn
+    the patient first describes their problem - a complaint can't be
+    recalled or amended once it reaches the quality team, so collect
+    the details, name, and phone first and confirm them.
+
     Returns:
     {"status": "sent"}
+    {"status": "incomplete", "missing": [...], "reason": ...}
+        # Required details are missing or too thin to act on - NOTHING
+        # was sent. Go back and collect what's listed in `missing` (one
+        # question per message), confirm it with the patient, then call
+        # this again. Do NOT tell them the complaint was submitted.
     {"status": "not_configured"}  # this clinic has no complaint recipient email(s) set up
     {"status": "error"}  # sending failed (webhook or SMTP error)"""
+
+    # Deterministic completeness check, BEFORE any delivery attempt.
+    # The flow in prompts.py already spells out collecting these one at
+    # a time, but a prose instruction is not a guarantee: confirmed real
+    # production failure - `send_complaint_email` was called in the very
+    # same turn the patient first said "المستشفى مش نضيفة", with no
+    # follow-up questions, no name, and no confirmation step. Only the
+    # clinic's missing email configuration stopped a half-empty
+    # complaint from reaching the quality team. A complaint sent
+    # incomplete cannot be recalled or amended, so the check lives here
+    # where it cannot be skipped.
+    missing = []
+
+    normalized_details = (details or "").strip()
+    if not normalized_details:
+        missing.append("details")
+    elif len(normalized_details) < 10:
+        # Long enough to be an actual description rather than a stray
+        # word, a single emoji, or a fragment like "وحش".
+        missing.append("details")
+
+    if not (patient_name or "").strip():
+        missing.append("patient_name")
+
+    if not (phone or "").strip():
+        missing.append("phone")
+
+    if not (category or "").strip():
+        missing.append("category")
+
+    # `branch` is deliberately NOT required - a complaint about the
+    # clinic as a whole legitimately has no branch, and demanding one
+    # would force exactly the irrelevant question the complaint flow is
+    # meant to avoid.
+
+    if missing:
+        logger.warning(
+            "send_complaint_email: REFUSED to send an incomplete complaint for client_id=%s session_id=%s - missing/insufficient: %s",
+            state.get("client_id"), state.get("session_id"), missing,
+        )
+        return {
+            "status": "incomplete",
+            "missing": missing,
+            "reason": "collect and confirm these with the patient first, then call again",
+        }
 
     templates = state.get("templates") or {}
     to_emails_raw = templates.get("_complaint_email_to", "")
