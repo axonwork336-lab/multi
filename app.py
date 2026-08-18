@@ -17,7 +17,7 @@ import logging
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import config
 import main as agent  # unmodified from this point of view: send_message()
@@ -36,9 +36,25 @@ app = FastAPI(
 )
 
 
+# Request fields that are the CALL's own parameters, never part of the
+# client's config row - used to separate the two when a caller sends the
+# config flattened into the top level (see ChatRequest.resolved_client_config).
+_CALL_FIELDS = frozenset({"session_id", "client_id", "message", "channel_phone", "client_config"})
+
+
 class ChatRequest(BaseModel):
+    # extra="allow" on purpose: n8n's Data Table row is commonly spread
+    # straight into the request body at the TOP LEVEL (clinic_name,
+    # msg_unknown_fallback, base_url, ... all as sibling fields of
+    # session_id/message), rather than nested under a "client_config"
+    # key. Rejecting or silently dropping those extras is exactly what
+    # made a fully-populated n8n config look completely empty on this
+    # side - confirmed directly from a real request body. Accepting both
+    # shapes means neither end has to be reshaped to match the other.
+    model_config = ConfigDict(extra="allow")
+
     session_id: str = Field(..., min_length=1, description="Stable per-conversation id (e.g. Messenger sender id)")
-    client_id: str = Field(..., min_length=1, description="Which client_config.csv row to use (clinic/tenant) - only used as a fallback when client_config isn't sent")
+    client_id: str = Field(..., min_length=1, description="Which client to use (clinic/tenant) - only used as a fallback when no config is sent")
     message: str = Field(..., min_length=1, description="The user's message text")
     channel_phone: str | None = Field(
         None, description="Optional verified channel identity phone (e.g. WhatsApp sender number)"
@@ -50,9 +66,24 @@ class ChatRequest(BaseModel):
             "Data Table (n8n's single source of truth). When given, this is used "
             "INSTEAD of looking client_id up in this project's bundled "
             "client_config.csv - so n8n's Data Table no longer needs a matching "
-            "CSV row to work. Omit to keep the old CSV-lookup-by-client_id behavior."
+            "CSV row to work. May ALSO be sent flattened into the top level of "
+            "the request body instead of nested here; both are accepted. Omit "
+            "entirely to keep the old CSV-lookup-by-client_id behavior."
         ),
     )
+
+    def resolved_client_config(self) -> dict | None:
+        """The client's config row for this request, from whichever shape
+        the caller used: the nested `client_config` object if present,
+        otherwise any extra top-level fields (n8n's Data Table row spread
+        flat into the body). Returns None when neither is present, which
+        is what makes config.get_messages() fall back to the CSV."""
+
+        if self.client_config:
+            return self.client_config
+
+        extras = {k: v for k, v in (self.model_extra or {}).items() if k not in _CALL_FIELDS}
+        return extras or None
 
 
 class ChatResponse(BaseModel):
@@ -79,10 +110,37 @@ def chat(req: ChatRequest) -> ChatResponse:
         req.session_id, req.client_id, req.message, req.channel_phone,
     )
 
+    resolved_config = req.resolved_client_config()
+
+    # Diagnostic ONLY - never logs the actual values (tokens, phone
+    # numbers, etc. can live in this dict), just whether a client config
+    # arrived this turn (in either shape) and whether the handful of
+    # fields most symptoms trace back to are actually present in it. This
+    # turns "is the config even arriving?" from an inference from side
+    # effects (an empty greeting, a doctor list falling back to
+    # not_configured) into a direct one-line answer in the logs.
+    if resolved_config:
+        logger.info(
+            "session_id=%s: client config received (%s), %d key(s): %s | "
+            "has msg_unknown_fallback=%s base_url=%s doctors_base_url=%s",
+            req.session_id,
+            "nested" if req.client_config else "flattened top-level",
+            len(resolved_config), sorted(resolved_config.keys()),
+            bool(resolved_config.get("msg_unknown_fallback")),
+            bool(resolved_config.get("base_url")),
+            bool(resolved_config.get("doctors_base_url")),
+        )
+    else:
+        logger.info(
+            "session_id=%s: NO client config in this request - falling back to "
+            "client_config.csv lookup for client_id=%s",
+            req.session_id, req.client_id,
+        )
+
     try:
         result = agent.send_message_with_signals(
             req.client_id, req.session_id, req.message,
-            channel_phone=req.channel_phone, client_config=req.client_config,
+            channel_phone=req.channel_phone, client_config=resolved_config,
         )
     except Exception:
         logger.exception(
