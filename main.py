@@ -178,7 +178,7 @@ def _turn_signals(messages: list) -> dict:
     return {"escalate": escalate, "location": location, "branch_name": branch_name}
 
 
-def send_message(client_id: str, session_id: str, message: str, channel_phone: str = None) -> str:
+def send_message(client_id: str, session_id: str, message: str, channel_phone: str = None, client_config: dict = None) -> str:
     """
     Send one user message for `session_id` and return the agent's reply
     text for this turn.
@@ -206,10 +206,14 @@ def send_message(client_id: str, session_id: str, message: str, channel_phone: s
     See _config_for() for exactly how these two triggers are evaluated.
     """
 
-    return send_message_with_signals(client_id, session_id, message, channel_phone=channel_phone)["reply"]
+    return send_message_with_signals(
+        client_id, session_id, message, channel_phone=channel_phone, client_config=client_config
+    )["reply"]
 
 
-def send_message_with_signals(client_id: str, session_id: str, message: str, channel_phone: str = None) -> Dict:
+def send_message_with_signals(
+    client_id: str, session_id: str, message: str, channel_phone: str = None, client_config: dict = None
+) -> Dict:
     """
     Same as send_message(), but returns a dict with the reply text PLUS
     the two n8n-facing signals for this turn:
@@ -222,6 +226,16 @@ def send_message_with_signals(client_id: str, session_id: str, message: str, cha
     - location=True (with branch_name set) means a branch's address was
       just given - n8n looks branch_name up in its own client_config
       data table for lat/lng and sends the map pin.
+
+    `client_config`: the client's full config row, straight from n8n's
+    own client_config Data Table (n8n's single source of truth) - passed
+    through to graph state as-is and used INSTEAD of this project's
+    bundled client_config.csv for this turn. Sent fresh on every /chat
+    call (n8n already fetches it before calling us, so there's no extra
+    round trip), which also means a config edit in n8n's Data Table
+    takes effect on the very next message, no redeploy needed. Omit (or
+    pass None) to keep the old CSV-lookup-by-client_id behavior - what
+    the CLI still does.
 
     See send_message()'s docstring for the reset/session behavior, which
     is identical here.
@@ -257,6 +271,7 @@ def send_message_with_signals(client_id: str, session_id: str, message: str, cha
                 "client_id": client_id,
                 "session_id": session_id,
                 "channel_phone": channel_phone,
+                "raw_client_config": client_config,
                 "messages": [HumanMessage(content=message)],
             }
 
