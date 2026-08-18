@@ -1,5 +1,5 @@
 """
-Central configuration for the Guest Booking Cancellation Agent.
+Central configuration for the  Agent.
 
 All environment-dependent values live here so that services/nodes never
 hardcode URLs, credentials, tunable settings, or CSV paths directly.
@@ -297,6 +297,17 @@ SESSION_TIMEOUT_SECONDS: int = int(os.getenv("SESSION_TIMEOUT_SECONDS", "3600"))
 # the same conversation as normal (no repeated greeting). See main.py's
 # _config_for()/_cancellation_just_succeeded().
 POST_SUCCESS_TIMEOUT_SECONDS: int = int(os.getenv("POST_SUCCESS_TIMEOUT_SECONDS", "600"))  # 10 minutes
+
+# Caps how many of the most recent chat messages (human/AI/tool) are
+# actually sent to the LLM each turn - the checkpointer still keeps the
+# FULL history for the thread (nothing is deleted), this only trims what
+# graph.py's agent() sends in the prompt. Without this, a long-running
+# conversation resends its entire history (plus the ~1000+ token system
+# prompt) on every single turn, growing without bound and driving up
+# both cost and latency turn over turn. 40 messages is roughly the last
+# 15-20 back-and-forth exchanges, comfortably more than the flows in
+# prompts.py ever need to look back on. See graph.py's agent().
+MAX_HISTORY_MESSAGES: int = int(os.getenv("MAX_HISTORY_MESSAGES", "40"))
 
 
 # ==========================================================
