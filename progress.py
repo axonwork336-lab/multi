@@ -271,6 +271,21 @@ _lock = threading.Lock()
 _timers: Dict[str, threading.Timer] = {}
 _delivered: Dict[str, bool] = {}
 
+# Sessions whose turn is CURRENTLY being processed. Set by begin_turn,
+# removed by end_turn.
+#
+# threading.Timer.cancel() only prevents a timer that hasn't started yet;
+# a timer that already fired and is midway through _fire/_deliver keeps
+# going regardless. That leaves a real race: the countdown elapses just
+# as the turn finishes, and the "please wait" line is delivered AFTER
+# the actual answer has already been sent. Confirmed in production from
+# a patient's own chat - the answer arrived, and only then did "لحظة من
+# فضلك، جاري البحث عن الأطباء المتاحين" show up underneath it, which
+# reads as though the assistant started working after it had replied.
+# _deliver re-checks this set immediately before sending, so a turn that
+# has ended can no longer emit anything.
+_in_flight: Dict[str, bool] = {}
+
 # When the tool-running part of the current turn began, per session -
 # i.e. the moment schedule() is FIRST called for this turn (right when
 # the LLM decides to call a tool), NOT when the turn itself started.
@@ -305,6 +320,7 @@ def begin_turn(session_id: str) -> None:
 
     with _lock:
         _cancel_locked(session_id)
+        _in_flight[session_id] = True
         _delivered[session_id] = False
         # NOT set here on purpose - see _turn_started's comment above.
         # Left over from a PRIOR turn shouldn't leak in either, so it's
@@ -321,6 +337,10 @@ def end_turn(session_id: str) -> None:
     """
 
     with _lock:
+        # Cleared before anything else: a timer thread already inside
+        # _fire is blocked on this same lock right now, and this is what
+        # it will see the moment it acquires it.
+        _in_flight.pop(session_id, None)
         _cancel_locked(session_id)
         _delivered.pop(session_id, None)
         _turn_started.pop(session_id, None)
@@ -427,6 +447,15 @@ def _deliver(session_id: str, client_id: str, text: str) -> None:
 
     with _lock:
         if _delivered.get(session_id):
+            return
+        if not _in_flight.get(session_id):
+            # The turn finished while this timer was on its way in. The
+            # real reply has already gone out (or is about to), so an
+            # interim "please wait" now would arrive after the answer.
+            logger.info(
+                "progress[%s]: suppressed %r - the turn already finished",
+                session_id, text,
+            )
             return
         _delivered[session_id] = True
         _timers.pop(session_id, None)
