@@ -38,8 +38,49 @@ logger = logging.getLogger(__name__)
 # Result helper
 # ==========================================================
 
-def _result(success: bool, status_code: Optional[int] = None, data=None, error: Optional[str] = None) -> dict:
-    return {"success": success, "status_code": status_code, "data": data, "error": error}
+def _result(success: bool, status_code: Optional[int] = None, data=None, error: Optional[str] = None,
+            details: Optional[list] = None) -> dict:
+    return {"success": success, "status_code": status_code, "data": data, "error": error,
+            "details": details or []}
+
+
+def _validation_details(response) -> list:
+    """Pull field-level validation complaints out of a 4xx body.
+
+    The API reports these as {"messages": [{"prop": "MobileNumber",
+    "message": "Mobile Number Not Valid"}], ...}. Without surfacing them,
+    every 400 collapses into one opaque "validation_error" and the
+    patient is told there's a "technical problem" they should retry later
+    - when in fact something specific and fixable was rejected (a phone
+    number in the wrong format, a missing email) that retrying will
+    never resolve. Confirmed real production failure: a booking was
+    refused because the patient's mobile number wasn't accepted, and the
+    reply blamed a technical fault instead of mentioning the number.
+
+    Returns [{"field": ..., "message": ...}, ...], or [] if the body
+    isn't in that shape."""
+
+    try:
+        body = response.json()
+    except ValueError:
+        return []
+
+    if not isinstance(body, dict):
+        return []
+
+    details = []
+    for entry in body.get("messages") or []:
+        if not isinstance(entry, dict):
+            continue
+        message = entry.get("message") or entry.get("Message")
+        if not message:
+            continue
+        details.append({
+            "field": entry.get("prop") or entry.get("Prop") or "",
+            "message": str(message),
+        })
+
+    return details
 
 
 def _headers(client_id: Optional[str] = None, language: Optional[str] = None) -> dict:
@@ -126,8 +167,13 @@ def _post_bookings(url: str, payload: dict, language: Optional[str], client_id: 
         return _result(False, response.status_code, error="authentication_error")
 
     if response.status_code >= 400:
-        logger.error("GuestBookings API validation error: %s status=%s body=%s", url, response.status_code, response.text[:500])
-        return _result(False, response.status_code, error="validation_error")
+        details = _validation_details(response)
+        logger.error(
+            "GuestBookings API validation error: %s status=%s body=%s rejected_fields=%s",
+            url, response.status_code, response.text[:500],
+            [d["field"] for d in details] or "unknown",
+        )
+        return _result(False, response.status_code, error="validation_error", details=details)
 
     try:
         body = response.json()
@@ -308,8 +354,13 @@ def _post_json(url: str, payload: dict, client_id: Optional[str] = None, languag
         return _result(False, response.status_code, error="endpoint_not_found")
 
     if response.status_code >= 400:
-        logger.error("Doctors/Specialties API validation error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
-        return _result(False, response.status_code, error="validation_error")
+        details = _validation_details(response)
+        logger.error(
+            "Doctors/Specialties API validation error: %s status=%s body=%s rejected_fields=%s",
+            url, response.status_code, response.text[:1000],
+            [d["field"] for d in details] or "unknown",
+        )
+        return _result(False, response.status_code, error="validation_error", details=details)
 
     try:
         body = response.json()
@@ -585,11 +636,13 @@ def _put_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict:
         return _result(False, response.status_code, error="endpoint_not_found")
 
     if response.status_code >= 400:
+        details = _validation_details(response)
         logger.error(
-            "GuestBookings/Update validation error: %s status=%s payload=%s body=%r headers=%s",
+            "GuestBookings/Update validation error: %s status=%s payload=%s body=%r headers=%s rejected_fields=%s",
             url, response.status_code, payload, response.text[:1000], dict(response.headers),
+            [d["field"] for d in details] or "unknown",
         )
-        return _result(False, response.status_code, error="validation_error")
+        return _result(False, response.status_code, error="validation_error", details=details)
 
     try:
         body = response.json()
