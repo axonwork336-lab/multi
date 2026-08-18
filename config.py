@@ -1,5 +1,5 @@
 """
-Central configuration for the  Agent.
+Central configuration for the Guest Booking Cancellation Agent.
 
 All environment-dependent values live here so that services/nodes never
 hardcode URLs, credentials, tunable settings, or CSV paths directly.
@@ -513,16 +513,29 @@ def get_dialect_template(dialect: str) -> Optional[dict]:
     return None
 
 
-def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
+def get_messages(client_id: str, dialect: Optional[str] = None, client_row_override: Optional[dict] = None) -> dict:
     """
     Build the merged message-template dict used by build_response and the
     system prompt equivalent throughout the graph.
 
     Resolution order:
       1. Start with the dialect row for `dialect`, or the client's own
-         `Dialect` column from client_config.csv if `dialect` isn't given.
-      2. Overlay any non-empty client_config.csv values for the keys both
-         files define (_CLIENT_OVERRIDE_KEYS).
+         `Dialect` column (from `client_row_override` if given, else
+         client_config.csv) if `dialect` isn't given.
+      2. Overlay any non-empty client-row values for the keys both
+         sources define (_CLIENT_OVERRIDE_KEYS).
+
+    `client_row_override`: when given (not None), this dict is used
+    AS the client's config row INSTEAD of looking client_id up in
+    client_config.csv - this is how a client's full config, sent fresh
+    by n8n on every /chat request (its own Data Table row, which is n8n's
+    single source of truth for client config), takes over from this
+    project's bundled CSV without needing a matching row there too. Pass
+    None (the default) to keep the original CSV-lookup behavior - used by
+    the CLI and anything invoking the graph directly without going
+    through n8n. An override that resolves to falsy (empty dict/None) is
+    treated as "use the CSV" too, since an override that provides
+    literally nothing is indistinguishable from not overriding at all.
 
     Returns a plain dict (never raises); missing config degrades to an
     empty dict, and format_message()'s own built-in English/Arabic
@@ -530,7 +543,7 @@ def get_messages(client_id: str, dialect: Optional[str] = None) -> dict:
     from there.
     """
 
-    client_row = get_client_config(client_id) or {}
+    client_row = client_row_override or get_client_config(client_id) or {}
 
     effective_dialect = dialect or client_row.get("Dialect")
 
