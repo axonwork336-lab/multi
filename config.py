@@ -584,6 +584,43 @@ def get_messages(client_id: str, dialect: Optional[str] = None, client_row_overr
         or merged["_base_url"]
     )
     merged["_phone_example"] = client_row.get("phone_example")
+    # Bilingual branch name pairs from the client's own config row, as
+    # [{"name": <as the booking API knows it>, "aliases": [...]}, ...].
+    #
+    # The booking API returns each branch under ONE name only (typically
+    # the English one, e.g. "Al Nozha"), but patients naturally type the
+    # Arabic one ("النزهة") - and fuzzy matching cannot bridge those two,
+    # since they share no letters at all. Confirmed real production
+    # failure: a patient was told their branch didn't exist after typing
+    # its Arabic name, then the SAME branch matched instantly when they
+    # retyped it as "nozha". The config row is the only place both names
+    # for the same branch appear together, so it's the only thing that
+    # can link them - see tools._branch_alias_map().
+    #
+    # Kept generic (a list, not branch1_/branch2_ specific) so a client
+    # with more than two branches only needs more columns, not a code
+    # change here.
+    branch_aliases = []
+    index = 1
+    while True:
+        name = client_row.get(f"branch{index}_name")
+        name_ar = client_row.get(f"branch{index}_name_ar")
+        if not name and not name_ar:
+            # Allow one gap (e.g. branch2 removed but branch3 still set)
+            # before giving up, but don't scan forever.
+            if index > 10:
+                break
+            index += 1
+            if index > 10:
+                break
+            continue
+        aliases = [str(v).strip() for v in (name, name_ar) if v and str(v).strip()]
+        if len(aliases) > 1:
+            branch_aliases.append({"name": aliases[0], "aliases": aliases})
+        index += 1
+        if index > 10:
+            break
+    merged["_branch_aliases"] = branch_aliases
     merged["_country_codes_hint"] = client_row.get("country_codes_hint")
     merged["_timezone"] = client_row.get("timezone") or DEFAULT_TIMEZONE
     merged["_knowledge_base_file"] = client_row.get("knowledge_base_file") or ""
