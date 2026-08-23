@@ -121,8 +121,19 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         (10, r"\bbook\b[^.\n]{0,25}\b(?:appointment|slot|consultation|visit|doctor)\b"),
         (10, r"\bnew\s+(?:appointment|booking)\b"),
         (10, r"\bmake\s+(?:an?\s+)?appointment\b"),
-        (6, r"(?:^|\s)(?:احجز|أحجز|احجزلي|احجز\s*لي|اريد\s*الحجز|عايز\s*حجز|عاوز\s*حجز|ابغى\s*احجز)(?:\s|$)"),
-        (6, r"\b(?:booking|reserve|schedule)\s+(?:an?\s+)?(?:appointment|visit|consultation)\b"),
+        # A bare "احجز" ("book!") with no object attached is still an
+        # unambiguous imperative - not a hint, an instruction. Confirmed
+        # real production failure: a patient mid-MEDICAL-flow typed just
+        # "احجز" and stayed on MEDICAL anyway because this pattern's old
+        # weight (6) sat below _SWITCH_THRESHOLD (8), so nothing about
+        # this obviously-clear message could interrupt the active flow.
+        # Everything downstream then ran without match_entity_for_booking/
+        # list_available_days_for_booking - the exact chain of failures
+        # (invented-sounding branch prompts, "pick a day yourself"
+        # questions) already fixed once for OTHER booking-intent phrases.
+        # Weighted to clear the mid-flow switch threshold on its own.
+        (9, r"(?:^|\s)(?:احجز|أحجز|احجزلي|احجز\s*لي|اريد\s*الحجز|عايز\s*حجز|عاوز\s*حجز|ابغى\s*احجز)(?:\s|$)"),
+        (9, r"\b(?:booking|reserve|schedule)\s+(?:an?\s+)?(?:appointment|visit|consultation)\b"),
         # Asking WHEN a specific doctor/specialty has an opening ("ايه
         # مواعيد", "اقرب معاد") is a request for a real bookable slot,
         # not small talk - it needs `list_available_days_for_booking`,
@@ -138,8 +149,14 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         # Excludes "مواعيد العمل/الدوام" (opening hours) and "مواعيد
         # الزيارة" (visiting hours), which are FAQ questions, not a
         # request for a bookable slot.
+        # (?:ال)? IS LOAD-BEARING: confirmed real production miss -
+        # "ايه المواعيد" (with the definite article glued onto the noun,
+        # as patients very commonly phrase it) did NOT match this
+        # pattern at all when it only accounted for the bare noun
+        # "مواعيد", so the router silently kept MEDICAL active on
+        # exactly the kind of message this rule exists to catch.
         (8, r"(?:ايه|إيه|في|فيه|عنده|عندها|فاضي|فاضيه)\s*"
-            r"(?:مواعيد|معاد|ميعاد)(?!\s*(?:العمل|الدوام|الزياره))"),
+            r"(?:ال)?(?:مواعيد|معاد|ميعاد)(?!\s*(?:العمل|الدوام|الزياره))"),
         (8, r"(?:اقرب|أقرب)\s*(?:معاد|موعد|ميعاد)"),
         (8, r"\b(?:nearest|soonest|earliest)\s+(?:appointment|slot|opening)\b"),
         (8, r"\bwhat\s+(?:appointments|times|slots)\s+(?:are\s+)?(?:available|open)\b"),
