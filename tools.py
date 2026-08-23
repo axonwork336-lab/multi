@@ -3723,10 +3723,13 @@ def list_available_days_for_booking(
     is open, that single date is shown on its own and the patient is
     simply asked whether it suits them.
 
-    Deliberately still a small number, not the whole window: a doctor
-    with a weekly clinic produces the same appointment repeated at
-    different dates ("Saturday 22/08, Saturday 29/08, Saturday
-    05/09..."), and twenty of those is noise rather than a choice.
+    ONE DATE PER WEEKDAY. The days returned are always DIFFERENT days of
+    the week - the doctor's actual working days, each at its own soonest
+    date. A weekly clinic can never come back as "Monday 24/08, Monday
+    31/08, Monday 07/09": that is one option printed three times, and it
+    is filtered out here rather than left for you to notice. So a doctor
+    who works only Mondays returns exactly ONE day, and you should
+    present it as the soonest available date rather than as a list.
 
     If none of them suit ("مش مناسب", "معاد أبعد", "في مواعيد تانية؟")
     call this AGAIN with the result's own `next_offset` to show the
@@ -3941,12 +3944,37 @@ def list_available_days_for_booking(
     MAX_VERIFY_CALLS = 8
     consumed = 0
 
+    # ONE DATE PER WEEKDAY.
+    #
+    # A doctor with a weekly clinic has the same appointment repeated
+    # every seven days, so the nearest three dates are routinely
+    # "الاثنين 24/08, الاثنين 31/08, الاثنين 07/09" - the same day of
+    # the week three times over. That is not a choice; it is one option
+    # printed three times, and it pushes the genuinely different days
+    # the doctor works off the bottom of the list.
+    #
+    # Confirmed directly: this exact list was produced in production and
+    # rejected. So a weekday already represented is skipped, and the
+    # next DIFFERENT one is looked for instead. The patient sees the
+    # doctor's actual working days ("الاثنين، الثلاثاء، السبت"), each at
+    # its own soonest date, which is what they need in order to pick.
+    #
+    # A doctor who genuinely only works one weekday still yields exactly
+    # one entry, and the single-day block is used - the same outcome the
+    # old `limit=1` produced, arrived at because it is true rather than
+    # by capping the list.
+    seen_weekdays = set()
+
     for date_iso in all_dates[offset:]:
         if len(days) >= limit:
             break
 
         slot_times = sorted(by_date[date_iso])
         first = slot_times[0]
+
+        if first.weekday() in seen_weekdays:
+            consumed += 1
+            continue
 
         day_start = datetime.combine(first.date(), datetime.min.time(), tzinfo=first.tzinfo)
         day_end = datetime.combine(first.date(), datetime.max.time().replace(microsecond=0), tzinfo=first.tzinfo)
@@ -3974,6 +4002,8 @@ def list_available_days_for_booking(
                 # the patient will actually be shown next.
                 slot_times = real_slots
                 first = slot_times[0]
+
+        seen_weekdays.add(first.weekday())
 
         days.append({
             "date": date_iso,
@@ -4282,6 +4312,10 @@ def get_doctor_schedule_for_booking(
             "branchName": branch_display_name if (branch_display_name and item.get("branchId") == session.get("branch_id")) else item.get("branchName"),
             "branchId": item.get("branchId"),
             "doctorName": doctor_display_name or item.get("doctorName"),
+            # The service NAME only ("كشف رمد") - never its price. Fees
+            # stay private until `get_doctor_fees` is called on an
+            # explicit request; see prompts.py's FEES rule.
+            "serviceName": _service_name(item, conversation_language(state)),
         }
         for item in items
     ]
