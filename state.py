@@ -115,3 +115,13 @@ class AgentState(TypedDict):
     # Why the router made that choice, for the logs only - never shown
     # to the patient, who must never learn there is more than one agent.
     routing_reason: NotRequired[Optional[str]]
+
+    # Which specialist owned the PREVIOUS turn. Lets a specialist tell
+    # "I have been running this flow for several turns" apart from "I
+    # have just taken this conversation over", which is the difference
+    # between a patient detouring mid-booking and a patient abandoning
+    # one - see graph.py's _build_abandoned_booking_directive.
+    #
+    # NotRequired for the same reason as the fields above: threads
+    # checkpointed before it existed must keep resuming cleanly.
+    previous_agent: NotRequired[Optional[str]]
