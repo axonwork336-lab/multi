@@ -785,6 +785,38 @@ def _get_booking_session(session_id: str) -> dict:
     })
 
 
+def _remember_specialty_ids(session: dict, specialty_ids: Optional[list]) -> None:
+    """Fold newly-used specialty ids into the session's remembered set,
+    rather than replacing it outright.
+
+    WHY: confirmed real production failure. The model is repeatedly told
+    to pass ALL plausibly-matching specialty ids in ONE call (see
+    find_available_doctors/list_branches_for_specialty docstrings), but
+    in practice it sometimes calls the same tool once PER specialty
+    instead - e.g. find_available_doctors(['باطنة']) immediately followed
+    by find_available_doctors(['نساء وتوليد']). Each call used to
+    OVERWRITE session["specialty_ids"] outright, so after the second
+    call the session only remembered نساء وتوليد - the patient's actual
+    (باطنة) doctor then vanished from every later specialty-filtered
+    lookup. `match_entity_for_booking` uses this same session value to
+    narrow its doctor query, and with only the wrong specialty id left
+    in it, a real, bookable doctor came back as "couldn't find them in
+    the system" - a booking dead-end for a doctor who was on-screen
+    moments earlier. Merging (union, order-preserving) means a second
+    call for a different specialty ADDS to what's remembered instead of
+    silently discarding the first."""
+
+    if not specialty_ids:
+        return
+
+    existing = session.get("specialty_ids") or []
+    merged = list(existing)
+    for sid in specialty_ids:
+        if sid not in merged:
+            merged.append(sid)
+    session["specialty_ids"] = merged
+
+
 def _remember_list(state: AgentState, entity_type: str, items: list) -> None:
     """Record the list of doctors/branches just returned to the model, so
     a later bare-number reply can be resolved against the SAME ordering
@@ -1156,8 +1188,7 @@ def list_branches_for_specialty(
     if not specialty_ids:
         specialty_ids = session.get("specialty_ids") or []
 
-    if specialty_ids:
-        session["specialty_ids"] = list(specialty_ids)
+    _remember_specialty_ids(session, specialty_ids)
 
     now = datetime.utcnow()
     intersection_start = now.isoformat() + "Z"
@@ -1326,6 +1357,19 @@ def find_available_doctors(
     so a doctor registered under any of them is found. Do not conclude
     "no doctors available" after checking only one plausible specialty.
 
+    NEVER call this tool ONCE PER SPECIALTY as a substitute for one
+    combined call - e.g. calling it with ["<internal-medicine-id>"] and
+    then immediately again with ["<gynaecology-id>"]. Confirmed real
+    production failure: doing exactly that made the SECOND call's
+    specialty silently become the only one this booking remembers going
+    forward (later steps reuse the session's remembered specialties),
+    so a doctor who was correctly found and shown under the FIRST
+    specialty came back "couldn't find them in the system" minutes
+    later when the patient tried to actually book with him - because
+    the booking lookup was, by then, only searching the second,
+    irrelevant specialty. One call, one list containing every relevant
+    id, every time.
+
     `allow_broader_search`: pass False whenever the specialty was chosen
     to match a SYMPTOM the patient described. With True (the default)
     this tool falls back to every doctor in the clinic when the given
@@ -1357,9 +1401,9 @@ def find_available_doctors(
 
     # Remember which specialties this search used, so later steps
     # (list_branches_for_specialty, "who's soonest?") reuse exactly the
-    # same set instead of the model having to re-derive them.
-    if specialty_ids:
-        session["specialty_ids"] = list(specialty_ids)
+    # same set instead of the model having to re-derive them. Merged
+    # rather than overwritten - see _remember_specialty_ids.
+    _remember_specialty_ids(session, specialty_ids)
 
     branch_ids = None
     matched_branch = None
