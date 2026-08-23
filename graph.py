@@ -2013,6 +2013,68 @@ _AVAILABILITY_CORRECTION_DIRECTIVE = (
 )
 
 
+# ==========================================================
+# Fabricated "your complaint was filed" verifier
+# ==========================================================
+#
+# WHY THIS EXISTS: confirmed real production failure, arguably the
+# worst kind - a patient filing a complaint about a doctor allegedly
+# PRESCRIBING THE WRONG MEDICATION was told "حجزت لك الشكوى بخصوص دكتور
+# عبدالله محمد" (your complaint has been registered) while the WHOLE
+# exchange ran under the "booking" specialist, which does not have the
+# `send_complaint_email` tool AT ALL - nothing was ever sent anywhere.
+# The routing itself was the deeper bug (a complaint conversation never
+# switched specialists and "booking" improvised the entire flow from
+# its own general "answer whatever you safely can" instructions), but
+# THIS check is the last line of defence regardless of which
+# specialist is active or why: a reply that confirms a complaint was
+# filed/registered/sent, with no successful `send_complaint_email` call
+# anywhere in this conversation, is always false and must be blocked -
+# a patient believing a genuine complaint about their care was
+# delivered when it never was is a serious trust and safety failure,
+# not a cosmetic one.
+
+_COMPLAINT_CONFIRMATION_RE = re.compile(
+    r"(?:حجزت|سجلت|تم\s*تسجيل|تم\s*استلام|تم\s*إرسال|تم\s*ارسال|استلمنا|"
+    r"وصلتنا)\s*\w*\s*(?:شكوا?ي?ت?ك|الشكوى|شكواك)"
+)
+
+
+def _reply_fabricates_complaint_submission(reply_text: str, state: AgentState) -> bool:
+    if not reply_text or not _COMPLAINT_CONFIRMATION_RE.search(reply_text):
+        return False
+
+    for msg in state.get("messages", []):
+        if getattr(msg, "name", None) != "send_complaint_email":
+            continue
+        content = str(getattr(msg, "content", "") or "")
+        if '"status": "sent"' in content or "'status': 'sent'" in content:
+            return False  # a real send actually happened - not fabricated
+
+    return True
+
+
+_COMPLAINT_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU CONFIRMED A COMPLAINT WAS FILED WITHOUT SENDING IT - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft told the patient their complaint was "
+    "registered/sent/filed, but `send_complaint_email` was never called "
+    "successfully in this conversation - nothing was actually sent "
+    "anywhere. Telling a patient a complaint about their care was "
+    "delivered when it wasn't is a serious trust failure, especially "
+    "when the complaint concerns something like a wrong prescription.\n\n"
+    "If this is genuinely a complaint (not a booking/medical/FAQ "
+    "request), follow the COMPLAINT FLOW: verify any doctor/branch name "
+    "via `match_entity_info` first, collect the remaining details, get "
+    "explicit confirmation, and only THEN call `send_complaint_email` "
+    "before claiming it was filed. If you don't have that tool "
+    "available to you right now, say honestly that you'll connect them "
+    "with a staff member for this instead of claiming success.\n\n"
+    "Rewrite the reply now without claiming the complaint was filed.\n\n"
+)
+
+
 _GYN_MENTION_RE = re.compile(
     r"نساء\s*و?\s*توليد|أمراض\s*النساء|امراض\s*النساء|"
     r"gyn[ae]colog\w*|obstetric\w*"
@@ -2357,6 +2419,25 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     return updates
                 if retry.content and not _reply_offers_unauthorized_gynecology(retry.content, state):
                     logger.info("agent[%s]: unauthorized نساء وتوليد mention corrected on retry", agent_name)
+                    normalized = _emojify_list_numbers(retry.content)
+
+        if _reply_fabricates_complaint_submission(normalized, state):
+            logger.error(
+                "agent[%s]: reply confirmed a complaint was filed but "
+                "send_complaint_email was never called successfully in this "
+                "conversation - fabricated confirmation | strict_mode=%s | reply=%r",
+                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
+            )
+            if _BRANCH_VERIFIER_STRICT:
+                retry = _llm_for(agent_name).invoke(
+                    [SystemMessage(content=_COMPLAINT_CORRECTION_DIRECTIVE + system_content)] + history
+                )
+                if getattr(retry, "tool_calls", None):
+                    updates["messages"] = [retry]
+                    updates["target_language"] = target_language
+                    return updates
+                if retry.content and not _reply_fabricates_complaint_submission(retry.content, state):
+                    logger.info("agent[%s]: fabricated complaint confirmation corrected on retry", agent_name)
                     normalized = _emojify_list_numbers(retry.content)
 
         invented = _find_invented_branches(normalized, state)
