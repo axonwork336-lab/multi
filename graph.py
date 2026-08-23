@@ -2843,6 +2843,176 @@ _REPLY_VERIFIERS = (
 )
 
 
+def _is_answering_a_list(messages: list) -> bool:
+    """True when the patient's latest message is a pick from a list the
+    assistant just showed them, rather than a fresh open question.
+
+    Used ONLY to choose the wording of the interim "please wait" line
+    (see progress._LIST_LOOKUP_TOOLS) - it never affects routing, tool
+    choice, or the reply itself.
+
+    Deliberately narrow: a bare position ("2", "٢", "رقم 2") or a short
+    reply, AND the assistant's own previous message actually contained a
+    numbered list. Both conditions have to hold, so an open question
+    that happens to be short is not mistaken for a selection.
+    """
+
+    history = list(messages or [])
+
+    last_human = None
+    for index in range(len(history) - 1, -1, -1):
+        if getattr(history[index], "type", None) == "human":
+            last_human = index
+            break
+
+    if last_human is None:
+        return False
+
+    content = getattr(history[last_human], "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not text.strip() or len(text.strip()) > 30:
+        return False
+
+    if tools._extract_selection_number(text) is None:
+        return False
+
+    for msg in reversed(history[:last_human]):
+        if getattr(msg, "type", None) != "ai":
+            continue
+        previous = getattr(msg, "content", "")
+        previous = previous if isinstance(previous, str) else str(previous)
+        if not previous.strip():
+            continue
+        # A numbered list, in either the emoji badges this project emits
+        # or plain digits.
+        return bool(
+            re.search(r"^\s*(?:[0-9\u0660-\u0669]{1,2}[.)]|[0-9]\uFE0F?\u20E3|\U0001F51F)", previous, re.MULTILINE)
+        )
+
+    return False
+
+
+_ABANDONED_BOOKING_RESET_DIRECTIVE = (
+    "============================================================\n"
+    "A PREVIOUS BOOKING ATTEMPT IS STILL HALF-FINISHED\n"
+    "============================================================\n"
+    "Earlier in this conversation a doctor and/or a branch were settled "
+    "for a booking that never completed - the patient changed their "
+    "mind, or moved on to something else. Those choices are still "
+    "remembered, and they will silently narrow every doctor, branch, day "
+    "and slot lookup you make from here.\n\n"
+    "The patient has now started a NEW request. Before anything else "
+    "this turn, call `reset_booking_session` - then continue normally. "
+    "Confirmed real production failure: a branch left over from an "
+    "abandoned booking made an entire specialty the clinic genuinely "
+    "staffs come back as \"no doctors available\", twice in a row, "
+    "including after the patient explicitly asked to look across the "
+    "whole hospital.\n\n"
+)
+
+
+def _build_abandoned_booking_directive(messages: list, session_id: str) -> str:
+    """Fires when a booking session still holds a doctor/branch from a
+    flow the patient has clearly moved on from.
+
+    Deliberately narrow. It requires ALL of:
+      - something actually remembered (a doctor or a branch), and
+      - the patient's latest message being a fresh human turn, and
+      - no booking tool having run since the patient walked away.
+
+    A patient who merely detours mid-booking (asks the opening hours,
+    then comes back) does NOT trip this: the booking specialist still
+    owns those turns, and this directive is only ever added for
+    specialists that cannot place a booking at all.
+    """
+
+    if not messages or not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+
+    if not (session.get("doctor_id") or session.get("branch_id")):
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    if not isinstance(messages[-1], _HumanMessage):
+        return ""
+
+    return _ABANDONED_BOOKING_RESET_DIRECTIVE
+
+
+# The bare words a patient uses to ANSWER "by specialty or by doctor?"
+# and "a particular branch, or shall I show you them?" - i.e. the word
+# itself, with no name attached.
+_BARE_ENTITY_ANSWER_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:ال)?(?:دكتور|دكتوره|دكتورة|دكاتره|دكاترة|طبيب|طبيبه|طبيبة|اطباء|أطباء)|"
+    r"(?:ال)?(?:تخصص|تخصصات|قسم|اقسام|أقسام)|"
+    r"(?:ال)?(?:فرع|فروع)|"
+    r"doctors?|specialt(?:y|ies)|departments?|branch(?:es)?"
+    r")\s*[.!؟?،,]*\s*$",
+    re.IGNORECASE,
+)
+
+_BARE_ENTITY_ANSWER_DIRECTIVE = (
+    "============================================================\n"
+    "THEY ANSWERED WITH THE CATEGORY, NOT A NAME - SHOW THE LIST\n"
+    "============================================================\n"
+    "The patient's reply is the bare WORD (\"دكتور\", \"تخصص\", \"فرع\", "
+    "\"doctor\", \"branch\") answering the choice you just offered them. "
+    "It is an ANSWER, not the name of anything.\n\n"
+    "They are telling you which way they want to go, and asking you to "
+    "show them the options. So SHOW THEM, this turn:\n"
+    "  - \"دكتور\"/\"doctor\"  -> call `find_available_doctors` (or "
+    "`match_entity_for_booking` in list mode) and show the numbered list "
+    "of doctors.\n"
+    "  - \"تخصص\"/\"specialty\" -> call `list_specialties` and show the "
+    "numbered list of specialties.\n"
+    "  - \"فرع\"/\"branch\"    -> call `list_branches_for_specialty` and "
+    "show the numbered list of branches.\n\n"
+    "Do NOT reply by asking for a name (\"اسم الدكتور إيه؟\", \"أي "
+    "تخصص؟\"). The patient does not know who works here or which "
+    "specialties exist - that is exactly why they asked you to show "
+    "them. Asking them to name one is asking for information only the "
+    "system has, and it wastes a turn.\n\n"
+    "Never fuzzy-match the bare word itself against a real doctor, "
+    "specialty or branch name. Confirmed real production failure: the "
+    "bare word \"فرع\" was matched to an actual branch the patient had "
+    "never named or seen, and the whole booking then ran against the "
+    "wrong one.\n\n"
+)
+
+
+def _build_bare_entity_answer_directive(messages: list) -> str:
+    """Fires when the patient's latest message is just the category word
+    ("دكتور"/"تخصص"/"فرع"), answering a choice the assistant offered.
+
+    `tools._is_generic_entity_word` already stops the bare word being
+    fuzzy-matched to a real entity once a tool is reached. This is the
+    other half: making sure a tool is reached at all, rather than the
+    model answering with a second question.
+    """
+
+    if not messages:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _BARE_ENTITY_ANSWER_RE.match(text.strip()):
+        return ""
+
+    return _BARE_ENTITY_ANSWER_DIRECTIVE
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -2939,6 +3109,22 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     entity_list_directive = _build_entity_list_directive(state["messages"])
     terminal_success_directive = _build_terminal_success_directive(state["messages"], state.get("templates"))
 
+    # Only the booking specialist is told to clear a half-finished
+    # booking, and only when it has just TAKEN OVER the conversation -
+    # i.e. the patient walked away from one booking and has started
+    # another. A patient still inside their original booking is already
+    # owned by this specialist from the previous turn, so nothing is
+    # reset underneath them mid-flow.
+    abandoned_booking_directive = ""
+    if agent_name == "booking" and state.get("active_agent") == "booking":
+        previous_owner = state.get("previous_agent")
+        if previous_owner and previous_owner != "booking":
+            abandoned_booking_directive = _build_abandoned_booking_directive(
+                state["messages"], state.get("session_id"),
+            )
+
+    bare_entity_directive = _build_bare_entity_answer_directive(state["messages"])
+
     # The scoped prompt for whoever owns this turn. Rebuilt per turn for
     # the same reason load_config rebuilds: a prompts.py/CSV edit must
     # reach conversations already in progress. The split itself is
@@ -2967,6 +3153,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + services_directive + how_to_book_directive
         + slots_directive + available_days_directive
         + resolved_day_directive + entity_list_directive
+        + abandoned_booking_directive + bare_entity_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
@@ -3064,6 +3251,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
             ],
             language=target_language,
             templates=state.get("templates"),
+            answering_a_list=_is_answering_a_list(state["messages"]),
         )
 
     # ONE QUESTION PER MESSAGE - enforced here, not just asked for in the
@@ -3201,7 +3389,17 @@ def router(state: AgentState) -> dict:
             "router: %s -> %s (%s)", previous or "none", chosen, reason,
         )
 
-    return {"active_agent": chosen, "routing_reason": reason}
+    # `previous_agent` records who owned the turn BEFORE this one, which
+    # is what tells a specialist whether it has just taken the
+    # conversation over or has been running the same flow all along. The
+    # booking specialist uses it to decide whether a half-finished
+    # booking is a detour to be preserved or an abandoned one to clear -
+    # see _build_abandoned_booking_directive.
+    return {
+        "active_agent": chosen,
+        "routing_reason": reason,
+        "previous_agent": previous,
+    }
 
 
 def route_to_specialist(state: AgentState) -> str:
