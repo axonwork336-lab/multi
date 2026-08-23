@@ -4298,11 +4298,20 @@ def share_branch_location(
     """Signal the surrounding system (n8n) to send this branch's map
     location/pin to the patient.
 
-    Call this ONLY right after `match_entity_info` (entity_type=
-    "branch") has ACTUALLY matched a real branch and you are telling the
-    patient its address this turn - never call this with a branch name
-    you have not just confirmed exists via that tool, and never guess or
-    invent one. `branch_name` must be exactly the `name` field
+    Call this ONLY when BOTH of these are true this turn:
+    1. The patient explicitly asked for the branch's location, address,
+       or how to get there (not just named the branch, and not just
+       had it confirmed/selected as part of booking or anything else).
+    2. `match_entity_info` (entity_type="branch") has ACTUALLY matched a
+       real branch and you are telling the patient its address this
+       turn - never call this with a branch name you have not just
+       confirmed exists via that tool, and never guess or invent one.
+
+    Simply mentioning, confirming, or picking a branch (e.g. during the
+    booking flow, or the patient just typing a branch's name with no
+    question attached) is NOT a location request - do not call this
+    tool in that case, even if the branch's address happens to be
+    matched. `branch_name` must be exactly the `name` field
     `match_entity_info` returned for that branch (not the patient's raw
     typed text, not a translation of it).
 
