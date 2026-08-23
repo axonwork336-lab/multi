@@ -660,22 +660,47 @@ def _build_show_soonest_day_directive(messages: list, session_id: str) -> str:
     if not isinstance(messages[-1], _HumanMessage):
         return ""
 
-    session = tools._BOOKING_SESSIONS.get(session_id)
-    if not session or not session.get("doctor_id"):
-        return ""
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    doctor_confirmed = bool(session.get("doctor_id"))
 
-    # Already past this step? Then the days/slots have been handled.
+    # A doctor can be settled in the CONVERSATION without ever having
+    # been confirmed into the booking session - the medical flow shows a
+    # doctor, the patient says yes, and nothing calls
+    # `match_entity_for_booking`. Confirmed real production failure: with
+    # د. طه مبروك agreed and فرع الشيخ زايد resolved, session["doctor_id"]
+    # was still empty, so every session-based guard here sat inert and
+    # the reply asked the patient to name a day. So this fires on either
+    # signal, and tells the model to confirm the doctor first when the
+    # session is the part that's missing.
+    doctor_seen = False
     for msg in reversed(messages[:-1]):
         name = getattr(msg, "name", None)
         if name in ("list_available_days_for_booking", "get_available_slots_for_booking",
                     "resolve_available_day", "create_new_booking"):
+            # Already past this step - days/slots have been handled.
             return ""
+        if name in ("find_available_doctors", "match_entity_for_booking",
+                    "list_branches_for_specialty", "find_best_doctor_in_specialty"):
+            doctor_seen = True
+
+    if not (doctor_confirmed or doctor_seen):
+        return ""
+
+    confirm_first = (
+        ""
+        if doctor_confirmed
+        else ("The doctor has NOT been confirmed into the booking session yet - "
+              "call `match_entity_for_booking(entity_type=\"doctor\")` with their "
+              "exact name FIRST (that call is what saves them), then continue "
+              "below in the same turn.\n\n")
+    )
 
     return (
         "============================================================\n"
         "SHOW THE SOONEST DATE - DO NOT ASK WHICH DAY THEY WANT\n"
         "============================================================\n"
-        "A doctor is already confirmed for this booking. Your ONLY next "
+        + confirm_first
+        + "A doctor has been settled for this booking. Your ONLY next "
         "action is to call `list_available_days_for_booking` and SHOW the "
         "soonest date it returns, then ask whether that date suits them.\n\n"
         "You are NOT allowed to ask \"which day would you prefer?\", to "
