@@ -1777,7 +1777,18 @@ def _is_redundant_closing_question_only(reply_text: str, greeting: str) -> bool:
 # branches. A name the model got from a tool is never flagged, however
 # it's phrased.
 
-_BRANCH_MENTION_RE = re.compile(r"فرع\s+([^\n،,.؟?:()\[\]0-9️⃣]{2,25})")
+# \b IS LOAD-BEARING: without it "فرع" also matches as a bare SUFFIX of
+# "الفرع" ("the branch", definite article glued on with no space).
+# Confirmed real production false-positive: "...أبغى أتأكد من اختيار
+# الدكتور والفرع أولاً" ("...I want to confirm the doctor and the
+# branch first") - a perfectly correct reply with no branch name in it
+# at all - matched "فرع" inside "الفرع" and captured the next word
+# "أولاً" ("first") as if it were an invented branch called "أولاً",
+# forcing a pointless correction retry that re-asked the patient to
+# reconfirm a doctor that was already settled. \b sees no boundary
+# between "ل" and "ف" (both word characters), so "الفرع" is correctly
+# left alone, while "فرع الدقي" (space before "فرع") still matches.
+_BRANCH_MENTION_RE = re.compile(r"\bفرع\s+([^\n،,.؟?:()\[\]0-9️⃣]{2,25})")
 
 # Words that follow "فرع" in ordinary questions rather than naming one -
 # "أي فرع تفضل؟" is not a branch called "تفضل". Without this the
