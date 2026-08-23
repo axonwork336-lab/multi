@@ -2081,6 +2081,53 @@ _COMPLAINT_CORRECTION_DIRECTIVE = (
 )
 
 
+# ==========================================================
+# "Doctor confirmed, then re-offered a doctor roster anyway" verifier
+# ==========================================================
+#
+# WHY THIS EXISTS: this exact anti-pattern is already documented in the
+# prompt with TWO confirmed prior examples ("دكتور شيماء جمعة تم
+# اختياره ✅" and "أبشر بحجز موعد عند د. سارة عبد الله", both followed
+# in the SAME message by an offer to list available doctors) - and it
+# still happened a THIRD time: "استشاري محمود سليمان تم اختياره ✅ ...
+# تحب تحجزين في فرع معيّن، ولا أعرض لك الدكاترة المتاحين؟". Repeating
+# the same prompt warning a third time is unlikely to hold any better
+# than the first two did, so this is promoted to a deterministic check,
+# the same escalation already applied to invented branches and
+# fabricated availability.
+
+_DOCTOR_CONFIRMED_RE = re.compile(
+    r"(?:د\.|دكتور|دكتوره|دكتورة|استشاري|أخصائي|اخصائي|أخصائية|اخصائية)"
+    r"[^.\n؟?]{0,40}?(?:تم\s*اختياره|تم\s*اختيارها|✅)"
+)
+
+_DOCTOR_ROSTER_OFFER_RE = re.compile(
+    r"الدكاترة\s*المتاحين|قائمة\s*الدكاترة|أعرض\s*لك\s*الدكاترة|اعرض\s*لك\s*الدكاترة"
+)
+
+
+def _reply_reoffers_doctor_roster_after_confirming_one(reply_text: str) -> bool:
+    if not reply_text:
+        return False
+    return bool(_DOCTOR_CONFIRMED_RE.search(reply_text)) and bool(_DOCTOR_ROSTER_OFFER_RE.search(reply_text))
+
+
+_DOCTOR_ROSTER_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU CONFIRMED A DOCTOR THEN OFFERED THE DOCTOR LIST AGAIN - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft named a doctor as chosen (\"... تم اختياره ✅\") "
+    "and then, in that SAME message, offered to show the available "
+    "doctors again (\"الدكاترة المتاحين\"). The doctor question is "
+    "already settled - re-offering the roster invites the patient to "
+    "undo a choice they just made.\n\n"
+    "Ask about the BRANCH instead, and offer THAT doctor's branches: "
+    "\"تحب تحجزين في فرع معيّن، ولا أعرض لك الفروع المتاحة عند "
+    "د. [name]؟\"\n\n"
+    "Rewrite the reply now without offering the doctor list again.\n\n"
+)
+
+
 _GYN_MENTION_RE = re.compile(
     r"نساء\s*و?\s*توليد|أمراض\s*النساء|امراض\s*النساء|"
     r"gyn[ae]colog\w*|obstetric\w*"
@@ -2461,6 +2508,24 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     return updates
                 if retry.content and not _reply_fabricates_complaint_submission(retry.content, state):
                     logger.info("agent[%s]: fabricated complaint confirmation corrected on retry", agent_name)
+                    normalized = _emojify_list_numbers(retry.content)
+
+        if _reply_reoffers_doctor_roster_after_confirming_one(normalized):
+            logger.error(
+                "agent[%s]: reply confirmed a doctor then offered the doctor "
+                "roster again in the same message | strict_mode=%s | reply=%r",
+                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
+            )
+            if _BRANCH_VERIFIER_STRICT:
+                retry = _llm_for(agent_name).invoke(
+                    [SystemMessage(content=_DOCTOR_ROSTER_CORRECTION_DIRECTIVE + system_content)] + history
+                )
+                if getattr(retry, "tool_calls", None):
+                    updates["messages"] = [retry]
+                    updates["target_language"] = target_language
+                    return updates
+                if retry.content and not _reply_reoffers_doctor_roster_after_confirming_one(retry.content):
+                    logger.info("agent[%s]: doctor-roster re-offer corrected on retry", agent_name)
                     normalized = _emojify_list_numbers(retry.content)
 
         invented = _find_invented_branches(normalized, state)
