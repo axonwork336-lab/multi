@@ -132,7 +132,26 @@ def load_config(state: AgentState) -> AgentState:
     templates = config.get_messages(state["client_id"], client_row_override=state.get("raw_client_config"))
 
     state["templates"] = templates
-    state["system_prompt"] = build_system_prompt(templates)
+
+    # THE BUILT PROMPT IS NOT STORED IN STATE WHEN IT ISN'T READ.
+    #
+    # `system_prompt` is ~130 KB of text. Everything in state is written
+    # into the checkpoint by the checkpointer, on every super-step - so
+    # a single 20-turn conversation was carrying something like 7.5 MB
+    # of identical copies of a string that is rebuilt from `templates`
+    # anyway (deliberately - see the docstring above). With MemorySaver
+    # keeping checkpoints in process memory, that is the largest single
+    # thing this service holds per conversation, for no benefit.
+    #
+    # In multi-agent mode `_run_agent` never reads this field: it builds
+    # the SCOPED prompt itself from `templates`. It is only read on the
+    # legacy single-agent path (MULTI_AGENT_ENABLED=false), so that is
+    # the only case where it is stored - the rollback flag keeps working
+    # byte for byte, and normal operation stops paying for it.
+    if config.MULTI_AGENT_ENABLED:
+        state["system_prompt"] = None
+    else:
+        state["system_prompt"] = build_system_prompt(templates)
 
     return state
 
@@ -141,6 +160,11 @@ _MORNING_CUES = ("صباح", "good morning", "morning")
 _EVENING_CUES = ("مساء", "good evening", "evening")
 
 
+# Mirrors the Arabic greeting item for item, in the same order, with the
+# same emoji. The complaint/suggestion line (📝) used to be missing here
+# while it was present in every client's Arabic greeting - so an English
+# patient was told about five of the six things this assistant does, and
+# the one thing that got dropped was the one for raising a problem.
 _ENGLISH_GREETING_TEMPLATE = (
     "{salutation}\n"
     "I'm {agent_name}, the virtual assistant at {clinic_name}, and I'm happy to help you today.\n"
@@ -149,6 +173,7 @@ _ENGLISH_GREETING_TEMPLATE = (
     "\u270F\uFE0F Modifying or cancelling an existing appointment\n"
     "\U0001FA7A Medical guidance to choose the right specialty or doctor\n"
     "\u2139\uFE0F Questions about the hospital's services and doctors\n"
+    "\U0001F4DD Filing a complaint or a suggestion\n"
     "\U0001F464 Speaking with a customer service representative\n\n"
     "How can I help you today? \U0001F60A"
 )
@@ -443,6 +468,221 @@ def _build_available_days_directive(messages: list, session_id: str) -> str:
     )
 
 
+# The three list-returning tools whose output the model used to format
+# freehand, and the key each one puts its items under.
+#
+# WHY THIS EXISTS: slots and days already had pre-built blocks, so those
+# two look identical for every patient. Doctors, specialties and
+# branches did not - so the SAME roster came out as an emoji-numbered
+# list for one patient, as "•" bullets for the next, and as a
+# comma-separated run-on inside a sentence for a third, purely
+# depending on what the model felt like that turn. Confirmed in
+# production: a doctor's schedule rendered with "•" bullets in a
+# conversation whose every other list was numbered.
+#
+# The list ITEMS are pre-built here; the numbering is `_numbered_prefix`,
+# exactly the same function the slots and days blocks already use, so
+# nothing about how lists are numbered changes.
+_ENTITY_LIST_TOOLS = {
+    "find_available_doctors": ("doctors", "الأطباء المتاحين"),
+    "find_best_doctor_in_specialty": ("doctors", "الأطباء المتاحين"),
+    "list_specialties": ("specialties", "التخصصات المتاحة"),
+    "list_branches_for_specialty": ("branches", "الفروع المتاحة"),
+}
+
+
+def _entity_list_line(item: dict) -> str:
+    """One list item, with the same fields in the same order every time.
+
+    Only fields the tool actually returned appear - a doctor with no
+    degree simply has no degree on their line, rather than a blank
+    label or a placeholder.
+    """
+
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return ""
+
+    details = []
+    for key in ("degreeName", "specialtyName"):
+        value = item.get(key)
+        if value and str(value).strip() and str(value).strip() != name:
+            details.append(str(value).strip())
+
+    # Branches carry a doctor count instead of a degree/specialty.
+    count = item.get("doctorCount")
+    if count:
+        details.append(f"{count} طبيب")
+
+    if details:
+        return f"{name} — {' · '.join(details)}"
+    return name
+
+
+def _build_entity_list_directive(messages: list) -> str:
+    """
+    If the LAST message is a ToolMessage from one of the list-returning
+    tools with status "found", pre-build the exact numbered list in code -
+    the same approach, and for the same reason, as the slots and days
+    blocks above.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+    tool_name = getattr(last, "name", None)
+
+    spec = _ENTITY_LIST_TOOLS.get(tool_name)
+    if not spec:
+        return ""
+
+    items_key, heading = spec
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    if data.get("status") != "found":
+        return ""
+
+    items = data.get(items_key) or []
+
+    # `find_best_doctor_in_specialty` returns ONE doctor under "doctor",
+    # not a list - it is a recommendation, not a roster, so it is left
+    # to the flow's own wording rather than forced into a list of one.
+    if not items and data.get("doctor"):
+        return ""
+
+    if not isinstance(items, list) or len(items) < 2:
+        # A single result is not a list. Numbering one item reads oddly,
+        # and the flows already have their own wording for the "only one
+        # match" case.
+        return ""
+
+    lines = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        text = _entity_list_line(item)
+        if text:
+            lines.append(f"{_numbered_prefix(len(lines) + 1)} {text}")
+
+    if len(lines) < 2:
+        return ""
+
+    block = f"{heading}:\n" + "\n".join(lines)
+
+    return (
+        "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+        "A list was just looked up. Your ENTIRE reply must be the exact "
+        "text between the START/END markers below, copied verbatim "
+        "(translate the HEADING and the connecting words only if the "
+        "conversation is in another language - keep the numbering, the "
+        "names and the order exactly as they are), followed by exactly "
+        "ONE question asking which one they'd like. The START/END "
+        "marker lines themselves are NOT part of the text to copy - "
+        "never include them, or any line of dashes/equals-signs, in "
+        "your actual reply.\n\n"
+        "Do NOT add, remove, reorder, merge, or re-describe any item, "
+        "and do NOT also list them in your own words anywhere else in "
+        "the same reply. Do NOT mention any price unless the patient "
+        "explicitly asked about cost and `get_doctor_fees` returned it.\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
+        f"{block}\n"
+        "[END-EXACT-TEXT]\n\n"
+    )
+
+
+def _build_resolved_day_directive(messages: list, session_id: str) -> str:
+    """
+    If the LAST message is a ToolMessage from `resolve_available_day`
+    with status "found", pre-build the exact confirmation block in code -
+    same approach, and same reason, as the slots and days lists above.
+
+    WHY THIS ONE WAS MISSING AND WHY IT MATTERED: every other
+    date-bearing result in this file has a pre-built block, so its shape
+    is identical for every patient. This one did not, so the reply was
+    written freehand each time. Confirmed in production, in a fully
+    Arabic conversation:
+
+        تم العثور على موعد متاح مع د. محمد زايد 🧑‍⚕️ الثلاثاء 2026-08-25 📅
+
+    - a raw ISO date inside an Arabic sentence, emoji trailing their
+    labels instead of leading them, and a field order that matched no
+    other message in the same conversation. The tool now returns
+    `date_display`/`weekday_display` (see tools.resolve_available_day),
+    and this block pins the shape so the same information cannot come
+    out looking different for the next patient.
+
+    The closing question is deliberately left as it already was - asking
+    whether they'd like to see that day's times. Only the SHAPE of the
+    block above it is being fixed here, not the flow.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+
+    if getattr(last, "name", None) != "resolve_available_day":
+        return ""
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    if data.get("status") != "found":
+        return ""
+
+    weekday = data.get("weekday_display") or data.get("weekday_name") or ""
+    date_display = data.get("date_display") or data.get("date") or ""
+
+    if not date_display:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    doctor_name = session.get("doctor_display_name") or ""
+    branch_name = session.get("branch_display_name") or ""
+
+    # Same label order as everywhere else in this project, per the
+    # response contract: doctor -> branch -> day -> date.
+    lines = []
+    if doctor_name:
+        lines.append(f"👨\u200d⚕️ الطبيب: {doctor_name}")
+    if branch_name:
+        lines.append(f"📍 الفرع: {branch_name}")
+    lines.append(f"📅 اليوم: {weekday} {date_display}".rstrip())
+
+    block = "\n".join(lines)
+
+    return (
+        "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+        "The nearest genuinely-available date was just resolved. Your "
+        "ENTIRE reply must be the exact text between the START/END "
+        "markers below, copied verbatim (translate the LABELS only if "
+        "the conversation is in another language - keep the emoji, the "
+        "date and the names unchanged either way), followed by exactly "
+        "ONE question asking whether they'd like to see the available "
+        "times on that day. The START/END marker lines themselves are "
+        "NOT part of the text to copy - never include them, or any line "
+        "of dashes/equals-signs, in your actual reply.\n\n"
+        "Never write the result's `date` field (the ISO \"YYYY-MM-DD\" "
+        "form) anywhere in your reply - it is a machine value. The block "
+        "below already contains the date in the form the patient should "
+        "see.\n\n"
+        "When they say yes, your ONLY next action is to call "
+        "`get_available_slots_for_booking` with this result's own "
+        "`from_date`/`to_date`, copied verbatim - never a date you "
+        "worked out yourself.\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
+        f"{block}\n"
+        "[END-EXACT-TEXT]\n\n"
+    )
+
+
 _ARABIC_DAY_NAMES = {
     "monday": "الاثنين", "tuesday": "الثلاثاء", "wednesday": "الأربعاء",
     "thursday": "الخميس", "friday": "الجمعة", "saturday": "السبت", "sunday": "الأحد",
@@ -492,6 +732,152 @@ def _fill_booking_ref(template_text: str, booking_ref: str) -> str:
         filled = f"{filled}\n🎉 رقم الحجز: {booking_ref}"
 
     return filled
+
+
+# The clinic-authored success templates write their variable parts as
+# {placeholders}, in several spellings across the two CSVs. Mapped to
+# the fields `_shape_appointment` actually returns, so the block can be
+# filled from a real tool result instead of from the model's memory.
+_SUCCESS_TEMPLATE_FIELDS = {
+    "patientFullName": ("patientFullName",),
+    "date": ("date_display",),
+    "time 12h ص/م": ("time_display",),
+    "time": ("time_display",),
+    "doctorName": ("doctorName",),
+    "branchName": ("branchName",),
+    "new_date": ("date_display",),
+    "new_time": ("time_display",),
+    "old_date": ("_old_date_display",),
+    "old_time": ("_old_time_display",),
+    "bookingRefNum": ("ref",),
+}
+
+
+def _fill_success_template(template_text: str, appointment: dict) -> str:
+    """Replace every {placeholder} in a clinic's authored success
+    template with the matching value from a real appointment record.
+
+    A placeholder with no value available is left EXACTLY as it is
+    rather than being blanked: an unfilled `{doctorName}` reaching a
+    patient is obvious and gets reported, whereas a silently empty line
+    ("👨‍⚕️ الطبيب: ") looks deliberate and hides the fault.
+    """
+
+    filled = template_text
+
+    for placeholder, keys in _SUCCESS_TEMPLATE_FIELDS.items():
+        value = next(
+            (appointment.get(key) for key in keys if appointment.get(key)), None
+        )
+        if value:
+            filled = filled.replace("{" + placeholder + "}", str(value))
+
+    return filled
+
+
+def _last_appointment_record(messages: list) -> dict:
+    """The most recent appointment the booking system actually returned
+    in this conversation.
+
+    Scanned backwards from the end, so it is the freshest one - which is
+    the record the flows require to have been re-fetched in the same
+    turn before anything is cancelled or moved.
+    """
+
+    for msg in reversed(messages or []):
+        if getattr(msg, "name", None) not in ("lookup_appointment", "check_booking_status"):
+            continue
+        try:
+            data = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+        appointment = data.get("appointment")
+        if isinstance(appointment, dict):
+            return appointment
+
+    return {}
+
+
+_TERMINAL_SUCCESS_TOOLS = {
+    "cancel_appointment": ("msg_cancel_success", "cancellation"),
+    "reschedule_appointment": ("msg_rescheduling_success", "reschedule"),
+}
+
+
+def _build_terminal_success_directive(messages: list, templates: dict) -> str:
+    """
+    If the LAST message is a successful `cancel_appointment` or
+    `reschedule_appointment`, pre-build the clinic's OWN authored
+    success message in code, filled from the real appointment record.
+
+    WHY THIS EXISTS: `create_new_booking` already had this treatment, so
+    a new booking's confirmation is identical for every patient. The two
+    other terminal outcomes did not. Both tools return nothing but
+    `{"status": "success"}` - no date, no doctor, no branch - so the
+    model had to reconstruct every field of the clinic's authored
+    template from memory of an earlier turn. That is the single worst
+    place in the whole flow to be reconstructing from memory: it is the
+    last message the patient receives, it is the one they screenshot and
+    keep, and it is stating as fact what the clinic has just done to
+    their appointment.
+
+    The wording is the clinic's own, verbatim - only the {placeholders}
+    are filled, and only from a real tool result.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+    spec = _TERMINAL_SUCCESS_TOOLS.get(getattr(last, "name", None))
+    if not spec:
+        return ""
+
+    template_key, label = spec
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    if data.get("status") != "success":
+        return ""
+
+    template_text = (templates or {}).get(template_key)
+    if not template_text or not template_text.strip():
+        return ""
+
+    appointment = _last_appointment_record(messages[:-1])
+    if not appointment:
+        # Nothing real to fill it with. Better to leave the model to its
+        # normal instructions than to emit a template full of visible
+        # {placeholders}.
+        return ""
+
+    block = _fill_success_template(
+        template_text.replace("\r\n", "\n").replace("\r", "\n"), appointment,
+    ).strip()
+
+    if not block:
+        return ""
+
+    return (
+        "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+        f"The {label} has just completed successfully. Your ENTIRE reply "
+        "must be the exact text between the START/END markers below, "
+        "copied verbatim - it is the clinic's own authored confirmation "
+        "message and it is already filled in with this patient's real "
+        "details. The START/END marker lines themselves are NOT part of "
+        "the text to copy - never include them, or any line of dashes/"
+        "equals-signs, in your actual reply.\n\n"
+        "Do NOT add a sentence of your own before or after it, do NOT "
+        "reword it, and do NOT restate any of its details in your own "
+        "words anywhere in the same reply. Do NOT add a question - this "
+        "message already closes the conversation on its own terms.\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
+        f"{block}\n"
+        "[END-EXACT-TEXT]\n\n"
+    )
 
 
 def _build_booking_success_display_directive(messages: list, templates: dict) -> str:
@@ -1184,8 +1570,35 @@ def _build_greeting(templates: dict, user_message: str, target_language: str) ->
 
     greeting = templates.get("msg_unknown_fallback")
 
-    if not greeting:
-        if target_language == "en":
+    # LANGUAGE COMES FIRST, BRANDING COMES WITH IT.
+    #
+    # An earlier version always used the configured `msg_unknown_fallback`
+    # verbatim, in whatever language it was authored in. Since every
+    # client authors it in Arabic, a patient who opened the conversation
+    # in English received the full Arabic greeting block and an English
+    # reply stapled underneath it - two languages in the first message
+    # the clinic ever sends. The version before THAT swung the other way
+    # and gave English conversations a generic, un-branded template even
+    # when the clinic was fully configured.
+    #
+    # Neither trade-off is necessary. The order is:
+    #   1. A greeting the client authored in this language, if their
+    #      config provides one (`msg_unknown_fallback_en`) - always wins.
+    #   2. The configured greeting, when it is already in the right
+    #      language for this conversation.
+    #   3. The standard template rendered in the conversation's language,
+    #      filled with THIS clinic's real agent name and clinic name -
+    #      so it is branded, and it matches the structure, ordering and
+    #      emoji of the Arabic one exactly. Same shape, different
+    #      language, which is precisely what the response contract asks
+    #      for.
+    if target_language == "en":
+        english_greeting = templates.get("msg_unknown_fallback_en")
+        if english_greeting:
+            greeting = english_greeting.replace("\r\n", "\n").replace("\r", "\n")
+            return _personalized_greeting(greeting, user_message, target_language)
+
+        if not greeting or _looks_arabic(greeting):
             lowered = (user_message or "").lower()
             if any(cue in lowered for cue in _MORNING_CUES):
                 salutation = "Good morning! \U0001F60A"
@@ -1199,6 +1612,8 @@ def _build_greeting(templates: dict, user_message: str, target_language: str) ->
                 agent_name=templates.get("_agent_name") or "the assistant",
                 clinic_name=templates.get("_clinic_name") or "the clinic",
             )
+
+    if not greeting:
         return ""
 
     # Normalize line endings FIRST. The CSV can arrive with \r\n (Excel/
@@ -1813,7 +2228,29 @@ _NOT_A_BRANCH_NAME = {
 
 _NOT_A_BRANCH_NAME_NORM = {tools._normalize_arabic(w) for w in _NOT_A_BRANCH_NAME}
 
-_BRANCH_VERIFIER_STRICT = os.getenv("BRANCH_VERIFIER_STRICT", "false").strip().lower() in ("1", "true", "yes")
+# STRICT MODE IS NOW THE DEFAULT.
+#
+# This flag governs all six reply verifiers below (invented branch,
+# invented date/time, fabricated complaint confirmation, fabricated
+# handoff confirmation, doctor-roster re-offer, unauthorised
+# gynaecology). It used to default to FALSE, which meant every one of
+# them only wrote a WARNING to the log while the offending reply was
+# delivered to the patient unchanged - so a fabricated appointment or a
+# branch that does not exist still reached them, and the only trace was
+# a log line nobody was watching.
+#
+# These checks are deliberately narrow: each one fires only when the
+# reply asserts something that appears in NO tool result in this
+# conversation. When one does fire, "log it and send it anyway" is not a
+# defensible default for a medical booking assistant - a patient can
+# accept an appointment that exists nowhere. Strict mode re-asks the
+# model once, with a targeted correction, and falls back to the original
+# reply if that retry doesn't produce something clean, so the worst case
+# is one extra LLM call on an already-suspect turn.
+#
+# Set BRANCH_VERIFIER_STRICT=false to restore the old log-only
+# behaviour.
+_BRANCH_VERIFIER_STRICT = os.getenv("BRANCH_VERIFIER_STRICT", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _norm_ar(text: str) -> str:
@@ -1924,8 +2361,26 @@ _BRANCH_CORRECTION_DIRECTIVE = (
     "first if you don't have them.\n\n"
 )
 
-_DATE_IN_REPLY_RE = re.compile(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}")
-_TIME_IN_REPLY_RE = re.compile(r"\d{1,2}:\d{2}")
+# (?<![\w-]) / (?![\w-]) ARE LOAD-BEARING - confirmed false positive.
+#
+# A booking reference looks like "GBN-2026-06-20-151", and the bare
+# pattern below happily matched the substring "26-06-20" INSIDE it. So
+# every correct reply that quoted the patient's own reference number -
+# which the cancellation flow does on literally every confirmation -
+# was read as containing a date, and then judged against the tool
+# results as if the model had invented it.
+#
+# In log-only mode that was noise. With the verifiers actually
+# intervening it is worse than noise: a perfectly accurate reply gets
+# thrown away and re-generated, and a check that cries wolf on correct
+# output is one nobody can afford to leave switched on. Requiring that
+# nothing word-like or hyphen-like sits on either side means a real
+# date ("20/08/2026", "on 20-08-2026.") still matches while a run of
+# digits embedded in a longer reference does not.
+_DATE_IN_REPLY_RE = re.compile(r"(?<![\w-])\d{1,2}[-/]\d{1,2}[-/]\d{2,4}(?![\w-])")
+
+# Same class of problem: a reference or an id can carry "...151:30...".
+_TIME_IN_REPLY_RE = re.compile(r"(?<![\w:])\d{1,2}:\d{2}(?![\w:])")
 
 _WEEKDAY_WORDS = {
     "الاثنين": "Monday", "الإثنين": "Monday", "الثلاثاء": "Tuesday",
@@ -2270,6 +2725,124 @@ _GYN_CORRECTION_DIRECTIVE = (
 )
 
 
+# ==========================================================
+# The single finaliser every outgoing reply passes through
+# ==========================================================
+
+def _apply_output_contract(
+    text: str,
+    state: AgentState,
+    target_language: Optional[str],
+    agent_name: str,
+) -> str:
+    """Put ONE reply into the shape every reply must have.
+
+    THE ONLY PLACE this happens, on purpose. A reply can reach the
+    patient by more than one route - the model's first draft, or a
+    rewrite produced after one of the verifiers below rejected that
+    draft - and those routes used to apply DIFFERENT amounts of
+    processing: the first got question-trimming + emoji numbering + the
+    shared response contract, the rewrite got emoji numbering only. The
+    patient therefore saw a differently-shaped message depending on
+    whether the model happened to get it right first time, which is
+    invisible from the outside and impossible to explain.
+
+    Order matters and is the original order:
+      1. Trim any question beyond the first (ONE QUESTION PER MESSAGE).
+      2. Emoji list badges, so every list looks the same - including
+         lists no pre-built directive exists for.
+      3. The shared response contract (filler openers, "let me check
+         that", persona re-introductions, leaked routing language,
+         irregular blank lines).
+    """
+
+    trimmed, removed = _strip_extra_questions(text, state.get("templates") or {})
+    if removed:
+        logger.warning(
+            "agent[%s]: reply contained %d extra question(s) beyond the first - trimmed. Original: %r",
+            agent_name, removed, text,
+        )
+
+    normalized = _emojify_list_numbers(trimmed)
+
+    if not config.REPLY_NORMALIZATION_ENABLED:
+        return normalized
+
+    greeting_for_dedupe = (
+        None if not state.get("greeted")
+        else _build_greeting(
+            state.get("templates") or {},
+            state["messages"][0].content if state["messages"] else "",
+            target_language or "ar",
+        )
+    )
+
+    contracted, changed = agents.normalize_reply(normalized, greeting_for_dedupe)
+    if changed:
+        logger.info(
+            "agent[%s]: reply normalized to the shared response contract", agent_name,
+        )
+
+    return contracted
+
+
+# ==========================================================
+# The reply verifiers, as data
+# ==========================================================
+#
+# Each entry is (check, correction_directive, description):
+#   check(reply, state, agent_name) -> True when the reply is wrong
+#   correction_directive(reply, state) -> the text prepended to the
+#       system message for the single corrective retry
+#   description -> what gets logged
+#
+# The signatures are uniform even where a particular check ignores an
+# argument, so the loop that runs them needs no special cases - the
+# special case in the old hand-written version (the branch check, which
+# needed the offending names interpolated into its directive) is what
+# had caused that block to drift away from the other five.
+
+_REPLY_VERIFIERS = (
+    (
+        lambda reply, state, agent_name: _reply_invents_availability(reply, state),
+        lambda reply, state: _AVAILABILITY_CORRECTION_DIRECTIVE,
+        "reply stated an appointment date/time that NO availability tool returned "
+        "- this is a fabricated appointment",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_offers_unauthorized_gynecology(reply, state, agent_name),
+        lambda reply, state: _GYN_CORRECTION_DIRECTIVE,
+        "reply named نساء وتوليد with no patient-raised pregnancy/gynaecological "
+        "signal in this conversation",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_fabricates_complaint_submission(reply, state),
+        lambda reply, state: _COMPLAINT_CORRECTION_DIRECTIVE,
+        "reply confirmed a complaint was filed but send_complaint_email was never "
+        "called successfully in this conversation",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_fabricates_handoff(reply, state),
+        lambda reply, state: _HANDOFF_CORRECTION_DIRECTIVE,
+        "reply confirmed a human handoff but request_human_handoff was never "
+        "raised successfully in this conversation",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_reoffers_doctor_roster_after_confirming_one(reply),
+        lambda reply, state: _DOCTOR_ROSTER_CORRECTION_DIRECTIVE,
+        "reply confirmed a doctor then offered the doctor roster again in the same message",
+    ),
+    (
+        lambda reply, state, agent_name: bool(_find_invented_branches(reply, state)),
+        lambda reply, state: _BRANCH_CORRECTION_DIRECTIVE.format(
+            names=", ".join(_find_invented_branches(reply, state))
+        ),
+        "reply named branch(es) that appear in NO tool result and are not "
+        "configured for this client",
+    ),
+)
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -2356,23 +2929,49 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     booking_confirmation_directive = _build_booking_confirmation_requires_tool_directive(state["messages"], state.get("session_id"))
     booking_success_directive = _build_booking_success_display_directive(state["messages"], state.get("templates"))
 
+    # The three display blocks added to close the remaining gaps: a
+    # resolved date, an entity list (doctors/specialties/branches), and
+    # the two terminal outcomes (cancelled / rescheduled). Before these,
+    # those were the only patient-facing results still formatted freehand
+    # by the model, which is exactly where its output shape varied from
+    # one patient to the next.
+    resolved_day_directive = _build_resolved_day_directive(state["messages"], state.get("session_id"))
+    entity_list_directive = _build_entity_list_directive(state["messages"])
+    terminal_success_directive = _build_terminal_success_directive(state["messages"], state.get("templates"))
+
     # The scoped prompt for whoever owns this turn. Rebuilt per turn for
     # the same reason load_config rebuilds: a prompts.py/CSV edit must
     # reach conversations already in progress. The split itself is
     # cached by content hash inside agents.sections, so this is string
     # assembly, not re-parsing, on all but the first turn after a change.
-    scoped_prompt = state.get("system_prompt") or ""
-    if config.MULTI_AGENT_ENABLED and state.get("templates"):
-        scoped_prompt = build_agent_system_prompt(state["templates"], agent_name)
+    #
+    # ORDER MATTERS. `state["system_prompt"]` is now only populated on
+    # the legacy single-agent path (see load_config's comment on why the
+    # 130 KB string is no longer written into every checkpoint), so the
+    # multi-agent branch is checked FIRST and the stored value is only a
+    # fallback. The final `build_system_prompt` fallback covers the one
+    # remaining case - single-agent mode resuming a thread checkpointed
+    # before this change, where the field is absent - so no path can
+    # reach the LLM with an empty system prompt.
+    templates = state.get("templates") or {}
+
+    if config.MULTI_AGENT_ENABLED and templates:
+        scoped_prompt = build_agent_system_prompt(templates, agent_name)
+    else:
+        scoped_prompt = state.get("system_prompt") or ""
+        if not scoped_prompt and templates:
+            scoped_prompt = build_system_prompt(templates)
 
     system_content = (
         language_directive + no_symptom_directive
         + services_directive + how_to_book_directive
         + slots_directive + available_days_directive
+        + resolved_day_directive + entity_list_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
         + booking_confirmation_directive + booking_success_directive
+        + terminal_success_directive
         + scoped_prompt
         # CHANNEL IDENTITY goes LAST, after scoped_prompt (STEP NB6/
         # complaint flow), not before it. Confirmed real production bug:
@@ -2473,171 +3072,65 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     # model must never see its own multi-question message as a
     # precedent for the next turn).
     if not has_tool_calls and response.content:
-        trimmed, removed = _strip_extra_questions(response.content, state.get("templates") or {})
-        if removed:
-            logger.warning(
-                "agent: reply contained %d extra question(s) beyond the first - trimmed. Original: %r",
-                removed, response.content,
-            )
+        normalized = _apply_output_contract(
+            response.content, state, target_language, agent_name,
+        )
 
-        # Every numbered list gets the same emoji badges, not just the
-        # ones this file pre-builds.
-        normalized = _emojify_list_numbers(trimmed)
+        # THE REPLY VERIFIERS. Each one catches a claim the model wrote
+        # that NO tool result in this conversation supports - the only
+        # class of error the pre-write directives structurally cannot
+        # prevent, because there is no tool call to shape.
+        #
+        # They run as a table rather than as six copy-pasted blocks: the
+        # blocks had already drifted apart (only some logged at ERROR,
+        # the branch one alone reported a failed correction), and every
+        # single one of them re-emitted the corrected reply through
+        # `_emojify_list_numbers` ALONE - skipping the question trimming
+        # and the shared response contract that the first-pass reply had
+        # just been put through. A corrected reply therefore came out in
+        # a visibly different shape from every other reply, which is
+        # exactly the inconsistency this project exists to remove. One
+        # loop, one finaliser, one behaviour.
+        for check, correction_directive, description in _REPLY_VERIFIERS:
+            if not check(normalized, state, agent_name):
+                continue
 
-        # THE SHARED OUTPUT CONTRACT. Runs on every final reply, from
-        # every specialist, so which agent happened to own the turn can
-        # never be visible in the shape of the answer: no filler opener,
-        # no "let me check that", no persona re-introduction on turn 9,
-        # no leaked routing language, same vertical spacing every time.
-        # Deliberately placed AFTER the question trimming so the stored
-        # history contains exactly what the patient saw - the model must
-        # never see an unnormalized message of its own as a precedent.
-        if config.REPLY_NORMALIZATION_ENABLED:
-            greeting_for_dedupe = (
-                None if not state.get("greeted")
-                else _build_greeting(
-                    state.get("templates") or {},
-                    state["messages"][0].content if state["messages"] else "",
-                    target_language or "ar",
-                )
-            )
-
-            contracted, changed = agents.normalize_reply(normalized, greeting_for_dedupe)
-            if changed:
-                logger.info(
-                    "agent[%s]: reply normalized to the shared response contract",
-                    agent_name,
-                )
-            normalized = contracted
-
-        # LAST LINE OF DEFENCE: did this reply name a branch nobody ever
-        # gave it? See _find_invented_branches - this is the only check
-        # that can catch a name written from memory with no tool call
-        # behind it.
-        if _reply_invents_availability(normalized, state):
             logger.error(
-                "agent[%s]: reply stated an appointment date/time that NO availability tool "
-                "returned - this is a fabricated appointment | strict_mode=%s | reply=%r",
-                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
-            )
-            if _BRANCH_VERIFIER_STRICT:
-                retry = _llm_for(agent_name).invoke(
-                    [SystemMessage(content=_AVAILABILITY_CORRECTION_DIRECTIVE + system_content)] + history
-                )
-                if getattr(retry, "tool_calls", None):
-                    updates["messages"] = [retry]
-                    updates["target_language"] = target_language
-                    return updates
-                if retry.content and not _reply_invents_availability(retry.content, state):
-                    logger.info("agent[%s]: fabricated availability corrected on retry", agent_name)
-                    normalized = _emojify_list_numbers(retry.content)
-
-        if _reply_offers_unauthorized_gynecology(normalized, state, agent_name):
-            logger.error(
-                "agent[%s]: reply named نساء وتوليد with no patient-raised "
-                "pregnancy/gynaecological signal in this conversation | "
-                "strict_mode=%s | reply=%r",
-                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
-            )
-            if _BRANCH_VERIFIER_STRICT:
-                retry = _llm_for(agent_name).invoke(
-                    [SystemMessage(content=_GYN_CORRECTION_DIRECTIVE + system_content)] + history
-                )
-                if getattr(retry, "tool_calls", None):
-                    updates["messages"] = [retry]
-                    updates["target_language"] = target_language
-                    return updates
-                if retry.content and not _reply_offers_unauthorized_gynecology(retry.content, state, agent_name):
-                    logger.info("agent[%s]: unauthorized نساء وتوليد mention corrected on retry", agent_name)
-                    normalized = _emojify_list_numbers(retry.content)
-
-        if _reply_fabricates_complaint_submission(normalized, state):
-            logger.error(
-                "agent[%s]: reply confirmed a complaint was filed but "
-                "send_complaint_email was never called successfully in this "
-                "conversation - fabricated confirmation | strict_mode=%s | reply=%r",
-                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
-            )
-            if _BRANCH_VERIFIER_STRICT:
-                retry = _llm_for(agent_name).invoke(
-                    [SystemMessage(content=_COMPLAINT_CORRECTION_DIRECTIVE + system_content)] + history
-                )
-                if getattr(retry, "tool_calls", None):
-                    updates["messages"] = [retry]
-                    updates["target_language"] = target_language
-                    return updates
-                if retry.content and not _reply_fabricates_complaint_submission(retry.content, state):
-                    logger.info("agent[%s]: fabricated complaint confirmation corrected on retry", agent_name)
-                    normalized = _emojify_list_numbers(retry.content)
-
-        if _reply_fabricates_handoff(normalized, state):
-            logger.error(
-                "agent[%s]: reply confirmed a human handoff but "
-                "request_human_handoff was never raised successfully in this "
-                "conversation - fabricated confirmation | strict_mode=%s | reply=%r",
-                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
-            )
-            if _BRANCH_VERIFIER_STRICT:
-                retry = _llm_for(agent_name).invoke(
-                    [SystemMessage(content=_HANDOFF_CORRECTION_DIRECTIVE + system_content)] + history
-                )
-                if getattr(retry, "tool_calls", None):
-                    updates["messages"] = [retry]
-                    updates["target_language"] = target_language
-                    return updates
-                if retry.content and not _reply_fabricates_handoff(retry.content, state):
-                    logger.info("agent[%s]: fabricated handoff confirmation corrected on retry", agent_name)
-                    normalized = _emojify_list_numbers(retry.content)
-
-        if _reply_reoffers_doctor_roster_after_confirming_one(normalized):
-            logger.error(
-                "agent[%s]: reply confirmed a doctor then offered the doctor "
-                "roster again in the same message | strict_mode=%s | reply=%r",
-                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
-            )
-            if _BRANCH_VERIFIER_STRICT:
-                retry = _llm_for(agent_name).invoke(
-                    [SystemMessage(content=_DOCTOR_ROSTER_CORRECTION_DIRECTIVE + system_content)] + history
-                )
-                if getattr(retry, "tool_calls", None):
-                    updates["messages"] = [retry]
-                    updates["target_language"] = target_language
-                    return updates
-                if retry.content and not _reply_reoffers_doctor_roster_after_confirming_one(retry.content):
-                    logger.info("agent[%s]: doctor-roster re-offer corrected on retry", agent_name)
-                    normalized = _emojify_list_numbers(retry.content)
-
-        invented = _find_invented_branches(normalized, state)
-        if invented:
-            logger.warning(
-                "agent[%s]: reply named branch(es) that appear in NO tool result and "
-                "are not configured for this client: %s | strict_mode=%s | reply=%r",
-                agent_name, invented, _BRANCH_VERIFIER_STRICT, normalized,
+                "agent[%s]: %s | strict_mode=%s | reply=%r",
+                agent_name, description, _BRANCH_VERIFIER_STRICT, normalized,
             )
 
-            if _BRANCH_VERIFIER_STRICT:
-                # Re-ask once, with the correction at the very top so it
-                # outranks everything else for this retry.
-                correction = _BRANCH_CORRECTION_DIRECTIVE.format(names=", ".join(invented))
-                retry = _llm_for(agent_name).invoke(
-                    [SystemMessage(content=correction + system_content)] + history
+            if not _BRANCH_VERIFIER_STRICT:
+                continue
+
+            directive = correction_directive(normalized, state)
+
+            retry = _llm_for(agent_name).invoke(
+                [SystemMessage(content=directive + system_content)] + history
+            )
+
+            if getattr(retry, "tool_calls", None):
+                # It chose to go and fetch the real data instead of
+                # rewriting from memory - much better. Let the normal
+                # tools loop run and send nothing this pass.
+                updates["messages"] = [retry]
+                updates["target_language"] = target_language
+                return updates
+
+            if not retry.content:
+                continue
+
+            if check(retry.content, state, agent_name):
+                logger.error(
+                    "agent[%s]: reply STILL failed the same check after correction (%s)",
+                    agent_name, description,
                 )
-                if getattr(retry, "tool_calls", None):
-                    # It chose to go and fetch the real list - let the
-                    # normal tools loop run instead of sending anything.
-                    updates["messages"] = [retry]
-                    updates["target_language"] = target_language
-                    return updates
-                if retry.content:
-                    still_invented = _find_invented_branches(retry.content, state)
-                    if still_invented:
-                        logger.error(
-                            "agent[%s]: reply STILL named invented branch(es) after correction: %s",
-                            agent_name, still_invented,
-                        )
-                    else:
-                        logger.info("agent[%s]: invented branches corrected on retry", agent_name)
-                        normalized = _emojify_list_numbers(retry.content)
+                continue
+
+            logger.info("agent[%s]: corrected on retry (%s)", agent_name, description)
+            normalized = _apply_output_contract(
+                retry.content, state, target_language, agent_name,
+            )
 
         if normalized != response.content:
             response = AIMessage(content=normalized)
