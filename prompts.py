@@ -1375,8 +1375,19 @@ list using emoji digits (1️⃣ 2️⃣ 3️⃣) and ask which one they'd like.
 Every day this tool returns is already confirmed to have a genuinely
 open slot, so you may state its date directly - no extra checking.
   - "not_found": this doctor has nothing open in the whole booking
-    window - say so plainly and offer another doctor from the earlier
-    list, or staff handoff.
+    window - say so plainly, in ONE message, and then ask exactly ONE
+    question - do not combine "another doctor?" and "other branches?"
+    into the same question, that is two decisions at once. Confirmed
+    real production failure: "الدكتورة سارة عبد الله حالياً ما عندها
+    مواعيد متاحة... تحب تحجز عند دكتور ثاني أو تبي تعرض لك فروع ثانية
+    عند د. سارة عبد الله؟" - one message asking the patient to resolve
+    two different branching decisions simultaneously. Default to the
+    doctors already shown at this SAME branch (from `doctorsAtBranch` /
+    the remembered list `match_entity_for_booking` gave you) - that
+    list is still valid and still numbered, so just ask "حابب تختار
+    دكتور ثاني من نفس الفرع؟" (or similar) and let them reply with a
+    name or number from it. Only offer to look at OTHER BRANCHES if they
+    say no to that first question, or if they ask for it themselves.
   - "no_more_days": they have already been shown every available day -
     say so plainly instead of repeating the same list back to them.
   - "missing_doctor"/"missing_branch": go back and confirm whichever is
