@@ -214,13 +214,27 @@ def _numbered_prefix(n: int) -> str:
     WHY: the previous version fell back to a plain "11." / "12." past
     ten, which made the tail of a long slot list look like a different,
     unstyled list stapled onto the end of the emoji-numbered one.
+
+    BIDI FIX: keycap digit emoji (e.g. 1️⃣) are NOT recognized by the
+    Unicode bidi algorithm as "European Number" characters the way plain
+    ASCII digits are - they're ordinary neutral symbols. A two-symbol
+    sequence like "1️⃣2️⃣" is therefore free to be visually REORDERED by
+    an RTL renderer (WhatsApp/Arabic paragraph context), and confirmed
+    real production behavior: "12" (1️⃣2️⃣) rendered on-device as "21",
+    while "11" (1️⃣1️⃣) looked fine only because reversing two identical
+    digits is invisible. Wrapping the multi-digit sequence in a
+    LEFT-TO-RIGHT ISOLATE (U+2066) ... POP DIRECTIONAL ISOLATE (U+2069)
+    pair tells the bidi algorithm to render exactly what's enclosed in
+    left-to-right order regardless of the surrounding RTL paragraph,
+    which is what a genuine multi-digit number needs.
     """
 
     if n == 10:
         return "🔟"
     if 1 <= n <= 9:
         return _NUMBER_EMOJIS[n]
-    return "".join(_NUMBER_EMOJIS[int(digit)] for digit in str(n))
+    digits = "".join(_NUMBER_EMOJIS[int(digit)] for digit in str(n))
+    return f"\u2066{digits}\u2069"
 
 
 def _build_slots_numbered_list_directive(messages: list) -> str:
