@@ -65,10 +65,6 @@ DATA_DIR: Path = Path(os.getenv("AGENT_DATA_DIR", str(PROJECT_ROOT / "data")))
 # Platform.
 _CANDIDATE_DATA_DIRS: List[Path] = [DATA_DIR, PROJECT_ROOT]
 
-CLIENT_CONFIG_CSV: Path = DATA_DIR / "client_config.csv"
-DIALECT_TEMPLATES_CSV: Path = DATA_DIR / "dialect_templates.csv"
-
-
 # ==========================================================
 # Booking API
 # ==========================================================
@@ -153,31 +149,27 @@ DOCTOR_AVAILABILITY_WINDOW_DAYS: int = int(
 # literals scattered through node.py.
 
 CANCELLED_STATUS_NAME: str = "Cancelled"
-CANCELLED_STATUS_CODE: int = 6
 
 # Official numeric status codes, confirmed directly from the Booking
 # API's own documentation - these replace the earlier fragile approach
 # of matching statusName strings (which had to handle both English AND
 # Arabic spellings depending on the accept-language header, and broke at
 # least once in practice). Numeric codes are language-independent.
+#
+# Only the codes something actually reads are defined. The full
+# enumeration (ARRIVED/NO_SHOW/COMPLETED/CANCELLED as separate
+# constants, plus CANCELLABLE_STATUSES as a parallel list of NAMES) used
+# to be spelled out here and none of it was referenced anywhere - a
+# second, string-based cancellability list sitting next to the numeric
+# one is exactly how the two drift apart and how the string-matching bug
+# above comes back.
 STATUS_NEW: int = 1
 STATUS_CONFIRMED: int = 2
-STATUS_ARRIVED: int = 3
-STATUS_NO_SHOW: int = 4
-STATUS_COMPLETED: int = 5
-STATUS_CANCELLED: int = 6
 
 # Only these two are cancellable - confirmed directly from the
 # dashboard's own status dropdown (جديد/تم التأكيد were the only ones NOT
 # excluded; وصل/لم يحضر/مكتمل/ملغي were all excluded).
 CANCELLABLE_STATUS_CODES = (STATUS_NEW, STATUS_CONFIRMED)
-
-# Statuses considered cancellable by build_response / check_booking_status.
-# The original sub-workflows only ever check for "already Cancelled" (not
-# an explicit allow-list), so this defaults permissive: anything that
-# isn't already Cancelled is treated as cancellable, and the API call
-# itself is the final authority (its own error response wins either way).
-CANCELLABLE_STATUSES = ("New", "Confirmed")
 
 
 # ==========================================================
@@ -213,7 +205,6 @@ DEFAULT_TIMEZONE: str = os.getenv("DEFAULT_TIMEZONE", "Asia/Riyadh")
 OTP_PROVIDER: str = os.getenv("OTP_PROVIDER", "dummy")
 
 TEST_OTP: str = os.getenv("TEST_OTP", "123456")
-OTP_LENGTH: int = 6
 OTP_TTL_SECONDS: int = 5 * 60  # 5 minutes
 
 AUTHENTICA_BASE_URL: str = os.getenv(
@@ -266,21 +257,6 @@ DEFAULT_COUNTRY_CODE: str = os.getenv("DEFAULT_COUNTRY_CODE", "20")  # Egypt
 
 
 # ==========================================================
-# Retry limits (bounded interrupt loops - see graph.py)
-# ==========================================================
-#
-# Every node that can loop back to itself via an interrupt (phone-format
-# retry, OTP retry, selection retry, confirmation retry) is bounded by one
-# of these, so a confused caller is routed to a handoff message
-# (client_config's msg_handoff_confirmation) instead of looping forever.
-
-MAX_PHONE_FORMAT_RETRIES: int = 3
-MAX_OTP_RETRIES: int = 3
-MAX_SELECTION_RETRIES: int = 3
-MAX_CONFIRMATION_RETRIES: int = 2
-
-
-# ==========================================================
 # LangGraph / Thread Settings
 # ==========================================================
 
@@ -319,11 +295,12 @@ OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4.1")  # upgraded from gpt-4.1-mini for better dialect/persona instruction-following
 OPENAI_TIMEOUT_SECONDS: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "10"))
 
-# LLM classification is only attempted if an API key is present. Without
-# one, prompts.py's callers fall back to deterministic heuristics so the
-# agent still runs (e.g. local dev / tests / this sandbox, which has no
-# outbound access to api.openai.com).
-LLM_CLASSIFICATION_ENABLED: bool = bool(OPENAI_API_KEY)
+# NOTE: there is deliberately no "run without an LLM" flag any more.
+# The old hybrid design could fall back to deterministic heuristics when
+# no API key was present; this architecture cannot - the LLM decides
+# every conversational step - so a flag implying otherwise was a
+# misleading leftover. OPENAI_API_KEY is required, as stated in the
+# README and requirements.txt.
 
 
 # ==========================================================
