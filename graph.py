@@ -1803,6 +1803,12 @@ _NOT_A_BRANCH_NAME = {
     "متاح", "متاحة", "المتاحة", "المتاح", "بس", "برضه", "برضو", "هو", "هي",
     "العيادة", "العياده", "عيادة", "عياده", "اللي", "الي", "التي", "الذي",
     "تزور", "تزوري", "تختار", "تختاري", "يزور",
+    # Number-words following "فرع" describe HOW MANY branches, not name
+    # one - "متوفر في فرع واحد" ("available in one branch"). Confirmed
+    # real false positive: "واحد" was captured as an invented branch
+    # name, forcing a pointless correction retry over a perfectly
+    # accurate reply.
+    "واحد", "واحده", "واحدة", "اثنين", "اثنان", "تلاته", "ثلاثة", "التالي",
 }
 
 _NOT_A_BRANCH_NAME_NORM = {tools._normalize_arabic(w) for w in _NOT_A_BRANCH_NAME}
