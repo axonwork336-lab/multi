@@ -1695,9 +1695,26 @@ _NOT_A_BRANCH_NAME = {
     "تحجز", "تحجزين", "احجز", "أحجز", "فيه", "فيها", "كمان", "ايضا", "أيضا",
     "ولا", "او", "أو", "من", "في", "علي", "على", "عند", "عندنا", "عندكم",
     "متاح", "متاحة", "المتاحة", "المتاح", "بس", "برضه", "برضو", "هو", "هي",
+    "العيادة", "العياده", "عيادة", "عياده", "اللي", "الي", "التي", "الذي",
+    "تزور", "تزوري", "تختار", "تختاري", "يزور",
 }
 
+_NOT_A_BRANCH_NAME_NORM = {tools._normalize_arabic(w) for w in _NOT_A_BRANCH_NAME}
+
 _BRANCH_VERIFIER_STRICT = os.getenv("BRANCH_VERIFIER_STRICT", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _norm_ar(text: str) -> str:
+    """Arabic-aware normalization, so a branch written with a different
+    alef/ya/ta-marbuta form still matches the configured spelling.
+
+    Confirmed real false positive: the reply's "الدقي" was flagged as
+    invented while the config held the same branch under a slightly
+    different spelling - whitespace-only comparison could not see they
+    were the same name, and a verifier that accuses correct replies gets
+    switched off."""
+
+    return tools._normalize_arabic(_normalize_for_compare(text))
 
 
 def _known_branch_text(state: AgentState) -> str:
@@ -1729,7 +1746,7 @@ def _known_branch_text(state: AgentState) -> str:
         if "branch" in key.lower() and isinstance(value, str):
             parts.append(value)
 
-    return _normalize_for_compare(" | ".join(str(p) for p in parts))
+    return _norm_ar(" | ".join(str(p) for p in parts))
 
 
 def _find_invented_branches(reply_text: str, state: AgentState) -> list:
@@ -1747,7 +1764,7 @@ def _find_invented_branches(reply_text: str, state: AgentState) -> list:
 
     invented = []
     for match in _BRANCH_MENTION_RE.finditer(reply_text):
-        name = _normalize_for_compare(match.group(1))
+        name = _norm_ar(match.group(1))
         if not name or len(name) < 3:
             continue
         # A branch name is the run of words right after "فرع", stopping
@@ -1757,7 +1774,7 @@ def _find_invented_branches(reply_text: str, state: AgentState) -> list:
         # that happened to follow the word "فرع", not a name.
         words = []
         for word in name.split():
-            if word in _NOT_A_BRANCH_NAME:
+            if word in _NOT_A_BRANCH_NAME or word in _NOT_A_BRANCH_NAME_NORM:
                 break
             words.append(word)
             if len(words) == 3:
@@ -1794,6 +1811,80 @@ _BRANCH_CORRECTION_DIRECTIVE = (
     "Rewrite the reply now using ONLY real branches, or call the tool "
     "first if you don't have them.\n\n"
 )
+
+_DATE_IN_REPLY_RE = re.compile(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}")
+_TIME_IN_REPLY_RE = re.compile(r"\d{1,2}:\d{2}")
+
+_AVAILABILITY_TOOLS = (
+    "list_available_days_for_booking", "get_available_slots_for_booking",
+    "get_available_reschedule_slots", "resolve_available_day",
+    "get_doctor_schedule", "get_doctor_schedule_for_booking",
+    "find_best_doctor_in_specialty", "lookup_appointment",
+    "check_booking_status", "create_new_booking",
+)
+
+
+def _reply_invents_availability(reply_text, state) -> bool:
+    """True when the reply states an appointment date or times that no
+    availability tool in this conversation ever returned.
+
+    WHY: confirmed real production failure, the worst yet - after a
+    branch was picked the reply offered "يوم الثلاثاء 30-05-2024" and a
+    list of times, with NO availability tool called at all. The date was
+    in the PAST and every time was invented; a patient could have
+    accepted an appointment that existed nowhere. The date/time
+    directives elsewhere only fire AFTER a tool has run, so when the
+    model skips the tool entirely nothing else can catch it."""
+
+    if not reply_text:
+        return False
+
+    dates = _DATE_IN_REPLY_RE.findall(reply_text)
+    times = _TIME_IN_REPLY_RE.findall(reply_text)
+    if not dates and not times:
+        return False
+
+    tool_text = []
+    for msg in state.get("messages", []):
+        if getattr(msg, "name", None) in _AVAILABILITY_TOOLS:
+            content = getattr(msg, "content", "")
+            if content:
+                tool_text.append(str(content))
+
+    if not tool_text:
+        return True
+
+    joined = " ".join(tool_text)
+
+    for value in dates:
+        parts = [p.lstrip("0") for p in re.split(r"[-/]", value)]
+        if not any(p and p in joined for p in parts):
+            return True
+
+    for value in times:
+        hour = value.split(":")[0].lstrip("0")
+        if hour and hour not in joined:
+            return True
+
+    return False
+
+
+_AVAILABILITY_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU STATED A DATE/TIME NO TOOL GAVE YOU - REWRITE YOUR REPLY\n"
+    "============================================================\n"
+    "Your previous draft named an appointment date or times that no "
+    "availability tool returned in this conversation. Those are "
+    "invented - a patient could accept an appointment that does not "
+    "exist anywhere in the booking system.\n\n"
+    "NEVER state a date or time from memory, from reasoning, or from a "
+    "doctor's general working hours. Call "
+    "`list_available_days_for_booking` for the real days, then "
+    "`get_available_slots_for_booking` with that day's own from_date/"
+    "to_date for the real times, and use ONLY what they return.\n\n"
+    "Call the tool now instead of writing a date yourself.\n\n"
+)
+
 
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
@@ -2038,6 +2129,24 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         # gave it? See _find_invented_branches - this is the only check
         # that can catch a name written from memory with no tool call
         # behind it.
+        if _reply_invents_availability(normalized, state):
+            logger.error(
+                "agent[%s]: reply stated an appointment date/time that NO availability tool "
+                "returned - this is a fabricated appointment | strict_mode=%s | reply=%r",
+                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
+            )
+            if _BRANCH_VERIFIER_STRICT:
+                retry = _llm_for(agent_name).invoke(
+                    [SystemMessage(content=_AVAILABILITY_CORRECTION_DIRECTIVE + system_content)] + history
+                )
+                if getattr(retry, "tool_calls", None):
+                    updates["messages"] = [retry]
+                    updates["target_language"] = target_language
+                    return updates
+                if retry.content and not _reply_invents_availability(retry.content, state):
+                    logger.info("agent[%s]: fabricated availability corrected on retry", agent_name)
+                    normalized = _emojify_list_numbers(retry.content)
+
         invented = _find_invented_branches(normalized, state)
         if invented:
             logger.warning(
