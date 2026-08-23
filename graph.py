@@ -1988,6 +1988,71 @@ _AVAILABILITY_CORRECTION_DIRECTIVE = (
 )
 
 
+_GYN_MENTION_RE = re.compile(
+    r"نساء\s*و?\s*توليد|أمراض\s*النساء|امراض\s*النساء|"
+    r"gyn[ae]colog\w*|obstetric\w*"
+)
+
+# Signals that the PATIENT (never the assistant) actually raised
+# something gynaecological/obstetric themselves - only these justify the
+# reply mentioning نساء وتوليد at all. Deliberately narrow: general
+# symptoms (abdominal pain, nausea, dizziness) must NOT appear here, or
+# they would silently "justify" the exact violation this guard exists to
+# catch.
+_PREGNANCY_SIGNAL_RE = re.compile(
+    r"حمل|حامل|حاملة|الدوره|الدورة|دوره\s*شهريه|دورة\s*شهرية|الطمث|"
+    r"تاخر\s*الدوره|تأخر\s*الدورة|اجهاض|إجهاض|ولاده|ولادة|رضاعه|رضاعة|"
+    r"pregnan\w*|menstru\w*|period\s*late"
+)
+
+
+def _reply_offers_unauthorized_gynecology(reply_text: str, state: AgentState) -> bool:
+    """True when the reply names نساء وتوليد (directly or as a "would you
+    also like me to check" secondary offer) despite the PATIENT never
+    having raised anything gynaecological or obstetric themselves.
+
+    WHY: confirmed real production failure, twice. First, abdominal pain
+    and vomiting were routed straight to نساء وتوليد with an unprompted
+    remark about "الجهاز التناسلي الأنثوي". After the prompt was fixed to
+    forbid that, the SAME symptom correctly named طب الباطنة but then
+    tacked on "أو تحبيني أدور لك دكاترة نساء وتوليد كمان؟" in the same
+    message - still naming the specialty unprompted, just softened into
+    an offer instead of the headline answer. Prompt instructions alone
+    did not hold, so this is the same kind of deterministic last-line-of-
+    defence as `_find_invented_branches`/`_reply_invents_availability`."""
+
+    if not reply_text or not _GYN_MENTION_RE.search(reply_text):
+        return False
+
+    for msg in state.get("messages", []):
+        if getattr(msg, "type", None) != "human":
+            continue
+        content = getattr(msg, "content", "")
+        if content and _PREGNANCY_SIGNAL_RE.search(str(content)):
+            return False  # the patient genuinely raised it themselves
+
+    return True
+
+
+_GYN_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU NAMED نساء وتوليد WITHOUT THE PATIENT RAISING IT - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft mentioned نساء وتوليد (gynaecology/obstetrics) - "
+    "even if only as a second, optional offer (\"أو تحبيني أدور لك دكاترة "
+    "نساء وتوليد كمان؟\") - but nothing the patient has said in this "
+    "conversation raised pregnancy, menstruation, or anything "
+    "gynaecological/obstetric themselves.\n\n"
+    "Naming that specialty at all - even as an offered alternative - is "
+    "not allowed on your own initiative. Rewrite your reply with ONLY "
+    "the genuinely relevant general specialty (e.g. طب الباطنة). If you "
+    "believe pregnancy is truly worth ruling out, ask the single plain "
+    "question \"في احتمال يكون حمل؟\" INSTEAD of naming any specialty "
+    "this turn, and let their answer decide what to search next.\n\n"
+    "Rewrite the reply now without mentioning نساء وتوليد.\n\n"
+)
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -2248,6 +2313,25 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     return updates
                 if retry.content and not _reply_invents_availability(retry.content, state):
                     logger.info("agent[%s]: fabricated availability corrected on retry", agent_name)
+                    normalized = _emojify_list_numbers(retry.content)
+
+        if _reply_offers_unauthorized_gynecology(normalized, state):
+            logger.error(
+                "agent[%s]: reply named نساء وتوليد with no patient-raised "
+                "pregnancy/gynaecological signal in this conversation | "
+                "strict_mode=%s | reply=%r",
+                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
+            )
+            if _BRANCH_VERIFIER_STRICT:
+                retry = _llm_for(agent_name).invoke(
+                    [SystemMessage(content=_GYN_CORRECTION_DIRECTIVE + system_content)] + history
+                )
+                if getattr(retry, "tool_calls", None):
+                    updates["messages"] = [retry]
+                    updates["target_language"] = target_language
+                    return updates
+                if retry.content and not _reply_offers_unauthorized_gynecology(retry.content, state):
+                    logger.info("agent[%s]: unauthorized نساء وتوليد mention corrected on retry", agent_name)
                     normalized = _emojify_list_numbers(retry.content)
 
         invented = _find_invented_branches(normalized, state)
