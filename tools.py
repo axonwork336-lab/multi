@@ -91,21 +91,73 @@ _KNOWN_COUNTRY_CODES = (
 )
 
 
+# The clinic's own country, derived from the IANA timezone every client
+# row already sets correctly ("Africa/Cairo", "Asia/Riyadh", ...).
+#
+# WHY NOT country_codes_hint: that column is a list of codes this clinic
+# ACCEPTS from patients, not the country the clinic is in, and it is
+# written most-important-first for the reader, not for a parser. Both
+# rows in client_config.csv read "+966, +20" - so taking the first code
+# out of it made the EGYPTIAN clinic (Africa/Cairo) treat every bare
+# local number as Saudi: "01155611045" became "+9661155611045", a number
+# belonging to nobody, which was then sent to the booking API and used
+# as the OTP storage key. The timezone column is unambiguous, already
+# per-client, and already correct in every row.
+_TIMEZONE_COUNTRY_CODES = {
+    "africa/cairo": "20",
+    "asia/riyadh": "966",
+    "asia/dubai": "971",
+    "asia/kuwait": "965",
+    "asia/qatar": "974",
+    "asia/bahrain": "973",
+    "asia/muscat": "968",
+    "asia/amman": "962",
+    "asia/beirut": "961",
+    "asia/baghdad": "964",
+    "africa/tripoli": "218",
+    "africa/tunis": "216",
+    "africa/algiers": "213",
+    "africa/casablanca": "212",
+    "africa/khartoum": "249",
+}
+
+
 def _client_default_country_code(state=None) -> str:
     """The country code to assume for a BARE LOCAL number (one written
     with a leading 0, or with no country code at all), for this client.
 
-    Read from the client's own config (`country_codes_hint`, e.g.
-    "+966, +20" -> "966") so a Saudi clinic assumes Saudi and an
-    Egyptian one assumes Egypt, instead of every tenant sharing one
-    hardcoded country. Falls back to DEFAULT_COUNTRY_CODE when the
-    client hasn't configured a hint."""
+    Resolution order:
+      1. The client's own `timezone` column, mapped through
+         _TIMEZONE_COUNTRY_CODES - this is the clinic's actual country.
+      2. `phone_example`'s FIRST fully-written number, if the timezone
+         is one this map doesn't know - a clinic that writes
+         "+201155611045" as its example is telling us plainly which
+         country its patients type local numbers for.
+      3. DEFAULT_COUNTRY_CODE.
 
-    hint = ((state or {}).get("templates") or {}).get("_country_codes_hint")
-    if hint:
-        match = re.search(r"\+?(\d{1,4})", str(hint))
+    `country_codes_hint` is deliberately NOT consulted: it lists the
+    codes this clinic ACCEPTS, not the country it is in - see the
+    comment above _TIMEZONE_COUNTRY_CODES.
+    """
+
+    templates = (state or {}).get("templates") or {}
+
+    timezone_name = str(templates.get("_timezone") or "").strip().lower()
+    code = _TIMEZONE_COUNTRY_CODES.get(timezone_name)
+    if code:
+        return code
+
+    example = templates.get("_phone_example")
+    if example:
+        match = re.search(r"\+(\d{4,15})", str(example))
         if match:
-            return match.group(1)
+            digits = match.group(1)
+            # Longest known code first, so "966555123456" resolves to
+            # "966" and not "96". A greedy \d{1,4} here would have
+            # produced "9665", which is not a country code at all.
+            for code in sorted(_KNOWN_COUNTRY_CODES, key=len, reverse=True):
+                if digits.startswith(code):
+                    return code
 
     return DEFAULT_COUNTRY_CODE
 
@@ -673,6 +725,36 @@ def cancel_appointment(
 
 _otp_storage: Dict[str, dict] = {}
 
+# An OTP record is unusable the moment it passes OTP_TTL_SECONDS -
+# verify_otp already rejects it. Without eviction, though, the dict kept
+# every code ever sent for the life of the process: a long-running
+# container accumulates one permanent entry per patient who ever started
+# identity verification, none of which can ever be used again. Pruned
+# lazily (on write, which is the only path that grows the dict) rather
+# than on a timer, so there is no background thread to reason about.
+_OTP_PRUNE_EVERY = 50
+_otp_writes_since_prune = 0
+
+
+def _prune_otp_storage() -> None:
+    global _otp_writes_since_prune
+
+    _otp_writes_since_prune += 1
+    if _otp_writes_since_prune < _OTP_PRUNE_EVERY:
+        return
+
+    _otp_writes_since_prune = 0
+    now = time.time()
+    expired = [
+        key for key, record in _otp_storage.items()
+        if now - record.get("created_at", 0) > OTP_TTL_SECONDS
+    ]
+    for key in expired:
+        _otp_storage.pop(key, None)
+
+    if expired:
+        logger.info("_prune_otp_storage: evicted %d expired OTP record(s)", len(expired))
+
 
 @tool
 def send_otp(state: Annotated[AgentState, InjectedState], phone: str) -> dict:
@@ -709,16 +791,31 @@ def send_otp(state: Annotated[AgentState, InjectedState], phone: str) -> dict:
         return {"status": "otp_sent"}
 
     _otp_storage[normalized] = {"otp": TEST_OTP, "created_at": time.time()}
+    _prune_otp_storage()
     logger.info("OTP sent for %s (test otp=%s)", normalized, TEST_OTP)
     return {"status": "otp_sent"}
 
 
 @tool
-def verify_otp(phone: str, otp: str) -> dict:
+def verify_otp(state: Annotated[AgentState, InjectedState], phone: str, otp: str) -> dict:
     """Verify a user-entered OTP code against the one sent to `phone`.
-    Returns {"status": "otp_valid"} or {"status": "otp_invalid"}."""
+    Returns {"status": "otp_valid"} or {"status": "otp_invalid"}.
 
-    normalized = normalize_phone_number(phone)
+    IMPLEMENTATION NOTE (not something the caller has to do anything
+    about): `state` is injected automatically and is used ONLY to
+    normalize `phone` exactly the way `send_otp` normalized it when it
+    stored the code.
+
+    CONFIRMED REAL PRODUCTION BUG this fixes: `send_otp` normalized with
+    the client's own country code while this function normalized without
+    it (plain module default). For any patient who typed a local number
+    ("01155611045") the two produced DIFFERENT keys - the code was
+    stored under one and looked up under the other - so a correct OTP
+    was rejected 100% of the time and identity verification could never
+    complete.
+    """
+
+    normalized = normalize_phone_number(phone, state)
 
     if OTP_PROVIDER == "authentica":
         result = api.authentica_verify_otp(normalized, otp)
@@ -776,13 +873,51 @@ def _doctors_base_url(state: AgentState) -> Optional[str]:
 
 _BOOKING_SESSIONS: Dict[str, dict] = {}
 
+# A booking session holds a doctor list, a branch list and specialty ids
+# - a few KB per conversation. `create_new_booking` clears it on
+# success, but an ABANDONED booking (the overwhelming majority: the
+# patient stops replying half way through) left its entry behind
+# forever. On a container that stays up for weeks that is an unbounded
+# leak, one entry per abandoned conversation.
+#
+# Sessions older than this are dropped. Deliberately generous - far
+# longer than config.SESSION_TIMEOUT_SECONDS, after which the
+# conversation itself starts fresh anyway - so this can only ever
+# collect sessions that are already dead, never one still in use.
+_BOOKING_SESSION_TTL_SECONDS = 6 * 3600
+_BOOKING_SESSION_PRUNE_EVERY = 100
+_booking_session_touches_since_prune = 0
+
+
+def _prune_booking_sessions() -> None:
+    global _booking_session_touches_since_prune
+
+    _booking_session_touches_since_prune += 1
+    if _booking_session_touches_since_prune < _BOOKING_SESSION_PRUNE_EVERY:
+        return
+
+    _booking_session_touches_since_prune = 0
+    now = time.monotonic()
+    stale = [
+        key for key, session in _BOOKING_SESSIONS.items()
+        if now - session.get("_touched_at", now) > _BOOKING_SESSION_TTL_SECONDS
+    ]
+    for key in stale:
+        _BOOKING_SESSIONS.pop(key, None)
+
+    if stale:
+        logger.info("_prune_booking_sessions: evicted %d abandoned booking session(s)", len(stale))
+
 
 def _get_booking_session(session_id: str) -> dict:
-    return _BOOKING_SESSIONS.setdefault(session_id, {
+    session = _BOOKING_SESSIONS.setdefault(session_id, {
         "doctor_id": None, "branch_id": None, "service_id": None,
         "last_list": None,  # {"entity_type": "doctor"/"branch", "items": [shaped items]}
         "specialty_ids": None,  # remembered so later steps reuse the same specialties
     })
+    session["_touched_at"] = time.monotonic()
+    _prune_booking_sessions()
+    return session
 
 
 def _remember_specialty_ids(session: dict, specialty_ids: Optional[list]) -> None:
@@ -2411,6 +2546,7 @@ def reset_booking_session(state: Annotated[AgentState, InjectedState]) -> dict:
     _BOOKING_SESSIONS[session_id] = {
         "doctor_id": None, "branch_id": None, "service_id": None,
         "last_list": None, "specialty_ids": None,
+        "_touched_at": time.monotonic(),
     }
     return {"status": "reset"}
 
@@ -3277,7 +3413,13 @@ def resolve_available_day(
     Thursday"/"الخميس اللي بعده" relative to one already discussed, or
     to retry after a day turned out fully booked.
     Returns:
-    {"status": "found", "date": "YYYY-MM-DD", "weekday_name": "Thursday", "from_date": ..., "to_date": ...}
+    {"status": "found", "date": "YYYY-MM-DD", "weekday_name": "Thursday",
+     "date_display": "25/08/2026", "weekday_display": "الثلاثاء",
+     "from_date": ..., "to_date": ...}
+        # SHOW `weekday_display` and `date_display` to the patient -
+        # never `date`, which is a machine value in ISO format and reads
+        # as a raw timestamp inside a sentence. Pass `from_date`/
+        # `to_date` VERBATIM into `get_available_slots_for_booking`.
     {"status": "not_found"}  # no available slot for that weekday within the booking window
     {"status": "missing_doctor"} / {"status": "missing_branch"}
     {"status": "not_configured"} / {"status": "error"}"""
@@ -3408,10 +3550,29 @@ def resolve_available_day(
     day_start = datetime.combine(chosen_date, datetime.min.time(), tzinfo=chosen_dt.tzinfo)
     day_end = datetime.combine(chosen_date, datetime.max.time().replace(microsecond=0), tzinfo=chosen_dt.tzinfo)
 
+    language = conversation_language(state)
+
+    # DISPLAY FIELDS, in the conversation's own language.
+    #
+    # This tool used to return `date` (a bare ISO "2026-08-25") and
+    # `weekday_name` ("Tuesday") and NOTHING a reply could show as-is.
+    # The model, correctly told never to reformat a tool's values, then
+    # printed the ISO string straight into an Arabic sentence -
+    # confirmed in production: "الثلاثاء 2026-08-25". Every OTHER
+    # date-bearing tool in this file already returns `date_display` /
+    # `weekday_display`, so the same date appeared in two different
+    # formats depending only on which tool happened to fetch it.
+    #
+    # `date` and `weekday_name` are kept exactly as they were: they are
+    # the MACHINE values, and `from_date`/`to_date` get passed verbatim
+    # into the next call. The display fields are additions, not
+    # replacements.
     return {
         "status": "found",
         "date": chosen_date.isoformat(),
         "weekday_name": english_name,
+        "date_display": _display_date(chosen_dt.isoformat()),
+        "weekday_display": _display_weekday(chosen_dt.isoformat(), language),
         "from_date": day_start.isoformat(),
         "to_date": day_end.isoformat(),
     }
