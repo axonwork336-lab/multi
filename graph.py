@@ -2093,20 +2093,37 @@ _PREGNANCY_SIGNAL_RE = re.compile(
 )
 
 
-def _reply_offers_unauthorized_gynecology(reply_text: str, state: AgentState) -> bool:
+def _reply_offers_unauthorized_gynecology(reply_text: str, state: AgentState, agent_name: str = "") -> bool:
     """True when the reply names نساء وتوليد (directly or as a "would you
     also like me to check" secondary offer) despite the PATIENT never
     having raised anything gynaecological or obstetric themselves.
 
-    WHY: confirmed real production failure, twice. First, abdominal pain
-    and vomiting were routed straight to نساء وتوليد with an unprompted
-    remark about "الجهاز التناسلي الأنثوي". After the prompt was fixed to
-    forbid that, the SAME symptom correctly named طب الباطنة but then
-    tacked on "أو تحبيني أدور لك دكاترة نساء وتوليد كمان؟" in the same
-    message - still naming the specialty unprompted, just softened into
-    an offer instead of the headline answer. Prompt instructions alone
-    did not hold, so this is the same kind of deterministic last-line-of-
+    SCOPED TO THE MEDICAL SPECIALIST ONLY. Confirmed real production
+    false positive: the BOOKING specialist showed the complete, accurate
+    roster of every doctor registered at a branch the patient had just
+    picked (dentistry, internal medicine, retina surgery, gynaecology -
+    whatever is actually there), with zero symptom involved and zero
+    editorializing - just an honest list. نساء وتوليد being one real
+    entry in a factual "who is at this branch" listing is not the same
+    thing as the MEDICAL specialist recommending or offering it
+    unprompted in response to a symptom; flagging it here would mean
+    silently deleting a real, bookable doctor from an accurate roster,
+    which is its own kind of wrong. Only "medical" ever gets to this
+    check at all.
+
+    WHY (for the medical case): confirmed real production failure,
+    twice. First, abdominal pain and vomiting were routed straight to
+    نساء وتوليد with an unprompted remark about "الجهاز التناسلي
+    الأنثوي". After the prompt was fixed to forbid that, the SAME
+    symptom correctly named طب الباطنة but then tacked on "أو تحبيني
+    أدور لك دكاترة نساء وتوليد كمان؟" in the same message - still
+    naming the specialty unprompted, just softened into an offer
+    instead of the headline answer. Prompt instructions alone did not
+    hold, so this is the same kind of deterministic last-line-of-
     defence as `_find_invented_branches`/`_reply_invents_availability`."""
+
+    if agent_name and agent_name != "medical":
+        return False
 
     if not reply_text or not _GYN_MENTION_RE.search(reply_text):
         return False
@@ -2402,7 +2419,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     logger.info("agent[%s]: fabricated availability corrected on retry", agent_name)
                     normalized = _emojify_list_numbers(retry.content)
 
-        if _reply_offers_unauthorized_gynecology(normalized, state):
+        if _reply_offers_unauthorized_gynecology(normalized, state, agent_name):
             logger.error(
                 "agent[%s]: reply named نساء وتوليد with no patient-raised "
                 "pregnancy/gynaecological signal in this conversation | "
@@ -2417,7 +2434,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     updates["messages"] = [retry]
                     updates["target_language"] = target_language
                     return updates
-                if retry.content and not _reply_offers_unauthorized_gynecology(retry.content, state):
+                if retry.content and not _reply_offers_unauthorized_gynecology(retry.content, state, agent_name):
                     logger.info("agent[%s]: unauthorized نساء وتوليد mention corrected on retry", agent_name)
                     normalized = _emojify_list_numbers(retry.content)
 
