@@ -37,6 +37,7 @@ or needs to ask the user something.
 """
 
 import json
+import os
 import sys
 import logging
 import re
@@ -1658,6 +1659,142 @@ def _is_redundant_closing_question_only(reply_text: str, greeting: str) -> bool:
     return len(remainder) <= 3
 
 
+
+
+# ==========================================================
+# Invented-branch-name verifier
+# ==========================================================
+#
+# WHY THIS EXISTS: the model has, more than once, listed branches it was
+# never given. The worst confirmed case offered "فرع الدقي / فرع زايد /
+# فرع مصر الجديدة" for a doctor who works at exactly one branch, with
+# zero tool calls made that turn - so there was no wrong tool result to
+# blame, and no prompt rule could have been "followed" at the moment it
+# mattered, because the model simply wrote names from memory.
+#
+# Every other guard in this file shapes what the model does BEFORE it
+# writes. This one checks what it actually wrote, which is the only
+# place a name invented out of nothing can still be caught.
+#
+# Deliberately narrow: it only looks at branch names, only in final
+# replies, and only flags a name that appears NOWHERE in this
+# conversation's tool results or in the clinic's own configured
+# branches. A name the model got from a tool is never flagged, however
+# it's phrased.
+
+_BRANCH_MENTION_RE = re.compile(r"فرع\s+([^\n،,.؟?:()\[\]0-9️⃣]{2,25})")
+
+# Words that follow "فرع" in ordinary questions rather than naming one -
+# "أي فرع تفضل؟" is not a branch called "تفضل". Without this the
+# verifier flags its own clinic on a perfectly correct question, and a
+# check that cries wolf gets switched off.
+_NOT_A_BRANCH_NAME = {
+    "تفضل", "تفضلين", "تفضلي", "معين", "معيّن", "تاني", "ثاني", "تانية", "ثانية",
+    "قريب", "قريبة", "مناسب", "مناسبة", "محدد", "محددة", "يناسبك", "تحب", "تحبين",
+    "اخر", "آخر", "أخرى", "اخرى", "غيره", "غيرها", "كذا", "معينة",
+    "تحجز", "تحجزين", "احجز", "أحجز", "فيه", "فيها", "كمان", "ايضا", "أيضا",
+    "ولا", "او", "أو", "من", "في", "علي", "على", "عند", "عندنا", "عندكم",
+    "متاح", "متاحة", "المتاحة", "المتاح", "بس", "برضه", "برضو", "هو", "هي",
+}
+
+_BRANCH_VERIFIER_STRICT = os.getenv("BRANCH_VERIFIER_STRICT", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _known_branch_text(state: AgentState) -> str:
+    """Everything this conversation has legitimately been told about
+    branches: the raw text of every tool result so far, plus the
+    clinic's own configured branch names.
+
+    Kept as one big string and tested with substring containment rather
+    than parsed into a name list. Tool results nest branch names under
+    several different keys depending on which tool produced them, and a
+    parser that missed one would flag a perfectly real branch - a false
+    accusation is worse here than a missed one, because it would block
+    a correct reply."""
+
+    parts = []
+
+    for msg in state.get("messages", []):
+        if getattr(msg, "type", None) == "tool" or getattr(msg, "name", None):
+            content = getattr(msg, "content", "")
+            if content:
+                parts.append(str(content))
+
+    templates = state.get("templates") or {}
+    for entry in templates.get("_branch_aliases") or []:
+        parts.extend(entry.get("aliases") or [])
+
+    raw_config = state.get("raw_client_config") or {}
+    for key, value in raw_config.items():
+        if "branch" in key.lower() and isinstance(value, str):
+            parts.append(value)
+
+    return _normalize_for_compare(" | ".join(str(p) for p in parts))
+
+
+def _find_invented_branches(reply_text: str, state: AgentState) -> list:
+    """Branch names the reply mentions that this conversation was never
+    actually given. Empty list means nothing to flag."""
+
+    if not reply_text or "فرع" not in reply_text:
+        return []
+
+    known = _known_branch_text(state)
+    if not known:
+        # Nothing to compare against (no tool results yet, no config) -
+        # stay silent rather than flagging everything.
+        return []
+
+    invented = []
+    for match in _BRANCH_MENTION_RE.finditer(reply_text):
+        name = _normalize_for_compare(match.group(1))
+        if not name or len(name) < 3:
+            continue
+        # A branch name is the run of words right after "فرع", stopping
+        # at the first word that clearly isn't part of a name ("أي فرع
+        # تفضل تحجز فيه؟" -> nothing; "فرع المعادي كمان" -> "المعادي").
+        # Names are 1-3 words in practice, so anything longer is prose
+        # that happened to follow the word "فرع", not a name.
+        words = []
+        for word in name.split():
+            if word in _NOT_A_BRANCH_NAME:
+                break
+            words.append(word)
+            if len(words) == 3:
+                break
+        if not words:
+            continue
+        name = " ".join(words)
+        if len(name) < 3:
+            continue
+        if name in known:
+            continue
+        # Also accept a partial: "الشيخ زايد" mentioned as "زايد".
+        if any(part in known for part in name.split() if len(part) >= 3):
+            continue
+        if name not in invented:
+            invented.append(name)
+
+    return invented
+
+
+_BRANCH_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU LISTED A BRANCH THAT DOES NOT EXIST - REWRITE YOUR REPLY\n"
+    "============================================================\n"
+    "Your previous draft named at least one branch that has NOT appeared "
+    "in any tool result in this conversation and is not one of this "
+    "clinic's configured branches: {names}\n\n"
+    "You may only name branches that came from a tool result. If you "
+    "need the branch list for a confirmed doctor, call the tool that "
+    "returns it rather than writing names from memory - a doctor's "
+    "branches are returned to you as `branchesForDoctor` the moment the "
+    "doctor is confirmed, and `list_branches_for_specialty` returns them "
+    "too.\n\n"
+    "Rewrite the reply now using ONLY real branches, or call the tool "
+    "first if you don't have them.\n\n"
+)
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -1896,6 +2033,42 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     agent_name,
                 )
             normalized = contracted
+
+        # LAST LINE OF DEFENCE: did this reply name a branch nobody ever
+        # gave it? See _find_invented_branches - this is the only check
+        # that can catch a name written from memory with no tool call
+        # behind it.
+        invented = _find_invented_branches(normalized, state)
+        if invented:
+            logger.warning(
+                "agent[%s]: reply named branch(es) that appear in NO tool result and "
+                "are not configured for this client: %s | strict_mode=%s | reply=%r",
+                agent_name, invented, _BRANCH_VERIFIER_STRICT, normalized,
+            )
+
+            if _BRANCH_VERIFIER_STRICT:
+                # Re-ask once, with the correction at the very top so it
+                # outranks everything else for this retry.
+                correction = _BRANCH_CORRECTION_DIRECTIVE.format(names=", ".join(invented))
+                retry = _llm_for(agent_name).invoke(
+                    [SystemMessage(content=correction + system_content)] + history
+                )
+                if getattr(retry, "tool_calls", None):
+                    # It chose to go and fetch the real list - let the
+                    # normal tools loop run instead of sending anything.
+                    updates["messages"] = [retry]
+                    updates["target_language"] = target_language
+                    return updates
+                if retry.content:
+                    still_invented = _find_invented_branches(retry.content, state)
+                    if still_invented:
+                        logger.error(
+                            "agent[%s]: reply STILL named invented branch(es) after correction: %s",
+                            agent_name, still_invented,
+                        )
+                    else:
+                        logger.info("agent[%s]: invented branches corrected on retry", agent_name)
+                        normalized = _emojify_list_numbers(retry.content)
 
         if normalized != response.content:
             response = AIMessage(content=normalized)
