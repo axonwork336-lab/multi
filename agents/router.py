@@ -218,6 +218,19 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
              r"\w*\s*(?:شكوى|شكويه|شكوه|شكاوي|اقتراح|مقترح|ملاحظه|ملاحظة)"),
         (10, r"\b(?:file|submit|make|raise|lodge|register)\s+(?:an?\s+)?"
              r"(?:complaint|grievance|suggestion|feedback)\b"),
+        # Describing a doctor having made a medical ERROR is a complaint
+        # even with no "شكوى"/"اشتكي" wording at all - "وصفلي دواء غلط"
+        # ("prescribed me the wrong medicine") is unambiguously about
+        # something a doctor did wrong, not a booking or medical-
+        # guidance request. Confirmed real production failure: a
+        # complaint that opened this way never scored high enough to
+        # switch away from whichever specialist was already active, so
+        # a specialist with no `send_complaint_email` tool improvised
+        # the entire complaint flow itself and eventually told the
+        # patient their complaint was filed when nothing was ever sent.
+        (9, r"(?:وصف|كتب|اداني|اعطاني)\w*\s*(?:لي|لى)?\s*دواء\s*(?:غلط|خطأ|خطا)"),
+        (9, r"(?:غلط|خطأ|خطا)\s*(?:طبي|في\s*العلاج|في\s*التشخيص|في\s*الدواء|في\s*الوصفه)"),
+        (9, r"(?:الدكتور|الطبيب|دكتور|طبيب)\w{0,10}\s*غلط\w*"),
         (6, r"(?:^|\s)(?:شكوى|شكويه|شكوه|شكاوي|اشتكي|أشتكي|بشتكي\s*من|اقتراح|مقترح)(?:\s|$)"),
         (6, r"\b(?:complaint|complain|grievance|suggestion)\b"),
         (3, r"(?:خدمه\s*سيئه|معامله\s*سيئه|مستاء|مستاءه|زعلان\s*من|غير\s*راضي)"),
