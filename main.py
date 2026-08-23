@@ -62,6 +62,59 @@ def _lock_for(session_id: str) -> threading.Lock:
 
 
 # ==========================================================
+# Bounded bookkeeping
+# ==========================================================
+#
+# _session_locks / _last_active / _success_at / _generation are keyed by
+# session_id, and every one of them used to grow forever: one permanent
+# entry per patient who ever sent a single message. On a container that
+# stays up for weeks that is a slow, guaranteed memory leak with no
+# upper bound.
+#
+# Anything untouched for longer than SESSION_TIMEOUT_SECONDS is already
+# dead as far as _config_for() is concerned - the next message from that
+# session starts a fresh conversation regardless of what is remembered
+# here. So dropping those entries changes no behaviour at all; it only
+# stops the dictionaries growing. A generous multiplier is applied on
+# top so a session can never be collected while it is still live.
+#
+# Pruned lazily, on the same path that adds entries, so there is no
+# background thread and no extra failure mode.
+_BOOKKEEPING_TTL_SECONDS = max(SESSION_TIMEOUT_SECONDS * 4, 4 * 3600)
+_PRUNE_EVERY_N_TURNS = 100
+_turns_since_prune = 0
+
+
+def _prune_session_bookkeeping() -> None:
+    global _turns_since_prune
+
+    _turns_since_prune += 1
+    if _turns_since_prune < _PRUNE_EVERY_N_TURNS:
+        return
+
+    _turns_since_prune = 0
+    cutoff = _now() - _BOOKKEEPING_TTL_SECONDS
+
+    stale = [sid for sid, seen in _last_active.items() if seen < cutoff]
+    if not stale:
+        return
+
+    for session_id in stale:
+        _last_active.pop(session_id, None)
+        _success_at.pop(session_id, None)
+        _generation.pop(session_id, None)
+        with _session_locks_guard:
+            lock = _session_locks.get(session_id)
+            # Never discard a lock some thread is currently holding -
+            # doing so would let a later call create a second lock for
+            # the same session and defeat the whole point of it.
+            if lock is not None and not lock.locked():
+                _session_locks.pop(session_id, None)
+
+    logger.info("pruned bookkeeping for %d inactive session(s)", len(stale))
+
+
+# ==========================================================
 # Inactivity-based reset
 # ==========================================================
 #
@@ -125,6 +178,8 @@ def _config_for(session_id: str) -> dict:
         _success_at.pop(session_id, None)
 
     _last_active[session_id] = now
+
+    _prune_session_bookkeeping()
 
     generation = _generation.get(session_id, 0)
     thread_id = f"{THREAD_ID_PREFIX}:{session_id}:{generation}" if generation else f"{THREAD_ID_PREFIX}:{session_id}"
