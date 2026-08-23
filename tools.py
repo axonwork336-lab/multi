@@ -2664,6 +2664,65 @@ def _fetch_doctors_for_booking(
     return result
 
 
+def _branches_with_real_slots(state: AgentState, base_url: str, doctor_id: str,
+                                branch_ids: list) -> Optional[set]:
+    """Which of `branch_ids` genuinely have at least one open (non-booked)
+    schedule slot for `doctor_id` within the normal booking window - ONE
+    batched call across every candidate branch, not one per branch.
+
+    WHY THIS EXISTS: the mirror image of `_doctors_with_real_slots`, same
+    confirmed real production failure. Branches for an ALREADY-CONFIRMED
+    doctor are derived from her general DoctorSchedules rows - which
+    branch(es) she's assigned to recurringly - not from whether she
+    currently has anything bookable there. A patient was shown "فرع
+    الشيخ زايد" as an option for a doctor purely because a schedule ROW
+    exists for that pairing, picked it, and only found out afterward
+    (`list_available_days_for_booking` returning zero days) that she had
+    nothing open there at all. This cross-checks the SAME real
+    schedule-slots endpoint booking itself uses, in one call for every
+    candidate branch at once.
+
+    Returns None (meaning "unknown, don't filter anything out") if the
+    verification call itself fails, same principle as
+    `_doctors_with_real_slots`/`_open_slots_on_day`."""
+
+    if not branch_ids:
+        return set()
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    now = datetime.now(tz)
+    result = api.get_doctor_schedule_slots(
+        base_url, doctor_ids=[doctor_id], branch_ids=branch_ids,
+        from_date=now.isoformat(),
+        to_date=(now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat(),
+        is_booked=False, page_size=1000,
+     language=conversation_language(state),)
+
+    if not result["success"]:
+        logger.warning(
+            "_branches_with_real_slots: verification call failed for doctor_id=%s "
+            "(status_code=%s) - keeping every candidate branch rather than hiding "
+            "real availability on a transient error",
+            doctor_id, result.get("status_code"),
+        )
+        return None
+
+    have_slots = set()
+    for item in (result["data"] or {}).get("items", []):
+        if item.get("isBooked"):
+            continue
+        branch_id = item.get("branchId")
+        if branch_id:
+            have_slots.add(branch_id)
+
+    return have_slots
+
+
 @tool
 def match_entity_for_booking(
     state: Annotated[AgentState, InjectedState],
@@ -2839,7 +2898,28 @@ def match_entity_for_booking(
             return {"matched": False, "ambiguous": False, "status": "error"}
 
         all_branch_items = (all_branches_result["data"] or {}).get("items", [])
-        result = {"success": True, "data": {"items": [b for b in all_branch_items if b.get("id") in doctor_branch_ids]}, "error": None}
+        candidate_branches = [b for b in all_branch_items if b.get("id") in doctor_branch_ids]
+
+        # ONE extra batched call cross-checks these candidate branches
+        # against real schedule slots, so a branch that's only a general
+        # schedule assignment - with nothing actually bookable there
+        # right now - is not offered as a choice. See
+        # _branches_with_real_slots for why.
+        verified_branch_ids = _branches_with_real_slots(
+            state, base_url, session["doctor_id"], [b["id"] for b in candidate_branches if b.get("id")],
+        )
+        if verified_branch_ids is not None:
+            before = len(candidate_branches)
+            candidate_branches = [b for b in candidate_branches if b.get("id") in verified_branch_ids]
+            if len(candidate_branches) != before:
+                logger.info(
+                    "match_entity_for_booking (branch, doctor-filtered): dropped %d "
+                    "branch(es) with no real open slot for doctor_id=%s despite a "
+                    "general schedule assignment there",
+                    before - len(candidate_branches), session["doctor_id"],
+                )
+
+        result = {"success": True, "data": {"items": candidate_branches}, "error": None}
         name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
     else:
         result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
