@@ -2082,6 +2082,66 @@ _COMPLAINT_CORRECTION_DIRECTIVE = (
 
 
 # ==========================================================
+# Fabricated "you've been transferred to a human" verifier
+# ==========================================================
+#
+# WHY THIS EXISTS: same class of failure as the fabricated complaint
+# confirmation above, applied to human handoff. Confirmed real
+# production failure: a patient said "لا هشتكي الدكتور دا" ("no, I'll
+# complain about this doctor") - not a request for a human agent at all,
+# and not agreement to any handoff that had been offered - and was told
+# "تم تحويلك إلى أحد ممثلي خدمة العملاء" (you've been transferred to a
+# customer service rep) with `request_human_handoff` never having been
+# called anywhere in the conversation. The patient was NOT transferred;
+# they were left believing a human was now handling something that
+# nobody was ever notified about. `request_human_handoff` itself
+# requires `patient_agreed=True` and returns no patient-facing text on
+# purpose specifically so the model still has to write - and get right -
+# the confirmation line itself; this check catches it when that line is
+# written without the tool call that's supposed to back it up.
+
+_HANDOFF_CONFIRMATION_RE = re.compile(
+    r"تم\s*تحويلك|تم\s*التحويل|جاري\s*تحويلك|حولتك|حولناك|"
+    r"سيتم\s*تحويلك|تم\s*تحويل\s*محادثتك"
+)
+
+
+def _reply_fabricates_handoff(reply_text: str, state: AgentState) -> bool:
+    if not reply_text or not _HANDOFF_CONFIRMATION_RE.search(reply_text):
+        return False
+
+    for msg in state.get("messages", []):
+        if getattr(msg, "name", None) != "request_human_handoff":
+            continue
+        content = str(getattr(msg, "content", "") or "")
+        if '"status": "handoff_requested"' in content or "'status': 'handoff_requested'" in content:
+            return False  # a real handoff was actually raised - not fabricated
+
+    return True
+
+
+_HANDOFF_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU CONFIRMED A HANDOFF WITHOUT REQUESTING ONE - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft told the patient they've been transferred to a "
+    "human staff member, but `request_human_handoff` was never called "
+    "successfully in this conversation (or `patient_agreed` was not "
+    "True) - nobody was actually notified. Telling a patient they've "
+    "been handed off when they haven't is a serious trust failure: they "
+    "may now be waiting indefinitely for a human who was never alerted.\n\n"
+    "A handoff requires the patient's own explicit agreement - either "
+    "they asked for a human themselves, or you offered one earlier and "
+    "they just said yes to THAT offer. If that hasn't genuinely happened "
+    "yet, do not call the tool or claim a transfer - ask them plainly "
+    "whether they'd like to be connected to a staff member instead, and "
+    "only call `request_human_handoff` with `patient_agreed=True` once "
+    "they confirm.\n\n"
+    "Rewrite the reply now without claiming a handoff happened.\n\n"
+)
+
+
+# ==========================================================
 # "Doctor confirmed, then re-offered a doctor roster anyway" verifier
 # ==========================================================
 #
@@ -2508,6 +2568,25 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     return updates
                 if retry.content and not _reply_fabricates_complaint_submission(retry.content, state):
                     logger.info("agent[%s]: fabricated complaint confirmation corrected on retry", agent_name)
+                    normalized = _emojify_list_numbers(retry.content)
+
+        if _reply_fabricates_handoff(normalized, state):
+            logger.error(
+                "agent[%s]: reply confirmed a human handoff but "
+                "request_human_handoff was never raised successfully in this "
+                "conversation - fabricated confirmation | strict_mode=%s | reply=%r",
+                agent_name, _BRANCH_VERIFIER_STRICT, normalized,
+            )
+            if _BRANCH_VERIFIER_STRICT:
+                retry = _llm_for(agent_name).invoke(
+                    [SystemMessage(content=_HANDOFF_CORRECTION_DIRECTIVE + system_content)] + history
+                )
+                if getattr(retry, "tool_calls", None):
+                    updates["messages"] = [retry]
+                    updates["target_language"] = target_language
+                    return updates
+                if retry.content and not _reply_fabricates_handoff(retry.content, state):
+                    logger.info("agent[%s]: fabricated handoff confirmation corrected on retry", agent_name)
                     normalized = _emojify_list_numbers(retry.content)
 
         if _reply_reoffers_doctor_roster_after_confirming_one(normalized):
