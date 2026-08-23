@@ -1065,6 +1065,69 @@ def _shape_doctor_list(raw_items: list, language: str = "ar") -> list:
     return doctors
 
 
+def _doctors_with_real_slots(state: AgentState, base_url: str, doctor_ids: list,
+                              branch_id: str) -> Optional[set]:
+    """Which of `doctor_ids` genuinely have at least one open (non-booked)
+    schedule slot at `branch_id` within the normal booking window - ONE
+    batched call for the whole roster, not one per doctor.
+
+    WHY THIS EXISTS: confirmed real production failure. The doctor-list
+    endpoint's own `hasSlots` flag is trusted leniently on purpose
+    (excluding a doctor only when it is explicitly False - see
+    `find_available_doctors`'s own comment on why treating a missing/
+    null flag as "unavailable" was a worse, previously-fixed bug). That
+    leniency means a doctor whose `hasSlots` came back null/missing but
+    who genuinely has ZERO open slots still gets shown as a bookable
+    choice. A patient picked exactly such a doctor from a branch's
+    roster and only found out two turns later - after already
+    committing to her - that `list_available_days_for_booking` had
+    nothing at all for her. This cross-checks against the SAME real
+    schedule-slots endpoint used for actual booking, in one call for
+    every candidate doctor at once, so the roster shown matches what
+    booking will actually honour.
+
+    Returns None (meaning "unknown, don't filter anything out") if the
+    verification call itself fails - a transient error here must not
+    silently hide every doctor, the same principle `_open_slots_on_day`
+    already follows elsewhere in this file."""
+
+    if not doctor_ids:
+        return set()
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    now = datetime.now(tz)
+    result = api.get_doctor_schedule_slots(
+        base_url, doctor_ids=doctor_ids, branch_ids=[branch_id],
+        from_date=now.isoformat(),
+        to_date=(now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat(),
+        is_booked=False, page_size=1000,
+     language=conversation_language(state),)
+
+    if not result["success"]:
+        logger.warning(
+            "_doctors_with_real_slots: verification call failed for branch_id=%s "
+            "(status_code=%s) - keeping every candidate rather than hiding real "
+            "availability on a transient error",
+            branch_id, result.get("status_code"),
+        )
+        return None
+
+    have_slots = set()
+    for item in (result["data"] or {}).get("items", []):
+        if item.get("isBooked"):
+            continue
+        doctor_id = item.get("doctorId")
+        if doctor_id:
+            have_slots.add(doctor_id)
+
+    return have_slots
+
+
 def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list:
     """Fetch the available doctors at one branch, narrowed to the
     specialties this booking is already about (when known), and remember
@@ -1100,6 +1163,23 @@ def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list
 
     available = [i for i in (result["data"] or {}).get("items", []) if i.get("hasSlots") is not False]
     doctors = _shape_doctor_list(available, conversation_language(state))
+
+    # ONE extra batched call cross-checks the roster against real
+    # schedule slots, so a doctor whose hasSlots flag was ambiguous but
+    # who genuinely has nothing open is not offered as a bookable
+    # choice - see _doctors_with_real_slots for why.
+    verified_ids = _doctors_with_real_slots(
+        state, base_url, [d["id"] for d in doctors if d.get("id")], branch_id,
+    )
+    if verified_ids is not None:
+        before = len(doctors)
+        doctors = [d for d in doctors if d.get("id") in verified_ids]
+        if len(doctors) != before:
+            logger.info(
+                "_doctors_at_branch: dropped %d doctor(s) with no real open slot "
+                "at branch_id=%s despite an ambiguous hasSlots flag",
+                before - len(doctors), branch_id,
+            )
 
     if doctors:
         _remember_list(state, "doctor", doctors)
