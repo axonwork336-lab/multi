@@ -634,6 +634,62 @@ def _build_booking_confirmation_requires_tool_directive(messages: list, session_
     return ""
 
 
+def _build_show_soonest_day_directive(messages: list, session_id: str) -> str:
+    """When a doctor (and branch) are settled, the next message must SHOW
+    the soonest available date - never ask the patient which day they
+    want.
+
+    WHY THIS EXISTS: confirmed real production failure, repeatedly. With
+    د. طه مبروك and فرع الشيخ زايد both confirmed, the reply was "ممكن
+    تخبرني اليوم اللي تفضله للحجز؟ مثلاً الجمعة، السبت؟" - asking the
+    patient to guess. They have no way of knowing when the doctor works
+    or which days still have space, so a wrong guess dead-ends the
+    booking; and in earlier runs the model filled that gap by inventing
+    weekdays outright.
+
+    STEP NB3 already says to call `list_available_days_for_booking`
+    immediately and show the date. It was not followed, so the
+    instruction is injected here, at the exact turn it applies to,
+    where it competes with nothing else."""
+
+    if not messages or not session_id:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    if not isinstance(messages[-1], _HumanMessage):
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id)
+    if not session or not session.get("doctor_id"):
+        return ""
+
+    # Already past this step? Then the days/slots have been handled.
+    for msg in reversed(messages[:-1]):
+        name = getattr(msg, "name", None)
+        if name in ("list_available_days_for_booking", "get_available_slots_for_booking",
+                    "resolve_available_day", "create_new_booking"):
+            return ""
+
+    return (
+        "============================================================\n"
+        "SHOW THE SOONEST DATE - DO NOT ASK WHICH DAY THEY WANT\n"
+        "============================================================\n"
+        "A doctor is already confirmed for this booking. Your ONLY next "
+        "action is to call `list_available_days_for_booking` and SHOW the "
+        "soonest date it returns, then ask whether that date suits them.\n\n"
+        "You are NOT allowed to ask \"which day would you prefer?\", to "
+        "suggest example days, or to name any weekday before that tool "
+        "has returned. The patient does not know when this doctor works "
+        "or which days still have space - asking them to guess is asking "
+        "for information only the booking system has. Confirmed real "
+        "production failure: with the doctor and branch both settled, the "
+        "reply asked \"ممكن تخبرني اليوم اللي تفضله؟ مثلاً الجمعة، "
+        "السبت؟\" - two weekdays that came from nowhere.\n\n"
+        "Call the tool now.\n\n"
+    )
+
+
 def _build_day_confirmation_requires_tool_directive(messages: list) -> str:
     """
     If the most recent ToolMessage in the conversation (scanning
@@ -1815,6 +1871,12 @@ _BRANCH_CORRECTION_DIRECTIVE = (
 _DATE_IN_REPLY_RE = re.compile(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}")
 _TIME_IN_REPLY_RE = re.compile(r"\d{1,2}:\d{2}")
 
+_WEEKDAY_WORDS = {
+    "الاثنين": "Monday", "الإثنين": "Monday", "الثلاثاء": "Tuesday",
+    "الأربعاء": "Wednesday", "الاربعاء": "Wednesday", "الخميس": "Thursday",
+    "الجمعة": "Friday", "السبت": "Saturday", "الأحد": "Sunday", "الاحد": "Sunday",
+}
+
 _AVAILABILITY_TOOLS = (
     "list_available_days_for_booking", "get_available_slots_for_booking",
     "get_available_reschedule_slots", "resolve_available_day",
@@ -1841,7 +1903,15 @@ def _reply_invents_availability(reply_text, state) -> bool:
 
     dates = _DATE_IN_REPLY_RE.findall(reply_text)
     times = _TIME_IN_REPLY_RE.findall(reply_text)
-    if not dates and not times:
+
+    # Weekday names count too. Confirmed real production failure: the
+    # reply offered "1️⃣ الخميس 2️⃣ السبت 3️⃣ الاثنين" as bookable days
+    # with no availability tool called at all - it carried no digits, so
+    # a date/time-only check saw nothing wrong while the patient was
+    # being offered three days the doctor may not work at all.
+    weekdays = [d for d in _WEEKDAY_WORDS if d in reply_text]
+
+    if not dates and not times and not weekdays:
         return False
 
     tool_text = []
@@ -1864,6 +1934,13 @@ def _reply_invents_availability(reply_text, state) -> bool:
     for value in times:
         hour = value.split(":")[0].lstrip("0")
         if hour and hour not in joined:
+            return True
+
+    for day in weekdays:
+        # The tools return weekday names in both the conversation's
+        # language and English, so accept either spelling.
+        english = _WEEKDAY_WORDS[day]
+        if day not in joined and english.lower() not in joined.lower():
             return True
 
     return False
@@ -1968,6 +2045,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     )
     schedule_display_directive = _build_schedule_display_directive(state["messages"])
     day_confirmation_directive = _build_day_confirmation_requires_tool_directive(state["messages"])
+    show_soonest_directive = _build_show_soonest_day_directive(state["messages"], state.get("session_id"))
     booking_confirmation_directive = _build_booking_confirmation_requires_tool_directive(state["messages"], state.get("session_id"))
     booking_success_directive = _build_booking_success_display_directive(state["messages"], state.get("templates"))
 
@@ -1986,7 +2064,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + slots_directive + available_days_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
-        + wrong_tool_directive + day_confirmation_directive
+        + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
         + booking_confirmation_directive + booking_success_directive
         + scoped_prompt
         # CHANNEL IDENTITY goes LAST, after scoped_prompt (STEP NB6/
