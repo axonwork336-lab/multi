@@ -2655,11 +2655,39 @@ _DOCTOR_ROSTER_OFFER_RE = re.compile(
 )
 
 
+# The branch question - "a particular branch, or shall I show you...?".
+# Asking this AT ALL means a doctor is already settled: there is no
+# other reason to be choosing a branch in the booking flow. So a reply
+# that asks it and offers the doctor roster in the same breath is
+# self-contradictory, whether or not it happens to restate the
+# confirmation line.
+#
+# CONFIRMED REAL MISS (the FIFTH occurrence of this anti-pattern): the
+# reply was the bare question with no confirmation line above it -
+# "تحب تحجزين في فرع معيّن، ولا أعرض لك كل الدكاترة المتاحين؟" - because
+# the doctor had been agreed in the PREVIOUS turn. Requiring the
+# confirmation text to be present in the same message meant the guard
+# only ever caught the version where the model restated it.
+_BRANCH_QUESTION_OFFER_RE = re.compile(
+    r"(?:في\s*)?فرع\s*(?:معين|معينه|محدد|محدده)|"
+    r"(?:اي|انهي|انهو)\s*فرع|"
+    r"(?:a\s+)?(?:particular|specific|certain)\s+branch|which\s+branch"
+)
+
+
 def _reply_reoffers_doctor_roster_after_confirming_one(reply_text: str) -> bool:
     if not reply_text:
         return False
+
     folded = _norm_ar(reply_text)
-    return bool(_DOCTOR_CONFIRMED_RE.search(folded)) and bool(_DOCTOR_ROSTER_OFFER_RE.search(folded))
+
+    if not _DOCTOR_ROSTER_OFFER_RE.search(folded):
+        return False
+
+    return bool(
+        _DOCTOR_CONFIRMED_RE.search(folded)
+        or _BRANCH_QUESTION_OFFER_RE.search(folded)
+    )
 
 
 _DOCTOR_ROSTER_CORRECTION_DIRECTIVE = (
@@ -3110,6 +3138,67 @@ def _build_doctor_branches_directive(messages: list, session_id: str) -> str:
     return _DOCTOR_BRANCHES_DIRECTIVE
 
 
+_BRANCH_QUESTION_PHRASING_DIRECTIVE = (
+    "============================================================\n"
+    "THE BRANCH QUESTION - EXACT PHRASING\n"
+    "============================================================\n"
+    "A doctor is settled for this booking. The next thing you do not "
+    "know is the BRANCH, so that is the one question this turn.\n\n"
+    "Ask it in this shape, with the doctor's real name in place of "
+    "[اسم الدكتور]:\n"
+    "    تحب تحجز في فرع معيّن، ولا أعرض لك كل الفروع اللي "
+    "د. [اسم الدكتور] متاح فيهم؟\n\n"
+    "The alternative you offer is THAT DOCTOR'S BRANCHES. Never offer "
+    "\"كل الدكاترة المتاحين\" or any doctor list here - the doctor "
+    "question is answered, and re-offering the roster invites them to "
+    "undo a choice they just made. Confirmed in production five separate "
+    "times.\n\n"
+    "If they then ask to see the branches, call "
+    "`get_doctor_schedule_for_booking` - that returns this doctor's own "
+    "branches with the days and hours at each.\n\n"
+)
+
+
+def _doctor_is_settled(messages: list, session_id: str) -> bool:
+    """Whether a specific doctor has been settled for this booking -
+    either confirmed into the session, or named by a tool and then
+    agreed to by the patient in the turn just gone.
+
+    The second case matters: the patient can say "اه" to "تحب أحجز لك
+    عند د. طه مبروك؟" and the doctor is settled from their point of view
+    long before any tool has written it into the session.
+    """
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    if session.get("doctor_id"):
+        return True
+
+    last_list = session.get("last_list") or {}
+    if last_list.get("entity_type") == "doctor" and last_list.get("items"):
+        return True
+
+    return False
+
+
+def _build_branch_question_directive(messages: list, session_id: str, agent_name: str) -> str:
+    """Fires in the booking flow once a doctor is settled and no branch
+    is confirmed yet - the exact point at which the branch question gets
+    asked, and the point at which it has repeatedly been asked wrong."""
+
+    if agent_name not in ("booking", "concierge") or not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+
+    if session.get("branch_id"):
+        return ""
+
+    if not _doctor_is_settled(messages, session_id):
+        return ""
+
+    return _BRANCH_QUESTION_PHRASING_DIRECTIVE
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -3224,6 +3313,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     doctor_branches_directive = _build_doctor_branches_directive(
         state["messages"], state.get("session_id"),
     )
+    branch_question_directive = _build_branch_question_directive(
+        state["messages"], state.get("session_id"), agent_name,
+    )
 
     # The scoped prompt for whoever owns this turn. Rebuilt per turn for
     # the same reason load_config rebuilds: a prompts.py/CSV edit must
@@ -3254,7 +3346,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + slots_directive + available_days_directive
         + resolved_day_directive + entity_list_directive
         + abandoned_booking_directive + bare_entity_directive
-        + doctor_branches_directive
+        + doctor_branches_directive + branch_question_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
