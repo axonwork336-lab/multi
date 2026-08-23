@@ -363,6 +363,66 @@ def _latest_human_text(messages: List) -> str:
 
 
 # ==========================================================
+# "Yes, book it" - a bare affirmation replying to a booking offer
+# ==========================================================
+#
+# CONFIRMED REAL PRODUCTION FAILURE: the MEDICAL specialist asked
+# "تبغى أحجز لك عند د. طه مبروك؟" (do you want me to book you with
+# Dr. X?) and the patient replied "اه" (yeah). "اه" alone carries no
+# cue at all, so the normal stickiness rule kept MEDICAL active - which
+# does not have match_entity_for_booking/list_available_days_for_booking,
+# only the coarse find_available_doctors/list_branches_for_specialty.
+# With no tool to get the doctor's REAL branches or REAL soonest day,
+# the model started inventing branch names from memory and asking "pick
+# a day yourself" instead of showing one - two separate confirmed
+# failures, both downstream of staying in the wrong specialist.
+#
+# A bare "yes" is not itself a cue for anything - "اه" said mid-medical-
+# guidance about a symptom is not a booking signal. It only means
+# "start booking" when the ASSISTANT'S OWN PREVIOUS MESSAGE just offered
+# to book something. That is a narrow, safe trigger: it only fires on
+# the exact turn right after the assistant asked a booking question.
+
+_BARE_AFFIRMATION_RE = re.compile(
+    r"^(?:اه+|ايوه|ايوا|ايه|نعم|تمام|ماشي|اكيد|أكيد|تمام\s*كده|"
+    r"يلا|يلا\s*بينا|كده\s*تمام|حاضر|okay|ok|yes|yep|yeah|sure)[\s!.،,؟?]*$"
+)
+
+_PREVIOUS_REPLY_OFFERED_BOOKING_RE = re.compile(
+    r"تحجز\w*\s*(?:لك\s*)?عند|أحجز\w*\s*لك\s*عند|احجز\w*\s*لك\s*عند|"
+    r"نحجز\w*\s*لك|نكمل\s*الحجز|تحب\w*\s*تحجز|حاب\w*\s*تحجز|"
+    r"تبغى\s*أحجز|تبي\s*أحجز|ابدأ\s*الحجز|أبدأ\s*بالحجز"
+)
+
+
+def _last_ai_text(messages: List) -> str:
+    """The assistant's own most recent reply, searched from just before
+    the newest human message backward - i.e. "what did the bot just
+    say" from the patient's point of view this turn."""
+
+    history = list(messages or [])
+    last_human = None
+    for index in range(len(history) - 1, -1, -1):
+        if getattr(history[index], "type", None) == "human":
+            last_human = index
+            break
+
+    search_from = history[:last_human] if last_human is not None else history
+    for message in reversed(search_from):
+        if getattr(message, "type", None) == "ai":
+            content = getattr(message, "content", "")
+            return content if isinstance(content, str) else str(content)
+    return ""
+
+
+def _affirms_previous_booking_offer(messages: List, text: str) -> bool:
+    if not _BARE_AFFIRMATION_RE.match(normalize(text)):
+        return False
+    last_ai = _last_ai_text(messages)
+    return bool(last_ai) and bool(_PREVIOUS_REPLY_OFFERED_BOOKING_RE.search(last_ai))
+
+
+# ==========================================================
 # The routing decision
 # ==========================================================
 
@@ -374,17 +434,21 @@ def route_turn(messages: List, active_agent: Optional[str] = None) -> Tuple[str,
     The rules, in the order they are applied:
 
       1. No message to read      -> keep the active specialist.
-      2. Strong cue for someone
+      2. A bare "yes" answering
+         the assistant's own
+         previous booking offer  -> switch straight to booking, even
+                                    with zero textual cue of its own.
+      3. Strong cue for someone
          other than the active
          specialist              -> switch (a deliberate change of
                                     subject, e.g. "خلاص ألغيه بقى" while
                                     booking).
-      3. Nothing active yet      -> the best cue above the start
+      4. Nothing active yet      -> the best cue above the start
                                     threshold, otherwise the concierge.
-      4. The active flow just
+      5. The active flow just
          completed AND this
          message has no cue      -> back to the concierge.
-      5. Anything else           -> keep the active specialist. This is
+      6. Anything else           -> keep the active specialist. This is
                                     the case that covers "نعم", an OTP,
                                     a phone number, a menu number, a
                                     weekday - i.e. most of a real
@@ -398,6 +462,9 @@ def route_turn(messages: List, active_agent: Optional[str] = None) -> Tuple[str,
 
     if not text.strip():
         return (active_agent or CONCIERGE), "no user message - kept current specialist"
+
+    if active_agent != "booking" and _affirms_previous_booking_offer(messages, text):
+        return "booking", "bare affirmation answering the assistant's own booking offer"
 
     scores = score_message(text)
     candidate, score = _best(scores)
