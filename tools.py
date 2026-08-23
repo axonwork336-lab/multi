@@ -1971,6 +1971,39 @@ def _normalize_arabic(text: str) -> str:
     return text
 
 
+def _strip_entity_filler(text: str) -> str:
+    """Remove the generic words patients naturally put around a name -
+    "فرع الدقي", "مستشفى تناسق", "دكتور أحمد", "Dokki branch".
+
+    These carry no identifying information, but they DO wreck fuzzy
+    matching: "فرع النزهة" against a stored "النزهة" scores far lower
+    than the bare name, and against an English "Al Nozha" it fails
+    outright. Confirmed real production failure: "النزهة" matched
+    correctly while "فرع النزهة" - the far more natural way to ask -
+    came back as a branch that doesn't exist.
+
+    Only ever used to build an EXTRA comparison candidate; the original
+    text is still matched too, so a clinic whose branch is genuinely
+    called e.g. "مركز الفرع" can't be broken by this."""
+
+    if not text:
+        return ""
+
+    stripped = str(text)
+    for filler in (
+        "فرع", "فروع", "الفرع", "مستشفى", "المستشفى", "مستشفي", "عيادة", "العيادة",
+        "مركز", "المركز", "دكتور", "الدكتور", "دكتوره", "دكتورة", "د.", "طبيب", "الطبيب",
+        "branch", "hospital", "clinic", "center", "centre", "doctor", "dr.", "dr",
+    ):
+        stripped = re.sub(rf"(?:^|\s){re.escape(filler)}(?=\s|$)", " ", stripped, flags=re.IGNORECASE)
+
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+
+    # If stripping removed everything, the filler WAS the name - keep the
+    # original rather than matching on an empty string.
+    return stripped or str(text).strip()
+
+
 def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
     """Match `user_input` against `candidates` (list of raw API items),
     checking each of `name_keys` per candidate. Returns:
@@ -1988,6 +2021,16 @@ def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
     if not normalized_input:
         return {"result": "not_matched"}
 
+    # Also compare against the input with generic words removed, so
+    # "فرع النزهة" matches a branch stored as "النزهة" (or "Al Nozha")
+    # just as well as the bare name does. Both variants are tried and
+    # the better score wins, so this can only ever help - see
+    # _strip_entity_filler.
+    candidates_input = [normalized_input]
+    stripped_input = _normalize_arabic(_strip_entity_filler(user_input))
+    if stripped_input and stripped_input != normalized_input:
+        candidates_input.append(stripped_input)
+
     scored = []
     for item in candidates:
         best_score = 0.0
@@ -1995,14 +2038,17 @@ def _fuzzy_match(user_input: str, candidates: list, name_keys: list) -> dict:
             value = item.get(key)
             if not value:
                 continue
-            normalized_value = _normalize_arabic(value)
-            if normalized_input == normalized_value:
-                best_score = max(best_score, 1.0)
-            elif normalized_input in normalized_value or normalized_value in normalized_input:
-                best_score = max(best_score, 0.96)
-            else:
-                ratio = difflib.SequenceMatcher(None, normalized_input, normalized_value).ratio()
-                best_score = max(best_score, ratio)
+            for normalized_value in {_normalize_arabic(value), _normalize_arabic(_strip_entity_filler(value))}:
+                if not normalized_value:
+                    continue
+                for candidate_input in candidates_input:
+                    if candidate_input == normalized_value:
+                        best_score = max(best_score, 1.0)
+                    elif candidate_input in normalized_value or normalized_value in candidate_input:
+                        best_score = max(best_score, 0.96)
+                    else:
+                        ratio = difflib.SequenceMatcher(None, candidate_input, normalized_value).ratio()
+                        best_score = max(best_score, ratio)
         if best_score >= 0.6:
             scored.append((item, best_score))
 
@@ -2925,7 +2971,29 @@ def get_patient_info(state: Annotated[AgentState, InjectedState], mobile_number:
     they've booked before. Returns:
     {"status": "found", "patientFullName": ..., "mobileNumber": ..., "email": ...}
     {"status": "not_found"}  # not registered - collect name/email fresh
+    {"status": "too_early"}
+        # No appointment time has been shown yet, so it is too early to
+        # be collecting personal details - go back and show the
+        # available times for the chosen day first, let the patient pick
+        # one, and only then ask for their phone number.
     {"status": "not_configured"} / {"status": "error"}"""
+
+    session = _get_booking_session(state.get("session_id"))
+    if not session.get("slots_shown"):
+        # Collecting personal details before a time exists is the wrong
+        # order and it costs the patient real effort for nothing:
+        # confirmed real production failure - the phone question was
+        # asked straight after a branch was picked, so the patient could
+        # have handed over their details and only then discovered no
+        # suitable time was free. Times first, always.
+        logger.warning(
+            "get_patient_info called before any slot times were shown for session_id=%s - refusing",
+            state.get("session_id"),
+        )
+        return {
+            "status": "too_early",
+            "reason": "no appointment time has been shown or chosen yet - show the available times first",
+        }
 
     base_url = _doctors_base_url(state)
     if not base_url:
@@ -3802,6 +3870,12 @@ def get_available_slots_for_booking(
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
+    if items:
+        # Record that this booking has genuinely reached the "here are
+        # the times" stage. get_patient_info refuses to run before this,
+        # so the patient can never be asked for their phone number and
+        # name for an appointment whose time doesn't exist yet.
+        session["slots_shown"] = True
     logger.info(
         "get_available_slots_for_booking: doctor_id=%s branch_id=%s from_date=%s to_date=%s api_returned=%d",
         doctor_id, branch_id, from_date, to_date, len(items),
