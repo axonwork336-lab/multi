@@ -94,6 +94,19 @@ _TOOL_GROUPS: Dict[str, tuple] = {
     "searching_doctors": (
         "find_available_doctors",
         "find_best_doctor_in_specialty",
+    ),
+
+    # LISTING SPECIALTIES IS NOT SEARCHING FOR DOCTORS.
+    #
+    # `list_specialties` used to sit in "searching_doctors", so a turn
+    # that only fetched the specialty list told the patient "جاري البحث
+    # عن الأطباء المتاحين". Confirmed from a real conversation: the
+    # patient described stomach pain, the agent looked up specialties in
+    # order to NAME one, and the reply that followed was merely an offer
+    # ("تحب أشوف لك الدكاترة؟"). The patient had not asked for a doctor
+    # search and none was run - so the interim line announced work that
+    # was never done, and pre-empted a question they hadn't answered yet.
+    "searching_specialties": (
         "list_specialties",
     ),
 
@@ -183,21 +196,60 @@ _SILENT_RESOLVER_TOOLS = frozenset({
     "match_entity_info",
 })
 
+# Tools that LIST options. Announcing one of these as a search is right
+# when the patient asked an open question ("what branches does he work
+# at?"), and wrong when they have just answered with a pick from a list
+# already on their screen.
+#
+# CONFIRMED FROM A REAL CHAT: the patient was shown three branches, typed
+# "2", and was told "لحظة من فضلك، جاري البحث عن الفروع المتاحة… 🏥" -
+# the branches had already been found and shown, and what the assistant
+# was actually doing was resolving their choice and fetching days. The
+# line described work from the previous turn, and re-announcing a search
+# for something they just chose reads as though their answer was
+# ignored. See `schedule(..., answering_a_list=True)`.
+_LIST_LOOKUP_TOOLS = frozenset({
+    "list_branches_for_specialty",
+    "list_specialties",
+    "find_available_doctors",
+    "find_best_doctor_in_specialty",
+})
+
 # Order of precedence when one turn calls several tools at once: the
 # patient should be told about the most significant thing happening, not
 # whichever tool the model happened to list first.
+#
+# EVERY GROUP IN _TOOL_GROUPS MUST APPEAR HERE. `message_for` resolves
+# the group by walking this tuple, so a group missing from it can never
+# be selected at all - it silently falls through to the "generic" line.
+# `searching_times` and `finding_patient_details` were both missing,
+# which is why looking up a day's times said "جاري تنفيذ طلبك… ⏳"
+# instead of "جاري البحث عن الأوقات المتاحة… 🕐", despite having a
+# perfectly good message defined for it. There is a test below that
+# fails if the two lists ever drift apart again.
 _GROUP_PRIORITY = (
     "creating_booking",
     "cancelling",
     "rescheduling",
     "sending_complaint",
     "sending_otp",
+    "searching_times",
     "searching_slots",
     "searching_branches",
     "searching_doctors",
+    "searching_specialties",
     "finding_booking",
+    "finding_patient_details",
     "checking_info",
 )
+
+# Fail loudly at import rather than shipping a group nothing can select.
+_UNREACHABLE_GROUPS = set(_TOOL_GROUPS) - set(_GROUP_PRIORITY)
+if _UNREACHABLE_GROUPS:  # pragma: no cover - guards a coding mistake
+    raise RuntimeError(
+        "progress.py: these tool groups are not in _GROUP_PRIORITY and can "
+        f"therefore never be selected: {sorted(_UNREACHABLE_GROUPS)}"
+    )
 
 
 # Defaults, kept deliberately plain. They are NOT written in any one
@@ -208,6 +260,8 @@ _GROUP_PRIORITY = (
 _DEFAULT_MESSAGES: Dict[str, Dict[str, str]] = {
     "searching_doctors":  {"ar": "لحظة من فضلك، جاري البحث عن الأطباء المتاحين… 🔎",
                            "en": "One moment please - looking up the available doctors… 🔎"},
+    "searching_specialties": {"ar": "لحظة من فضلك، جاري مراجعة التخصصات المتاحة… 🩺",
+                           "en": "One moment please - checking the available specialties… 🩺"},
     "searching_branches": {"ar": "لحظة من فضلك، جاري البحث عن الفروع المتاحة… 🏥",
                            "en": "One moment please - looking up the available branches… 🏥"},
     "searching_slots":    {"ar": "لحظة من فضلك، جاري البحث عن المواعيد المتاحة… 🗓️",
@@ -358,8 +412,15 @@ def schedule(
     tool_names: Iterable[str],
     language: Optional[str] = "ar",
     templates: Optional[dict] = None,
+    answering_a_list: bool = False,
 ) -> None:
     """Arm the interim message for a tool phase that is about to start.
+
+    `answering_a_list`: True when the patient's own latest message was a
+    pick from a list they were just shown ("2", "الدقي", "الأول"). In
+    that case a list-lookup tool is resolving their answer, not
+    searching on their behalf, so it is treated as a silent resolver -
+    see _LIST_LOOKUP_TOOLS.
 
     Never raises: a failure here must not be able to break a turn that
     would otherwise have answered the patient perfectly well.
@@ -373,14 +434,23 @@ def schedule(
         if not names:
             return
 
-        if names and all(n in _SILENT_RESOLVER_TOOLS for n in names):
+        silent = set(_SILENT_RESOLVER_TOOLS)
+        if answering_a_list:
+            silent |= _LIST_LOOKUP_TOOLS
+
+        if all(name in silent for name in names):
             # Nothing worth announcing yet - see _SILENT_RESOLVER_TOOLS.
             # Leave any already-armed timer from earlier in this turn
             # alone; just don't let THIS call arm one or overwrite the
             # pending wording with a resolver-only description.
             return
 
-        text = message_for(names, language, templates)
+        # Whatever remains is what the patient is genuinely waiting for,
+        # so the wording is taken from that and not from the resolvers
+        # sharing the same turn.
+        announceable = [name for name in names if name not in silent] or names
+
+        text = message_for(announceable, language, templates)
         fire_now = False
 
         with _lock:
@@ -484,15 +554,45 @@ def _deliver(session_id: str, client_id: str, text: str) -> None:
         # where nothing ever sends a webhook.
         import requests
 
+        # LAST CHECK, IMMEDIATELY BEFORE THE REQUEST GOES OUT.
+        #
+        # The guard above runs while holding the lock, but the POST that
+        # follows takes real time - measured at ~1.3s against the live
+        # n8n webhook. The turn can, and does, finish inside that window:
+        # the guard passed at T, the real answer left the app at T+40ms,
+        # and the interim line was still in flight. Re-reading the flag
+        # here shrinks that window to the width of the send call itself.
+        if not _in_flight.get(session_id):
+            logger.info(
+                "progress[%s]: suppressed %r just before sending - the turn finished",
+                session_id, text,
+            )
+            return
+
         response = requests.post(
             url,
             json=payload,
             timeout=config.PROGRESS_TIMEOUT_SECONDS,
             headers={"Content-Type": "application/json"},
         )
-        logger.info(
-            "progress[%s]: sent %r (HTTP %s)", session_id, text, response.status_code,
-        )
+
+        # The window cannot be closed entirely from this side - the
+        # request is already with n8n by now. Logging when it happens at
+        # least makes it visible and measurable rather than showing up
+        # only as a confused patient. If this line appears often, raise
+        # PROGRESS_DELAY_SECONDS: the turns firing it are ones that were
+        # never slow enough to need an interim message.
+        if not _in_flight.get(session_id):
+            logger.warning(
+                "progress[%s]: sent %r but the turn finished while it was in "
+                "flight - the patient may see it after the answer. Consider "
+                "raising PROGRESS_DELAY_SECONDS (currently %ss).",
+                session_id, text, config.PROGRESS_DELAY_SECONDS,
+            )
+        else:
+            logger.info(
+                "progress[%s]: sent %r (HTTP %s)", session_id, text, response.status_code,
+            )
     except Exception as exc:
         # Swallowed on purpose. A "please wait" line that fails to send is
         # a cosmetic loss; it must never surface to the patient or
