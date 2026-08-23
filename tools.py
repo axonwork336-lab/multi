@@ -2754,12 +2754,24 @@ def match_entity_for_booking(
     {"matched": true, "needsConfirmation": false, "item": {...}}
         -> CONFIRMED AND SAVED to the booking session automatically -
            do NOT ask "are you sure" for this case, proceed directly.
-           When entity_type="branch", this ALSO carries
-           "doctorsAtBranch": [...] - the doctors who actually work at
-           that branch (narrowed to this booking's specialty when known)
-           and already remembered for numeric selection. Show THAT list,
-           numbered - never re-show doctor names from before the branch
-           was chosen, because not every doctor works at every branch.
+           When entity_type="branch" AND no doctor was already confirmed
+           in this booking, this ALSO carries "doctorsAtBranch": [...] -
+           the doctors who actually work at that branch (narrowed to
+           this booking's specialty when known) and already remembered
+           for numeric selection. Show THAT list, numbered - never
+           re-show doctor names from before the branch was chosen,
+           because not every doctor works at every branch.
+    {"matched": true, ..., "doctorAlreadyConfirmed": true}
+        -> the branch was confirmed while a DOCTOR was already
+           confirmed earlier in this booking. There is no doctor list
+           here on purpose - one was already picked, so do not ask
+           "which doctor?" or show any doctor roster. Go straight to
+           `list_available_days_for_booking` for the doctor+branch pair
+           already on file. Confirmed real, repeated production
+           failure: a confirmed doctor kept getting silently dropped the
+           moment a branch was confirmed afterward, with the reply
+           reverting to "here are the available doctors" as if no
+           doctor had ever been chosen.
     {"matched": true, "needsConfirmation": true, "item": {...}}
         -> a close-but-not-exact match (likely a typo) - nothing was
            saved yet. Ask the user "did you mean [item]?" and WAIT.
@@ -3007,10 +3019,23 @@ def match_entity_for_booking(
                 response = {"matched": True, "needsConfirmation": False, "item": shaped}
 
                 if entity_type == "branch":
-                    doctors_here = _doctors_at_branch(state, base_url, shaped["id"])
-                    response["doctorsAtBranch"] = doctors_here
-                    if not doctors_here:
-                        response["noDoctorsAtBranch"] = True
+                    if session.get("doctor_id"):
+                        # A doctor is ALREADY confirmed - there is no
+                        # roster to browse, so don't compute or return
+                        # one. Confirmed real, repeated production
+                        # failure: doctorsAtBranch being present at all
+                        # (even naming the SAME already-confirmed
+                        # doctor among others, or coming back empty)
+                        # kept tempting the model into re-presenting a
+                        # doctor choice that was already settled,
+                        # discarding the confirmed doctor entirely.
+                        # Removing the data removes the temptation.
+                        response["doctorAlreadyConfirmed"] = True
+                    else:
+                        doctors_here = _doctors_at_branch(state, base_url, shaped["id"])
+                        response["doctorsAtBranch"] = doctors_here
+                        if not doctors_here:
+                            response["noDoctorsAtBranch"] = True
 
                 return response
 
@@ -3055,14 +3080,22 @@ def match_entity_for_booking(
     response = {"matched": True, "needsConfirmation": needs_confirmation, "item": shaped}
 
     if entity_type == "branch" and not needs_confirmation and shaped.get("id"):
-        doctors_here = _doctors_at_branch(state, base_url, shaped["id"])
-        response["doctorsAtBranch"] = doctors_here
-        if not doctors_here:
-            # Explicit flag rather than just an empty list: confirmed
-            # real failure - with an empty list the reply still said
-            # "هنا قائمة الدكاترة المتاحين في الفرع" and then listed
-            # nobody, leaving the patient with a confirmed branch and no
-            # way forward.
+        if session.get("doctor_id"):
+            # Same reasoning as the positional-pick branch above: a
+            # doctor is already confirmed, so there is no roster to
+            # browse - don't return one, don't tempt a re-presentation
+            # of a decision that's already made.
+            response["doctorAlreadyConfirmed"] = True
+        else:
+            doctors_here = _doctors_at_branch(state, base_url, shaped["id"])
+            response["doctorsAtBranch"] = doctors_here
+            if not doctors_here:
+                # Explicit flag rather than just an empty list: confirmed
+                # real failure - with an empty list the reply still said
+                # "هنا قائمة الدكاترة المتاحين في الفرع" and then listed
+                # nobody, leaving the patient with a confirmed branch and no
+                # way forward.
+                response["noDoctorsAtBranch"] = True
             response["noDoctorsAtBranch"] = True
 
     return response
