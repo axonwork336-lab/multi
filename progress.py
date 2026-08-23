@@ -96,19 +96,18 @@ _TOOL_GROUPS: Dict[str, tuple] = {
         "find_best_doctor_in_specialty",
     ),
 
-    # LISTING SPECIALTIES IS NOT SEARCHING FOR DOCTORS.
-    #
-    # `list_specialties` used to sit in "searching_doctors", so a turn
-    # that only fetched the specialty list told the patient "جاري البحث
-    # عن الأطباء المتاحين". Confirmed from a real conversation: the
-    # patient described stomach pain, the agent looked up specialties in
-    # order to NAME one, and the reply that followed was merely an offer
-    # ("تحب أشوف لك الدكاترة؟"). The patient had not asked for a doctor
-    # search and none was run - so the interim line announced work that
-    # was never done, and pre-empted a question they hadn't answered yet.
-    "searching_specialties": (
-        "list_specialties",
-    ),
+    # Kept as a group with no tools of its own: `list_specialties` is
+    # silent (see _SILENT_RESOLVER_TOOLS), but a tenant may still
+    # override this wording via msg_progress_searching_specialties, and
+    # _list_mode_alias can still select it.
+    "searching_specialties": (),
+
+    # A doctor search NARROWED TO A SPECIALTY, which is what the patient
+    # has just agreed to when they say "اه" to "تحب أشوف لك الدكاترة في
+    # التخصص ده؟". Worth its own wording: at that moment the specialty
+    # is the shared context of the conversation, and naming it confirms
+    # the assistant understood which one they meant.
+    "searching_specialty_doctors": (),
 
     "searching_branches": (
         "list_branches_for_specialty",
@@ -194,6 +193,19 @@ _GROUP_FOR_TOOL: Dict[str, str] = {
 _SILENT_RESOLVER_TOOLS = frozenset({
     "match_entity_for_booking",
     "match_entity_info",
+    # `list_specialties` is an INTERNAL step, not the thing the patient
+    # is waiting for. They described a symptom and are waiting to be
+    # told which doctor to see; the specialty lookup is how the
+    # assistant works that out, and announcing it ("جاري مراجعة
+    # التخصصات المتاحة") narrates the assistant's own reasoning at
+    # someone who never asked about specialties.
+    #
+    # Confirmed directly: this line appeared after "بطني وجعاني وعندي
+    # ترجيع" and was rejected - what the patient wants told to them is
+    # the DOCTOR search, which is the step after they agree. Silencing
+    # it here means the turn's timer stays unarmed and the genuinely
+    # relevant next call is what speaks.
+    "list_specialties",
 })
 
 # ...BUT ONLY IN RESOLVE MODE.
@@ -278,6 +290,7 @@ _GROUP_PRIORITY = (
     "searching_times",
     "searching_slots",
     "searching_branches",
+    "searching_specialty_doctors",
     "searching_doctors",
     "searching_specialties",
     "finding_booking",
@@ -304,6 +317,8 @@ _DEFAULT_MESSAGES: Dict[str, Dict[str, str]] = {
                            "en": "One moment please - looking up the available doctors… 🔎"},
     "searching_specialties": {"ar": "لحظة من فضلك، جاري مراجعة التخصصات المتاحة… 🩺",
                            "en": "One moment please - checking the available specialties… 🩺"},
+    "searching_specialty_doctors": {"ar": "لحظة من فضلك، جاري مراجعة الدكاترة المتاحين في التخصص ده… 🩺",
+                           "en": "One moment please - checking the available doctors in this specialty… 🩺"},
     "searching_branches": {"ar": "لحظة من فضلك، جاري البحث عن الفروع المتاحة… 🏥",
                            "en": "One moment please - looking up the available branches… 🏥"},
     "searching_slots":    {"ar": "لحظة من فضلك، جاري البحث عن المواعيد المتاحة… 🗓️",
@@ -329,6 +344,27 @@ _DEFAULT_MESSAGES: Dict[str, Dict[str, str]] = {
     "generic":            {"ar": "لحظة من فضلك، جاري تنفيذ طلبك… ⏳",
                            "en": "One moment please - working on that… ⏳"},
 }
+
+
+def _message_for_group(
+    group: str,
+    language: Optional[str] = "ar",
+    templates: Optional[dict] = None,
+) -> str:
+    """The interim line for one named group, bypassing tool lookup.
+
+    Same tenant-override rule as `message_for`: a
+    `msg_progress_<group>` column in the client's config wins, then
+    `msg_progress`, then the neutral default.
+    """
+
+    if templates:
+        override = templates.get(f"msg_progress_{group}") or templates.get("msg_progress")
+        if override and override.strip():
+            return override.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    key = "en" if (language or "ar").startswith("en") else "ar"
+    return _DEFAULT_MESSAGES.get(group, _DEFAULT_MESSAGES["generic"])[key]
 
 
 def message_for(
@@ -514,7 +550,22 @@ def schedule(
             for name in announceable
         ]
 
-        text = message_for(announceable, language, templates)
+        # A doctor search narrowed to a specialty gets wording that says
+        # so - it is the step the patient just agreed to, and naming the
+        # specialty confirms the assistant understood which one.
+        groups_override = None
+        if any(
+            name == "find_available_doctors"
+            and (args_by_tool.get(name) or {}).get("specialty_ids")
+            for name in announceable
+        ):
+            groups_override = "searching_specialty_doctors"
+
+        text = (
+            _message_for_group(groups_override, language, templates)
+            if groups_override
+            else message_for(announceable, language, templates)
+        )
         fire_now = False
 
         with _lock:
