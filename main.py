@@ -300,6 +300,20 @@ def send_message_with_signals(
 
             result = graph.invoke(state, config=thread_config)
 
+            # End the turn for progress.py IMMEDIATELY once the real
+            # answer exists - not only in the `finally` block below.
+            # Confirmed real production race: the gap between this point
+            # and the `finally` at the bottom of this function (which
+            # still had to run the cancellation check, compute signals,
+            # and log both) was enough time for an already-armed timer to
+            # fire and slip past the `_in_flight` guard, so "لحظة من
+            # فضلك، جاري البحث..." was delivered a few milliseconds AFTER
+            # the real reply had already gone out and been logged. Ending
+            # the turn here closes that window at the earliest possible
+            # point; the `finally` call below still runs too (end_turn is
+            # idempotent) so the exception path stays fully covered.
+            progress.end_turn(session_id)
+
             reply = result["messages"][-1].content
             logger.info("session_id=%s: reply=%r", session_id, reply)
 
