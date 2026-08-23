@@ -196,6 +196,48 @@ _SILENT_RESOLVER_TOOLS = frozenset({
     "match_entity_info",
 })
 
+# ...BUT ONLY IN RESOLVE MODE.
+#
+# `match_entity_for_booking` is dual-mode: with `user_input` filled it
+# resolves the patient's text to one entity (instant, always followed by
+# the real work), and with `user_input` EMPTY it lists every doctor or
+# branch - which is a full roster fetch and is frequently the slowest
+# thing in the turn.
+#
+# CONFIRMED REAL FAILURE: the patient answered "دكتور", the turn spent
+# 5.1 seconds fetching and rendering all 8 doctors, and said nothing at
+# all while they waited - because the only tool called was this one, and
+# it was unconditionally treated as silent. `schedule()` is given the
+# call's ARGUMENTS now so it can tell the two modes apart.
+_LIST_MODE_ARG_NAMES = ("user_input",)
+
+
+def _is_list_mode(tool_name: str, args: Optional[dict]) -> bool:
+    """True when a dual-mode resolver is being used to LIST rather than
+    to resolve - i.e. its entity argument is empty."""
+
+    if tool_name not in _SILENT_RESOLVER_TOOLS:
+        return False
+
+    if args is None:
+        # No argument information available: assume resolve mode, which
+        # preserves the previous behaviour exactly.
+        return False
+
+    return not any(str(args.get(name) or "").strip() for name in _LIST_MODE_ARG_NAMES)
+
+
+def _list_mode_alias(tool_name: str, args: Optional[dict]) -> str:
+    """The tool whose wording describes what a list-mode resolver is
+    actually fetching, chosen from its `entity_type` argument."""
+
+    entity_type = str((args or {}).get("entity_type") or "").strip().lower()
+
+    if entity_type.startswith("branch"):
+        return "list_branches_for_specialty"
+
+    return "find_available_doctors"
+
 # Tools that LIST options. Announcing one of these as a search is right
 # when the patient asked an open question ("what branches does he work
 # at?"), and wrong when they have just answered with a pick from a list
@@ -413,6 +455,7 @@ def schedule(
     language: Optional[str] = "ar",
     templates: Optional[dict] = None,
     answering_a_list: bool = False,
+    tool_args: Optional[dict] = None,
 ) -> None:
     """Arm the interim message for a tool phase that is about to start.
 
@@ -421,6 +464,10 @@ def schedule(
     that case a list-lookup tool is resolving their answer, not
     searching on their behalf, so it is treated as a silent resolver -
     see _LIST_LOOKUP_TOOLS.
+
+    `tool_args`: {tool_name: arguments}, used only to tell a dual-mode
+    resolver's LIST mode (a real roster fetch, worth announcing) from
+    its RESOLVE mode (instant) - see _is_list_mode.
 
     Never raises: a failure here must not be able to break a turn that
     would otherwise have answered the patient perfectly well.
@@ -434,7 +481,12 @@ def schedule(
         if not names:
             return
 
-        silent = set(_SILENT_RESOLVER_TOOLS)
+        args_by_tool = tool_args or {}
+
+        silent = {
+            name for name in _SILENT_RESOLVER_TOOLS
+            if not _is_list_mode(name, args_by_tool.get(name))
+        }
         if answering_a_list:
             silent |= _LIST_LOOKUP_TOOLS
 
@@ -449,6 +501,18 @@ def schedule(
         # so the wording is taken from that and not from the resolvers
         # sharing the same turn.
         announceable = [name for name in names if name not in silent] or names
+
+        # A dual-mode resolver in LIST mode has no group of its own -
+        # what it is fetching depends on its `entity_type` argument. Map
+        # it onto the tool whose wording already describes that fetch, so
+        # listing doctors says "جاري البحث عن الأطباء" and listing
+        # branches says "جاري البحث عن الفروع", rather than both falling
+        # through to the generic line.
+        announceable = [
+            _list_mode_alias(name, args_by_tool.get(name))
+            if _is_list_mode(name, args_by_tool.get(name)) else name
+            for name in announceable
+        ]
 
         text = message_for(announceable, language, templates)
         fire_now = False
