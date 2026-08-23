@@ -36,8 +36,8 @@ Design notes worth knowing before changing anything here
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import config
 import tools as tools_module
@@ -459,13 +459,3 @@ def _rejoin_everything(sections: Dict[str, str]) -> str:
     if not order:
         order = [k for k in sections if k != "__order__"]
     return "\n\n".join(sections[k].strip() for k in order if k in sections)
-
-
-def describe_roster() -> str:
-    """Human-readable summary - used by the CLI banner and the tests."""
-
-    lines = []
-    for spec in _SPECS:
-        tool_count = "all" if spec.full_access else str(len(spec.tools()))
-        lines.append(f"  {spec.name:<11} {spec.title:<28} tools: {tool_count}")
-    return "\n".join(lines)
