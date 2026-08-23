@@ -432,9 +432,21 @@ _BARE_AFFIRMATION_RE = re.compile(
     r"يلا|يلا\s*بينا|كده\s*تمام|حاضر|okay|ok|yes|yep|yeah|sure)[\s!.،,؟?]*$"
 )
 
+# \w*[^.\n؟?]{0,20}?عند IS LOAD-BEARING: the earlier version required
+# "لك" to be immediately followed by "عند" ("أحجز لك عند"), so a
+# perfectly natural rephrasing with a word in between - "تحب أحجز لك
+# موعد عنده؟" ("would you like me to book you an appointment with
+# him?") - never matched at all. Confirmed real production failure:
+# the patient said "اه" to exactly that offer, the affirmation-override
+# above never fired because THIS regex missed it, and the conversation
+# stayed on MEDICAL - which then invented branch names again for the
+# same reason as before. The bounded gap (up to ~20 chars, no sentence/
+# question-mark boundary crossed) catches "لك موعد عند"/"لك كشف عند"
+# and similar short insertions without matching across unrelated
+# sentences.
 _PREVIOUS_REPLY_OFFERED_BOOKING_RE = re.compile(
-    r"تحجز\w*\s*(?:لك\s*)?عند|أحجز\w*\s*لك\s*عند|احجز\w*\s*لك\s*عند|"
-    r"نحجز\w*\s*لك|نكمل\s*الحجز|تحب\w*\s*تحجز|حاب\w*\s*تحجز|"
+    r"(?:تحجز|أحجز|احجز|نحجز)\w*[^.\n؟?]{0,20}?عند|"
+    r"نكمل\s*الحجز|تحب\w*\s*تحجز|حاب\w*\s*تحجز|"
     r"تبغى\s*أحجز|تبي\s*أحجز|ابدأ\s*الحجز|أبدأ\s*بالحجز"
 )
 
