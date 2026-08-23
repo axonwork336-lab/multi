@@ -1536,6 +1536,34 @@ def list_branches_for_specialty(
     return {"status": "found", "branches": branches}
 
 
+def _booking_branch_is_stale(state, session) -> bool:
+    """Whether the branch remembered in the booking session should be
+    ignored for the question being asked right now.
+
+    A branch is remembered so that the REST OF THAT BOOKING stays
+    consistent with it. It is not a global preference, and it must not
+    outlive the flow that set it.
+
+    The signal is which specialist owns this turn. `booking` and
+    `reschedule` are the two flows a branch legitimately constrains -
+    they are placing or moving a specific appointment. `medical`, `faq`
+    and the concierge are answering a different question, and silently
+    filtering their results by a branch chosen for an abandoned booking
+    turns a specialty the clinic genuinely staffs into "nobody is
+    available".
+
+    Returns False when the active agent is unknown, so nothing changes
+    on any path that does not go through the router.
+    """
+
+    active_agent = (state or {}).get("active_agent")
+
+    if not active_agent:
+        return False
+
+    return active_agent not in ("booking", "reschedule")
+
+
 @tool
 def find_available_doctors(
     state: Annotated[AgentState, InjectedState],
@@ -1543,6 +1571,7 @@ def find_available_doctors(
     days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
     branch_name: str = "",
     allow_broader_search: bool = True,
+    all_branches: bool = False,
 ) -> dict:
     """Find doctors who currently have a bookable service AND an available
     schedule slot within the next `days_ahead` days, across one or more
@@ -1556,6 +1585,14 @@ def find_available_doctors(
     the user hasn't picked a branch (or said they don't mind). If the
     user doesn't know which branches exist, call
     `list_branches_for_specialty` instead of guessing.
+
+    `all_branches=True`: search the WHOLE hospital, ignoring any branch
+    settled earlier in the conversation. Pass this whenever the user asks
+    to look more widely - "شوف في أي دكتور في المستشفى", "في فروع
+    ثانية؟", "anywhere", "any branch" - and whenever you are answering a
+    NEW question that has nothing to do with an earlier booking attempt.
+    Without it, a branch chosen earlier keeps narrowing every later
+    search.
 
     The returned list is remembered automatically, so the user can simply
     reply with its number ("3") and `match_entity_for_booking` will
@@ -1635,10 +1672,41 @@ def find_available_doctors(
         session["branch_display_name"] = _arabic_preferred_name(matched_branch)
         logger.info("find_available_doctors: confirmed branch_id=%s (%s) from branch_name=%r", matched_branch["id"], session["branch_display_name"], branch_name)
 
+    elif all_branches:
+        # An explicit clinic-wide search. The remembered branch is also
+        # CLEARED, not merely ignored for this one call: the patient has
+        # just said the branch isn't the constraint, so leaving it in the
+        # session would re-narrow the very next lookup.
+        if session.get("branch_id"):
+            logger.info(
+                "find_available_doctors: all_branches=True - clearing remembered branch_id=%s",
+                session.get("branch_id"),
+            )
+        session["branch_id"] = None
+        session["branch_display_name"] = None
+
     elif session.get("branch_id"):
         # A branch was already confirmed earlier in this booking - keep
         # the doctor list consistent with it.
-        branch_ids = [session["branch_id"]]
+        #
+        # ONLY when that branch belongs to the flow actually in progress.
+        # CONFIRMED REAL PRODUCTION FAILURE: a patient picked a branch,
+        # abandoned the booking ("لا مش عايزة كده خلاص"), then described
+        # stomach pain. The medical search inherited that dead branch, so
+        # a specialty the clinic genuinely staffs came back as "no
+        # doctors available" - and when the patient then asked, in as
+        # many words, to look across the whole hospital, the identical
+        # branch-filtered query ran again and gave the identical wrong
+        # answer. A branch chosen for a booking that is no longer
+        # happening must not silently constrain a different question.
+        if _booking_branch_is_stale(state, session):
+            logger.info(
+                "find_available_doctors: ignoring branch_id=%s - it belongs to an "
+                "abandoned/unrelated flow, not the question being asked now",
+                session.get("branch_id"),
+            )
+        else:
+            branch_ids = [session["branch_id"]]
 
     now = datetime.utcnow()
     intersection_start = now.isoformat() + "Z"
@@ -3628,7 +3696,7 @@ def _open_slots_on_day(state, base_url: str, doctor_id: str, branch_id: str,
 @tool
 def list_available_days_for_booking(
     state: Annotated[AgentState, InjectedState],
-    limit: int = 1,
+    limit: int = 3,
     offset: int = 0,
 ) -> dict:
     """For a NEW BOOKING: list the doctor's REAL upcoming days that
@@ -3647,18 +3715,23 @@ def list_available_days_for_booking(
     confirmed to have at least one genuinely open slot, so you can show
     its date directly without any further checking.
 
-SHOW THE SOONEST AVAILABLE DAY ONLY: `limit` defaults to 1 on
-    purpose. A doctor with a weekly clinic produces the same appointment
-    repeated at different dates ("Saturday 22/08, Saturday 29/08,
-    Saturday 05/09..."), which is noise, not a choice - the patient
-    almost always wants the earliest one. Offer that single date and ask
-    if it suits them.
+    SHOW THE NEAREST FEW DAYS: `limit` defaults to 3. When the doctor
+    genuinely has more than one day open at this branch, show them as a
+    numbered list and let the patient pick - they can then choose the
+    day that actually suits them in ONE message instead of rejecting a
+    single offered date and waiting for the next one. When only one day
+    is open, that single date is shown on its own and the patient is
+    simply asked whether it suits them.
 
-    Only when the patient asks for something else ("مش مناسب", "معاد
-    أبعد", "في مواعيد تانية؟") call this AGAIN with `offset` advanced
-    past what you already showed, and only then may you raise `limit`
-    (e.g. limit=3) to show a few alternatives. Never dump the whole
-    window on the first reply.
+    Deliberately still a small number, not the whole window: a doctor
+    with a weekly clinic produces the same appointment repeated at
+    different dates ("Saturday 22/08, Saturday 29/08, Saturday
+    05/09..."), and twenty of those is noise rather than a choice.
+
+    If none of them suit ("مش مناسب", "معاد أبعد", "في مواعيد تانية؟")
+    call this AGAIN with the result's own `next_offset` to show the
+    following few. Never invent or calculate a date yourself, and never
+    dump the whole window on the first reply.
 
     `has_more` in the response tells you whether further days exist
     beyond the ones returned, so you can say so honestly instead of
@@ -3861,9 +3934,9 @@ SHOW THE SOONEST AVAILABLE DAY ONLY: `limit` defaults to 1 on
     #
     # Rather than trusting the sweep, each candidate day is confirmed
     # with the SAME query the next step will run. A day that fails is
-    # skipped, not shown. Because `limit` defaults to 1 this is normally
-    # a single extra call, and it makes "here is your appointment"
-    # something the next turn can actually honour.
+    # skipped, not shown. With `limit` at 3 this is normally three extra
+    # calls (capped at MAX_VERIFY_CALLS either way), and it makes "here
+    # is your appointment" something the next turn can actually honour.
     verified_calls = 0
     MAX_VERIFY_CALLS = 8
     consumed = 0
