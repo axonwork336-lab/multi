@@ -1229,59 +1229,80 @@ def _build_schedule_display_directive(messages: list) -> str:
     doctor_name = next((s.get("doctorName") for s in schedules if s.get("doctorName")), "")
 
     # Group rows by branch, preserving first-seen order.
+    #
+    # THE FORMAT BELOW WAS SPECIFIED DIRECTLY, and replaces three
+    # different emoji-labelled layouts this function used to pick
+    # between depending on how many branches and days were involved.
+    # Those three produced visibly different messages for what is the
+    # same question ("when and where does this doctor work?"), which is
+    # exactly the inconsistency this project exists to remove. There is
+    # now ONE shape: the doctor's name, then each branch with its own
+    # days underneath it.
     by_branch: dict = {}
     branch_order = []
-    for s in schedules:
-        branch = s.get("branchName") or ""
+    for s_row in schedules:
+        branch = s_row.get("branchName") or ""
         if branch not in by_branch:
             by_branch[branch] = []
             branch_order.append(branch)
-        days = s.get("recurringDaysNames") or [""]
-        from_time = _arabic_time_12h(s.get("fromDateTime"))
-        to_time = _arabic_time_12h(s.get("toDateTime"))
+        days = s_row.get("recurringDaysNames") or [""]
+        from_time = _arabic_time_12h(s_row.get("fromDateTime"))
+        to_time = _arabic_time_12h(s_row.get("toDateTime"))
+        service = (s_row.get("serviceName") or "").strip()
         for day in days:
             arabic_day = _ARABIC_DAY_NAMES.get((day or "").strip().lower(), day)
-            by_branch[branch].append((arabic_day, from_time, to_time))
+            entry = (arabic_day, from_time, to_time, service)
+            if entry not in by_branch[branch]:
+                by_branch[branch].append(entry)
 
     total_day_rows = sum(len(v) for v in by_branch.values())
 
-    if len(branch_order) == 1 and total_day_rows == 1:
-        # Format 1: single branch, single day
-        branch = branch_order[0]
-        day, from_time, to_time = by_branch[branch][0]
-        block = (
-            f"📍 الفرع: {branch}\n"
-            f"👩\u200d⚕️ الطبيب: {doctor_name}\n"
-            f"📅 اليوم: {day}\n"
-            f"🕙 المواعيد المتاحة: من {from_time} حتى {to_time}"
+    def _day_line(day: str, from_time: str, to_time: str, service: str) -> str:
+        line = f"• {day}: من {from_time} لـ {to_time}"
+        # NO PRICE, EVER. The service NAME is useful context ("كشف رمد");
+        # its fee is private by default and only ever revealed through
+        # `get_doctor_fees` on an explicit request - see prompts.py's
+        # FEES rule.
+        if service:
+            line = f"{line} — {service}"
+        return line
+
+    branch_blocks = []
+    for index, branch in enumerate(branch_order):
+        heading = (
+            f"مواعيد الدكتور {doctor_name} في فرع {branch}:"
+            if index == 0
+            else f"وفي فرع {branch}:"
         )
-    elif len(branch_order) == 1:
-        # Format 3: single branch, multiple days
-        branch = branch_order[0]
-        lines = [f"👩\u200d⚕️ الطبيب: {doctor_name}", f"📍 {branch}"]
-        for day, from_time, to_time in by_branch[branch]:
-            lines.append(f"📅 {day} | 🕙 {from_time} – {to_time}")
-        block = "\n".join(lines)
-    else:
-        # Format 2: multiple branches (each may have one or more days)
-        branch_blocks = []
-        for branch in branch_order:
-            branch_lines = [f"📍 {branch}"]
-            for day, from_time, to_time in by_branch[branch]:
-                branch_lines.append(f"📅 {day}\n🕙 {from_time} – {to_time}")
-            branch_blocks.append("\n".join(branch_lines))
-        block = f"👩\u200d⚕️ الطبيب: {doctor_name}\n" + "\n\n".join(branch_blocks)
+        lines = [heading]
+        for day, from_time, to_time, service in by_branch[branch]:
+            lines.append(_day_line(day, from_time, to_time, service))
+        branch_blocks.append("\n".join(lines))
+
+    block = "\n\n".join(branch_blocks)
+
+    single_branch = len(branch_order) == 1
 
     if total_day_rows == 1:
         only_day = next(iter(by_branch.values()))[0][0]
         closing_question_instruction = (
-            f"  3. Exactly one question asking if they'd like to see the "
-            f"available times for {only_day} (the only day shown) - do "
-            f"NOT ask \"which day\" when only one day exists at all, "
-            f"that's not a real choice and reads as confusing/redundant.\n"
+            f"  3. Exactly one question asking whether they'd like the "
+            f"available times for {only_day} - the only day this doctor "
+            f"works. Do NOT ask \"which day\" or \"which branch\" when "
+            f"there is only one of each; that is not a choice, and "
+            f"reads as though you didn't look.\n"
+        )
+    elif single_branch:
+        closing_question_instruction = (
+            "  3. Exactly one question asking which DAY they'd like - "
+            "the branch is already settled, so do not ask about it.\n"
         )
     else:
-        closing_question_instruction = "  3. Exactly one question asking which day they'd prefer.\n"
+        closing_question_instruction = (
+            "  3. Exactly ONE question covering both, phrased as a "
+            "single sentence: \"حابب تحجز في أنهي فرع وانهي يوم؟\" - "
+            "not two separate questions, and not two turns.\n"
+        )
 
     return (
         "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
@@ -2611,20 +2632,34 @@ _HANDOFF_CORRECTION_DIRECTIVE = (
 # the same escalation already applied to invented branches and
 # fabricated availability.
 
+# MATCHED AGAINST A FOLDED COPY OF THE REPLY (see _norm_ar), not the raw
+# text. CONFIRMED REAL MISS: the reply "اخصائى محمد زايد تم اختياره ✅ ...
+# ولا أعرض لك كل الدكاترة المتاحين؟" - the exact anti-pattern this guard
+# exists for, on its FOURTH occurrence - sailed straight through,
+# because the model wrote "اخصائى" with alef maqsura while the pattern
+# spelled it "اخصائي" with ya. One letter, and a guard that had already
+# been escalated from a prompt rule to code did nothing.
+#
+# Folding both sides removes that entire class of miss: alef variants,
+# ya/alef-maqsura, ta-marbuta/ha. Patterns here are written in their
+# FOLDED form (ي not ى, ه not ة) so they match what _norm_ar produces.
 _DOCTOR_CONFIRMED_RE = re.compile(
-    r"(?:د\.|دكتور|دكتوره|دكتورة|استشاري|أخصائي|اخصائي|أخصائية|اخصائية)"
+    r"(?:د\.|دكتور|دكتوره|استشاري|استشاريه|اخصائي|اخصائيه)"
     r"[^.\n؟?]{0,40}?(?:تم\s*اختياره|تم\s*اختيارها|✅)"
 )
 
 _DOCTOR_ROSTER_OFFER_RE = re.compile(
-    r"الدكاترة\s*المتاحين|قائمة\s*الدكاترة|أعرض\s*لك\s*الدكاترة|اعرض\s*لك\s*الدكاترة"
+    r"(?:ال)?دكاتره\s*(?:ال)?متاحين|قائمه\s*(?:ال)?دكاتره|"
+    r"(?:ا|أ)عرض\s*لك\s*(?:كل\s*)?(?:ال)?دكاتره|"
+    r"(?:ال)?اطباء\s*(?:ال)?متاحين"
 )
 
 
 def _reply_reoffers_doctor_roster_after_confirming_one(reply_text: str) -> bool:
     if not reply_text:
         return False
-    return bool(_DOCTOR_CONFIRMED_RE.search(reply_text)) and bool(_DOCTOR_ROSTER_OFFER_RE.search(reply_text))
+    folded = _norm_ar(reply_text)
+    return bool(_DOCTOR_CONFIRMED_RE.search(folded)) and bool(_DOCTOR_ROSTER_OFFER_RE.search(folded))
 
 
 _DOCTOR_ROSTER_CORRECTION_DIRECTIVE = (
@@ -2635,11 +2670,17 @@ _DOCTOR_ROSTER_CORRECTION_DIRECTIVE = (
     "and then, in that SAME message, offered to show the available "
     "doctors again (\"الدكاترة المتاحين\"). The doctor question is "
     "already settled - re-offering the roster invites the patient to "
-    "undo a choice they just made.\n\n"
-    "Ask about the BRANCH instead, and offer THAT doctor's branches: "
-    "\"تحب تحجزين في فرع معيّن، ولا أعرض لك الفروع المتاحة عند "
-    "د. [name]؟\"\n\n"
-    "Rewrite the reply now without offering the doctor list again.\n\n"
+    "undo a choice they just made, and it is the wrong question "
+    "entirely: what is still unknown at this point is the BRANCH.\n\n"
+    "The next question is about the branch, and the branches you offer "
+    "must be THAT DOCTOR'S branches - naming the doctor explicitly, so "
+    "it is obvious the choice stands:\n"
+    "    تحب تحجز في فرع معيّن، ولا أعرض لك الفروع اللي د. [اسم الدكتور] "
+    "متاح فيها؟\n\n"
+    "Never offer \"كل الدكاترة\" or a general branch list here - the "
+    "patient has a doctor, so only that doctor's branches are relevant. "
+    "Keep the confirmation line exactly as it was and rewrite only the "
+    "question.\n\n"
 )
 
 
@@ -3013,6 +3054,62 @@ def _build_bare_entity_answer_directive(messages: list) -> str:
     return _BARE_ENTITY_ANSWER_DIRECTIVE
 
 
+_BRANCH_QUESTION_RE = re.compile(
+    r"(?:ال)?فروع|(?:ال)?فرع|branch(?:es)?"
+)
+
+_DOCTOR_BRANCHES_DIRECTIVE = (
+    "============================================================\n"
+    "SHOW THIS DOCTOR'S OWN BRANCHES AND DAYS - NOT A GENERIC LIST\n"
+    "============================================================\n"
+    "A doctor is already confirmed for this booking, and the patient is "
+    "asking about branches. The question is therefore \"where and when "
+    "does THIS doctor work?\" - not \"what branches does the hospital "
+    "have?\".\n\n"
+    "Call `get_doctor_schedule_for_booking` now. It returns exactly "
+    "that: every branch this doctor works at, with the weekdays and "
+    "hours at each. Do NOT call `list_branches_for_specialty` here - it "
+    "answers a different question, and its answer includes branches "
+    "this doctor may never attend.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: asked to show a confirmed "
+    "doctor's branches, the reply listed all three hospital branches "
+    "with their street addresses and opened with \"الدكاترة المتاحين "
+    "عندنا مش محددين بعد في الفروع\" - which is simply untrue, the "
+    "doctor's branches were one tool call away, and the patient could "
+    "have picked a branch the doctor does not work at.\n\n"
+    "Never say the doctor's branches are unknown or not yet assigned. "
+    "If the tool genuinely returns nothing, say plainly that this "
+    "doctor has no published schedule at the moment and offer another "
+    "doctor - do not fall back to the hospital's branch list.\n\n"
+)
+
+
+def _build_doctor_branches_directive(messages: list, session_id: str) -> str:
+    """Fires when a doctor is confirmed and the patient's latest message
+    asks about branches."""
+
+    if not messages or not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    if not session.get("doctor_id"):
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _BRANCH_QUESTION_RE.search(_norm_ar(text)):
+        return ""
+
+    return _DOCTOR_BRANCHES_DIRECTIVE
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -3124,6 +3221,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
             )
 
     bare_entity_directive = _build_bare_entity_answer_directive(state["messages"])
+    doctor_branches_directive = _build_doctor_branches_directive(
+        state["messages"], state.get("session_id"),
+    )
 
     # The scoped prompt for whoever owns this turn. Rebuilt per turn for
     # the same reason load_config rebuilds: a prompts.py/CSV edit must
@@ -3154,6 +3254,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + slots_directive + available_days_directive
         + resolved_day_directive + entity_list_directive
         + abandoned_booking_directive + bare_entity_directive
+        + doctor_branches_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
@@ -3252,6 +3353,11 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
             language=target_language,
             templates=state.get("templates"),
             answering_a_list=_is_answering_a_list(state["messages"]),
+            tool_args={
+                call.get("name", ""): (call.get("args") or {})
+                for call in response.tool_calls
+                if isinstance(call, dict)
+            },
         )
 
     # ONE QUESTION PER MESSAGE - enforced here, not just asked for in the
