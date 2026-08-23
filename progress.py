@@ -72,11 +72,10 @@ PROGRESS_ENABLED defaults to false. Nothing about the agent's behaviour
 changes until it is switched on - see README_MULTIAGENT.md.
 """
 
-import json
 import logging
 import threading
 import time
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, Optional
 
 import config
 
@@ -499,25 +498,3 @@ def _deliver(session_id: str, client_id: str, text: str) -> None:
         # a cosmetic loss; it must never surface to the patient or
         # interfere with the real reply that is still being produced.
         logger.warning("progress[%s]: delivery failed (%s)", session_id, exc)
-
-
-def pending_tools(messages: List) -> List[str]:
-    """The tool names the latest AI message is about to call."""
-
-    if not messages:
-        return []
-
-    last = messages[-1]
-    calls = getattr(last, "tool_calls", None) or []
-    return [call.get("name", "") for call in calls if isinstance(call, dict)]
-
-
-def describe_config() -> str:
-    if not config.PROGRESS_ENABLED:
-        return "progress messages: off"
-
-    target = "log only" if config.PROGRESS_MODE == "log" else (config.PROGRESS_WEBHOOK_URL or "UNSET")
-    return (
-        f"progress messages: on, after {config.PROGRESS_DELAY_SECONDS}s, "
-        f"one per turn, to {target}"
-    )
