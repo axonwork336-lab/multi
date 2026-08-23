@@ -160,6 +160,20 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         (8, r"(?:اقرب|أقرب)\s*(?:معاد|موعد|ميعاد)"),
         (8, r"\b(?:nearest|soonest|earliest)\s+(?:appointment|slot|opening)\b"),
         (8, r"\bwhat\s+(?:appointments|times|slots)\s+(?:are\s+)?(?:available|open)\b"),
+        # Same class of miss as the "مواعيد" fix above, different word:
+        # asking about the doctor's available DAYS is exactly as much a
+        # request for `list_available_days_for_booking` as asking about
+        # "مواعيد" is - it's the same tool either way. Confirmed real
+        # production failure: "ايه الايام المتاحه" only ever matched the
+        # generic weak "متاح" hint below (score 3, nowhere near the
+        # mid-flow switch threshold), so MEDICAL stayed active with no
+        # way to answer it honestly - it re-ran `list_specialties` and
+        # `list_branches_for_specialty` pointlessly (data it already
+        # had) and still ended on "هل تحب تحدد موعد في يوم معين؟", the
+        # exact "pick a day yourself" anti-pattern the booking flow
+        # exists to avoid. Excludes "أيام العمل" (working days), which
+        # is an FAQ question, not a request for a bookable slot.
+        (8, r"(?:ال)?ايام\s*(?:ال)?متاح[ةه](?!\s*(?:العمل|الدوام))"),
         (3, r"(?:متاح|فاضي|مواعيد\s*متاحه|في\s*مواعيد)"),
         (3, r"\bavailable\s+(?:slots?|times?|appointments?)\b"),
     ],
