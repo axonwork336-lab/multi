@@ -123,6 +123,26 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         (10, r"\bmake\s+(?:an?\s+)?appointment\b"),
         (6, r"(?:^|\s)(?:احجز|أحجز|احجزلي|احجز\s*لي|اريد\s*الحجز|عايز\s*حجز|عاوز\s*حجز|ابغى\s*احجز)(?:\s|$)"),
         (6, r"\b(?:booking|reserve|schedule)\s+(?:an?\s+)?(?:appointment|visit|consultation)\b"),
+        # Asking WHEN a specific doctor/specialty has an opening ("ايه
+        # مواعيد", "اقرب معاد") is a request for a real bookable slot,
+        # not small talk - it needs `list_available_days_for_booking`,
+        # which only the booking specialist has. Confirmed real
+        # production failure: this kept the MEDICAL specialist active
+        # (it only has `find_available_doctors`'s coarse hasSlots flag),
+        # so the reply could only say "no specific appointment showed
+        # up" instead of ever fetching an actual next date - leaving the
+        # patient with a branch confirmed and no way to find out when.
+        # Weighted to switch even mid-flow (>= _SWITCH_THRESHOLD): a
+        # patient who has just been told about a doctor and now asks
+        # about appointments has unambiguously moved on to booking.
+        # Excludes "مواعيد العمل/الدوام" (opening hours) and "مواعيد
+        # الزيارة" (visiting hours), which are FAQ questions, not a
+        # request for a bookable slot.
+        (8, r"(?:ايه|إيه|في|فيه|عنده|عندها|فاضي|فاضيه)\s*"
+            r"(?:مواعيد|معاد|ميعاد)(?!\s*(?:العمل|الدوام|الزياره))"),
+        (8, r"(?:اقرب|أقرب)\s*(?:معاد|موعد|ميعاد)"),
+        (8, r"\b(?:nearest|soonest|earliest)\s+(?:appointment|slot|opening)\b"),
+        (8, r"\bwhat\s+(?:appointments|times|slots)\s+(?:are\s+)?(?:available|open)\b"),
         (3, r"(?:متاح|فاضي|مواعيد\s*متاحه|في\s*مواعيد)"),
         (3, r"\bavailable\s+(?:slots?|times?|appointments?)\b"),
     ],
