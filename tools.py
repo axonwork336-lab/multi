@@ -2897,24 +2897,37 @@ def _fetch_doctors_for_booking(
 def _branches_with_real_slots(state: AgentState, base_url: str, doctor_id: str,
                                 branch_ids: list) -> Optional[set]:
     """Which of `branch_ids` genuinely have at least one open (non-booked)
-    schedule slot for `doctor_id` within the normal booking window - ONE
-    batched call across every candidate branch, not one per branch.
+    slot for `doctor_id` within the booking window.
 
-    WHY THIS EXISTS: the mirror image of `_doctors_with_real_slots`, same
-    confirmed real production failure. Branches for an ALREADY-CONFIRMED
-    doctor are derived from her general DoctorSchedules rows - which
-    branch(es) she's assigned to recurringly - not from whether she
-    currently has anything bookable there. A patient was shown "فرع
-    الشيخ زايد" as an option for a doctor purely because a schedule ROW
-    exists for that pairing, picked it, and only found out afterward
-    (`list_available_days_for_booking` returning zero days) that she had
-    nothing open there at all. This cross-checks the SAME real
-    schedule-slots endpoint booking itself uses, in one call for every
-    candidate branch at once.
+    WHY THIS EXISTS: branches for an ALREADY-CONFIRMED doctor are
+    derived from her general DoctorSchedules rows - which branch(es) she
+    is assigned to recurringly - not from whether she currently has
+    anything bookable there. A patient was shown a branch purely because
+    a schedule ROW exists for that pairing, picked it, and only found
+    out afterwards that she had nothing open there.
 
-    Returns None (meaning "unknown, don't filter anything out") if the
-    verification call itself fails, same principle as
-    `_doctors_with_real_slots`/`_open_slots_on_day`."""
+    ONE QUERY PER BRANCH, ON PURPOSE.
+    --------------------------------
+    This used to make a single batched call for every branch at once and
+    then group the results by each slot's `branchId`. The slots endpoint
+    returns slotStart/slotEnd/isBooked - `branchId` is NOT a field it is
+    documented or confirmed to return. When it is absent, the grouping
+    finds nothing for any branch, and the function reports that EVERY
+    branch is full.
+
+    CONFIRMED REAL PRODUCTION FAILURE: a doctor with genuine open
+    appointments at الدقي was reported as fully booked there -
+    `list_available_days_for_booking`, which does not depend on that
+    field, returned her real days at that same branch moments later.
+
+    Asking per branch means the ANSWER is what the query was scoped to,
+    rather than something inferred from a field that may not be there.
+    That is a handful of calls (two or three in practice), made once, at
+    the only point where it matters.
+
+    Returns None ("unknown - don't filter anything") if EVERY lookup
+    failed, so a transient outage can never mark a real branch full.
+    """
 
     if not branch_ids:
         return set()
@@ -2926,29 +2939,37 @@ def _branches_with_real_slots(state: AgentState, base_url: str, doctor_id: str,
         tz = ZoneInfo(DEFAULT_TIMEZONE)
 
     now = datetime.now(tz)
-    result = api.get_doctor_schedule_slots(
-        base_url, doctor_ids=[doctor_id], branch_ids=branch_ids,
-        from_date=now.isoformat(),
-        to_date=(now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat(),
-        is_booked=False, page_size=1000,
-     language=conversation_language(state),)
-
-    if not result["success"]:
-        logger.warning(
-            "_branches_with_real_slots: verification call failed for doctor_id=%s "
-            "(status_code=%s) - keeping every candidate branch rather than hiding "
-            "real availability on a transient error",
-            doctor_id, result.get("status_code"),
-        )
-        return None
+    window_end = now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)
 
     have_slots = set()
-    for item in (result["data"] or {}).get("items", []):
-        if item.get("isBooked"):
+    any_lookup_succeeded = False
+
+    for branch_id in branch_ids:
+        if not branch_id:
             continue
-        branch_id = item.get("branchId")
-        if branch_id:
+
+        slots = _open_slots_on_day(
+            state, base_url, doctor_id, branch_id,
+            now.isoformat(), window_end.isoformat(), timezone_name,
+        )
+
+        if slots is None:
+            # This branch's check failed. Treat it as available rather
+            # than hiding a branch that may well have appointments.
             have_slots.add(branch_id)
+            continue
+
+        any_lookup_succeeded = True
+        if slots:
+            have_slots.add(branch_id)
+
+    if not any_lookup_succeeded:
+        logger.warning(
+            "_branches_with_real_slots: every availability lookup failed for doctor_id=%s - "
+            "reporting 'unknown' so nothing gets marked full on a transient error",
+            doctor_id,
+        )
+        return None
 
     return have_slots
 
