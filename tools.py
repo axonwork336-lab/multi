@@ -3668,6 +3668,65 @@ def resolve_available_day(
     }
 
 
+def _branches_with_real_availability(state, base_url: str, doctor_id: str, branch_options: list) -> list:
+    """Keep only the branches where this doctor genuinely has something
+    bookable in the availability window.
+
+    A schedule row means ROSTERED, not AVAILABLE - the roster can be
+    full, or the schedule can have lapsed. Each candidate is therefore
+    checked with the same slot query the next step will run.
+
+    A branch whose check FAILS (transient API error) is kept, not
+    dropped: hiding a real branch because of a network blip is the worse
+    of the two mistakes, and the next step will surface the truth
+    anyway.
+    """
+
+    if len(branch_options) <= 1:
+        # Nothing to choose between - the caller's single-branch
+        # auto-confirm path already handled that case.
+        return branch_options
+
+    timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    now_local = datetime.now(tz)
+    window_end = now_local + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)
+
+    kept = []
+    for option in branch_options:
+        branch_id = option.get("id")
+        if not branch_id:
+            kept.append(option)
+            continue
+
+        slots = _open_slots_on_day(
+            state, base_url, doctor_id, branch_id,
+            now_local.isoformat(), window_end.isoformat(), timezone_name,
+        )
+
+        if slots is None:
+            logger.info(
+                "_branches_with_real_availability: availability check failed for branch_id=%s - "
+                "keeping it rather than hiding a branch over a transient error",
+                branch_id,
+            )
+            kept.append(option)
+        elif slots:
+            kept.append(option)
+        else:
+            logger.info(
+                "_branches_with_real_availability: dropping branch %r (%s) - doctor is rostered "
+                "there but has no open slots in the window",
+                option.get("name"), branch_id,
+            )
+
+    return kept
+
+
 def _open_slots_on_day(state, base_url: str, doctor_id: str, branch_id: str,
                        from_iso: str, to_iso: str, timezone_name: str):
     """Open slot start times for ONE day, fetched with exactly the same
@@ -3858,17 +3917,55 @@ def list_available_days_for_booking(
                     match = branches_lookup.get(item_branch_id)
                     name = (_arabic_preferred_name(match) if match else None) or item.get("branchName")
                     if name:
-                        branch_options.append({"name": name})
+                        # THE id IS NOT OPTIONAL.
+                        #
+                        # These options were previously {"name": ...}
+                        # only, and the list was never remembered - so
+                        # when the patient answered with its NUMBER, there
+                        # was nothing to resolve the position against.
+                        # Confirmed in production: the patient typed "١",
+                        # then "٢", and both times got "عذرًا، ما قدرت
+                        # أتعرف على الفرع اللي اخترته" followed by the
+                        # SAME list again - a dead end they could only
+                        # escape by typing the branch name.
+                        branch_options.append({"id": item_branch_id, "name": name})
+
+                # ONLY BRANCHES THAT ACTUALLY HAVE SOMETHING BOOKABLE.
+                #
+                # A schedule row means the doctor is ROSTERED at that
+                # branch. It says nothing about whether any slot there is
+                # still open - the roster can be full, or the schedule
+                # can have lapsed. Offering it anyway sends the patient
+                # to a branch with nothing available, which reads as the
+                # assistant inventing a branch. Confirmed in production
+                # and reported as exactly that.
+                #
+                # Each candidate is checked with the same availability
+                # query the next step will run, so what is offered is
+                # what can be booked. Typically 2-3 extra calls, made
+                # once, at the only point where the patient is being
+                # asked to choose.
+                branch_options = _branches_with_real_availability(
+                    state, base_url, doctor_id, branch_options,
+                )
         except Exception:
             logger.exception("list_available_days_for_booking: failed to build branch options for missing_branch")
 
         if branch_options:
             logger.info(
-                "list_available_days_for_booking: missing_branch for doctor_id=%s -> %d branch option(s)",
+                "list_available_days_for_booking: missing_branch for doctor_id=%s -> %d bookable branch option(s)",
                 doctor_id, len(branch_options),
             )
+            # Remembered so a bare "١"/"2" reply resolves by position
+            # against the SAME ordering the patient was shown.
+            _remember_list(state, "branch", branch_options)
             return {"status": "missing_branch", "branches": branch_options}
 
+        logger.info(
+            "list_available_days_for_booking: doctor_id=%s is rostered at branches but none "
+            "have bookable availability right now",
+            doctor_id,
+        )
         return {"status": "missing_branch"}
 
     timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
