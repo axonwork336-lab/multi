@@ -534,6 +534,29 @@ def _entity_list_line(item: dict) -> str:
     return name
 
 
+def _entity_type_for_tool_call(messages: list, tool_message) -> Optional[str]:
+    """The `entity_type` argument a tool was called with, found by
+    matching `tool_message`'s `tool_call_id` back to the AIMessage that
+    made the call.
+
+    Needed because `match_entity_for_booking` serves both doctors and
+    branches from one status ("list"), so the result alone doesn't say
+    which kind of list it is - only the call that produced it does.
+    """
+
+    tool_call_id = getattr(tool_message, "tool_call_id", None)
+    if not tool_call_id:
+        return None
+
+    for msg in reversed(messages):
+        calls = getattr(msg, "tool_calls", None) or []
+        for call in calls:
+            if isinstance(call, dict) and call.get("id") == tool_call_id:
+                return (call.get("args") or {}).get("entity_type")
+
+    return None
+
+
 def _build_entity_list_directive(messages: list) -> str:
     """
     If the LAST message is a ToolMessage from one of the list-returning
@@ -548,22 +571,59 @@ def _build_entity_list_directive(messages: list) -> str:
     last = messages[-1]
     tool_name = getattr(last, "name", None)
 
-    spec = _ENTITY_LIST_TOOLS.get(tool_name)
-    if not spec:
-        return ""
+    # `match_entity_for_booking` IN LIST MODE WAS THE ONE LIST-PRODUCING
+    # PATH NEVER WIRED INTO THIS BLOCK, AND IT WAS DANGEROUS TO MISS.
+    #
+    # Every other list tool got this treatment because a freehand list
+    # LOOKS wrong to a reader. This one is worse: it produces a list
+    # whose NUMBERING silently disagrees with what gets stored for later
+    # resolution, so the patient can pick option "1" and end up
+    # confirmed for option "2" - a WRONG BRANCH, not just a wrong-looking
+    # reply.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: the reply read "1️⃣ الدقي / 2️⃣
+    # الشيخ زايد" (freehand, the model's own ordering), the patient typed
+    # "1", and the code resolved position 1 against `_remember_list`'s
+    # own stored order - which is the tool's ACTUAL array order, not
+    # whatever order the model chose to print it in - and returned فرع
+    # الشيخ زايد. One booking away from confirming the wrong branch.
+    #
+    # This tool serves two entity types from one status ("list"), so its
+    # heading depends on which - read from the ORIGINAL tool call's
+    # `entity_type` argument, not the result.
+    if tool_name == "match_entity_for_booking":
+        entity_type = _entity_type_for_tool_call(messages, last)
+        if entity_type == "doctor":
+            items_key, heading = "items", "الأطباء المتاحين"
+        elif entity_type == "branch":
+            items_key, heading = "items", "الفروع المتاحة"
+        else:
+            return ""
 
-    items_key, heading = spec
+        try:
+            data = json.loads(last.content)
+        except (ValueError, TypeError):
+            return ""
 
-    try:
-        data = json.loads(last.content)
-    except (ValueError, TypeError):
-        return ""
+        if data.get("status") != "list":
+            return ""
+    else:
+        spec = _ENTITY_LIST_TOOLS.get(tool_name)
+        if not spec:
+            return ""
 
-    # "missing_branch" is a list result too: it means "I can't go on
-    # until you pick a branch, and here they are". Treated the same as
-    # "found" so that list gets the same fixed shape as every other.
-    if data.get("status") not in ("found", "missing_branch"):
-        return ""
+        items_key, heading = spec
+
+        try:
+            data = json.loads(last.content)
+        except (ValueError, TypeError):
+            return ""
+
+        # "missing_branch" is a list result too: it means "I can't go on
+        # until you pick a branch, and here they are". Treated the same as
+        # "found" so that list gets the same fixed shape as every other.
+        if data.get("status") not in ("found", "missing_branch"):
+            return ""
 
     items = data.get(items_key) or []
 
