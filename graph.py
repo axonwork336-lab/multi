@@ -3422,11 +3422,32 @@ def _build_branch_question_directive(messages: list, session_id: str, agent_name
 # The rule is simple and has no false-positive surface: you cannot ask
 # someone to confirm cancelling an appointment you have never looked up.
 _CANCELLATION_FRAMING_RE = re.compile(
-    r"تلغيه|تلغيها|تلغي\s*(?:ال)?موعد|الغاء\s*(?:ال)?موعد|"
-    r"(?:ال)?موعد\s*(?:ال)?لي\s*تبي\s*تلغيه|"
+    r"تلغيه\b|تلغيها\b|"
+    r"تلغي\s*هذا\s*(?:ال)?موعد|الغاء\s*هذا\s*(?:ال)?موعد|"
+    r"موعدك[^.\n؟?]{0,20}تلغي|"
     r"cancel\s+(?:this|your|the)\s+appointment|"
     r"appointment\s+(?:you|to)\s+(?:want\s+to\s+)?cancel"
 )
+
+# THE TWO BARE ALTERNATIVES REMOVED ABOVE ("تلغي موعد" / "الغاء موعد",
+# with no possessive or demonstrative attached) MATCHED THE ROUTINE
+# CAPABILITY MENU, NOT A CONFIRMATION.
+#
+# CONFIRMED REAL FALSE POSITIVE: every standard greeting lists what the
+# assistant can help with, including "✏️ تعديل أو إلغاء موعد قائم"
+# ("editing or cancelling an EXISTING appointment" - describing a
+# SERVICE, not confirming a specific one). That phrase alone matched
+# "الغاء\s*(?:ال)?موعد" and fired this verifier on literally the first
+# message of every single conversation, spending an extra LLM call on a
+# reply that had done nothing wrong.
+#
+# The real confirmed failure this guard exists for - "هذا هو موعدك الذي
+# تبغى تلغيه؟" - is still caught: "تلغيه" (cancel IT, with the object
+# pronoun attached) never appears in a generic capability description,
+# only when referring back to an appointment already identified in the
+# conversation. The remaining alternatives require an explicit "هذا"
+# (this) or "موعدك" (YOUR appointment) - a routine menu bullet has
+# neither.
 
 _APPOINTMENT_LOOKUP_TOOLS = ("lookup_appointment", "check_booking_status")
 
