@@ -1974,7 +1974,11 @@ def get_doctor_schedule(
         except Exception:
             effective_date = None
 
-    result = api.get_doctor_schedule(base_url, doctor_ids=[resolved["doctor_id"]], effective_date=effective_date, language=conversation_language(state))
+    result = api.get_doctor_schedule(
+        base_url, doctor_ids=[resolved["doctor_id"]], effective_date=effective_date,
+        include_future=not target_date,
+        language=conversation_language(state),
+    )
 
     if not result["success"]:
         logger.error("get_doctor_schedule API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
@@ -3550,7 +3554,14 @@ def resolve_available_day(
         # never `date`, which is a machine value in ISO format and reads
         # as a raw timestamp inside a sentence. Pass `from_date`/
         # `to_date` VERBATIM into `get_available_slots_for_booking`.
-    {"status": "not_found"}  # no available slot for that weekday within the booking window
+    {"status": "fully_booked", "weekday_name": "Thursday", "weekday_display": "الخميس"}
+        # The doctor DOES work that weekday here, but every slot is
+        # taken. Say exactly that - "الخميس محجوز بالكامل حاليًا" - and
+        # offer the days that ARE available. This is the only place that
+        # fact should be volunteered: the schedule list deliberately
+        # leaves full days out so nobody is invited to pick one, and
+        # this status is what comes back when they ask anyway.
+    {"status": "not_found"}  # the doctor does not work that weekday here at all
     {"status": "missing_doctor"} / {"status": "missing_branch"}
     {"status": "not_configured"} / {"status": "error"}"""
 
@@ -3669,6 +3680,31 @@ def resolve_available_day(
             "resolve_available_day: not_found - %d raw items, none matched (weekday=%s, lead_time=%s, after_date=%s). Sample raw items: %s",
             len(items), weekday_name, lead_time.isoformat(), after_dt, items[:3],
         )
+
+        # WHY the day is unavailable decides what the patient is told.
+        #
+        # If the doctor is ROSTERED on this weekday at this branch and
+        # there is simply nothing left, that is "fully booked" - a real,
+        # useful answer they can act on (ask for another day, or a later
+        # date). It is also the only moment that fact should ever be
+        # volunteered: the schedule list deliberately hides full days so
+        # nobody is invited to pick one, and this is the branch reached
+        # when they ask about that day anyway.
+        #
+        # If the doctor does not work that weekday at all, "not_found"
+        # stays - a different thing, and saying "fully booked" would
+        # falsely imply the day normally exists.
+        rostered = _doctor_works_weekday(
+            state, base_url, doctor_id, branch_id, target_weekday,
+        )
+
+        if rostered:
+            return {
+                "status": "fully_booked",
+                "weekday_name": _ENGLISH_WEEKDAY_BY_INDEX.get(target_weekday, ""),
+                "weekday_display": _display_weekday_name(target_weekday, conversation_language(state)),
+            }
+
         return {"status": "not_found"}
 
     candidates.sort()
@@ -3706,6 +3742,187 @@ def resolve_available_day(
         "from_date": day_start.isoformat(),
         "to_date": day_end.isoformat(),
     }
+
+
+_ENGLISH_WEEKDAY_INDEX = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _weekdays_with_open_slots(state, base_url: str, doctor_id: str, branch_id: str,
+                              timezone_name: str, window_days: int):
+    """Which weekdays this doctor still has an OPEN slot on, at this
+    branch, within the booking window.
+
+    Returns a set of Python weekday indexes (Monday=0), or None when the
+    lookup failed - None means "unknown", and the caller must not mark
+    anything as full on the strength of it.
+
+    ONE call per branch, covering the whole window, rather than one per
+    day.
+    """
+
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    now_local = datetime.now(tz)
+    window_end = now_local + timedelta(days=window_days)
+
+    slots = _open_slots_on_day(
+        state, base_url, doctor_id, branch_id,
+        now_local.isoformat(), window_end.isoformat(), timezone_name,
+    )
+
+    if slots is None:
+        return None
+
+    return {slot.weekday() for slot in slots}
+
+
+_ARABIC_WEEKDAY_BY_INDEX = {
+    0: "الاثنين", 1: "الثلاثاء", 2: "الأربعاء", 3: "الخميس",
+    4: "الجمعة", 5: "السبت", 6: "الأحد",
+}
+
+_ENGLISH_WEEKDAY_BY_INDEX = {
+    0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+    4: "Friday", 5: "Saturday", 6: "Sunday",
+}
+
+
+def _display_weekday_name(weekday_index: int, language: str = "ar") -> str:
+    """A weekday's name in the conversation's language, from its index."""
+
+    if (language or "ar").startswith("en"):
+        return _ENGLISH_WEEKDAY_BY_INDEX.get(weekday_index, "")
+    return _ARABIC_WEEKDAY_BY_INDEX.get(weekday_index, "")
+
+
+def _doctor_works_weekday(state, base_url: str, doctor_id: str, branch_id: str,
+                          weekday_index: int) -> bool:
+    """Whether this doctor's ROSTER includes that weekday at that branch.
+
+    Used to tell "fully booked" (rostered, nothing left) apart from "the
+    doctor doesn't work that day" - two different answers, and saying
+    the wrong one either invents a day that never existed or hides a
+    real one behind a vague refusal.
+
+    Returns False when the lookup fails, so a transient error produces
+    the more conservative "not_found" rather than asserting the day is
+    full.
+    """
+
+    try:
+        result = api.get_doctor_schedule(
+            base_url, doctor_ids=[doctor_id],
+            branch_ids=[branch_id] if branch_id else None,
+            language=conversation_language(state),
+        )
+        if not result["success"]:
+            return False
+
+        for item in (result["data"] or {}).get("items", []):
+            for name in item.get("recurringDaysNames") or []:
+                if _ENGLISH_WEEKDAY_INDEX.get(str(name).strip().lower()) == weekday_index:
+                    return True
+    except Exception:
+        logger.exception("_doctor_works_weekday: roster lookup failed")
+
+    return False
+
+
+def _mark_fully_booked_schedule_days(state, base_url: str, doctor_id: str,
+                                     schedules: list, timezone_name: str) -> list:
+    """Flag schedule rows whose weekday has no open slot left.
+
+    WHY: a schedule row is a ROSTER entry - "this doctor works Thursdays
+    here". It says nothing about whether any Thursday slot is still
+    free. Confirmed in production: a doctor's Thursday rota was
+    presented as available while every Thursday slot had already been
+    taken by other patients, so the patient was walked forward into a
+    day that could not be booked.
+
+    A row is marked ONLY when its weekday actually occurs inside the
+    booking window and has nothing open. A rota that has not STARTED yet
+    (the clinic has published it for a later period) is left unmarked -
+    "not open yet" is a different thing from "full", and the doctor may
+    well be taking bookings for it. That distinction is why this cannot
+    simply mark every weekday the sweep didn't see.
+    """
+
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+
+    today = datetime.now(tz).date()
+
+    open_weekdays_by_branch = {}
+
+    for row in schedules:
+        branch_id = row.get("branchId")
+        if not branch_id:
+            continue
+
+        names = row.get("recurringDaysNames") or []
+        indexes = [
+            _ENGLISH_WEEKDAY_INDEX[str(n).strip().lower()]
+            for n in names
+            if str(n).strip().lower() in _ENGLISH_WEEKDAY_INDEX
+        ]
+        if not indexes:
+            continue
+
+        starts_on = _parse_iso_date(row.get("effectiveFrom") or row.get("fromDateTimeFrom"))
+
+        if branch_id not in open_weekdays_by_branch:
+            open_weekdays_by_branch[branch_id] = _weekdays_with_open_slots(
+                state, base_url, doctor_id, branch_id, timezone_name,
+                DOCTOR_AVAILABILITY_WINDOW_DAYS,
+            )
+
+        open_weekdays = open_weekdays_by_branch[branch_id]
+        if open_weekdays is None:
+            # Lookup failed - unknown is not full.
+            continue
+
+        if any(index in open_weekdays for index in indexes):
+            # Something is open on this weekday - nothing to flag.
+            continue
+
+        # A rota the clinic has published for a FUTURE period is left
+        # alone. Publishing it IS opening it - the patient can book
+        # against it, and the sweep simply hasn't reached that far or
+        # the slots are generated closer to the date. Flagging it in any
+        # way would discourage a booking that is perfectly possible.
+        #
+        # Only a rota that is in effect RIGHT NOW and has nothing open
+        # is genuinely full.
+        if starts_on and starts_on > today:
+            continue
+
+        row["fully_booked"] = True
+        logger.info(
+            "_mark_fully_booked_schedule_days: %s at branch %s is in effect but has no open "
+            "slot in the next %d days - marking it fully booked",
+            names, branch_id, DOCTOR_AVAILABILITY_WINDOW_DAYS,
+        )
+
+    return schedules
+
+
+def _parse_iso_date(value):
+    """A date from an ISO-ish string, or None."""
+
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except (ValueError, TypeError):
+        return None
 
 
 def _branches_with_real_availability(state, base_url: str, doctor_id: str, branch_options: list) -> list:
@@ -4423,7 +4640,12 @@ def get_doctor_schedule_for_booking(
         base_url, doctor_ids=[doctor_id],
         branch_ids=[branch_id] if branch_id else None,
         effective_date=effective_date,
-     language=conversation_language(state),)
+        # Only a question about ONE specific date should be restricted to
+        # rotas already in effect. A general "when does this doctor
+        # work?" must include a rota the clinic has published for a later
+        # period - see api.get_doctor_schedule.
+        include_future=not target_date,
+        language=conversation_language(state),)
 
     if not result["success"]:
         logger.error("get_doctor_schedule_for_booking API call failed: status_code=%s error=%s", result.get("status_code"), result.get("error"))
@@ -4474,9 +4696,26 @@ def get_doctor_schedule_for_booking(
             # stay private until `get_doctor_fees` is called on an
             # explicit request; see prompts.py's FEES rule.
             "serviceName": _service_name(item, conversation_language(state)),
+            # Kept so the availability check below can group by branch
+            # and tell a not-yet-started rota from a full one.
+            "effectiveFrom": item.get("effectiveFrom") or item.get("fromDateTimeFrom"),
         }
         for item in items
     ]
+
+    # A roster entry is not availability. Rows whose weekday has nothing
+    # open left are flagged, so the reply says "fully booked" instead of
+    # walking the patient into a day they cannot book - see
+    # _mark_fully_booked_schedule_days.
+    try:
+        schedules = _mark_fully_booked_schedule_days(
+            state, base_url, doctor_id, schedules, timezone_name,
+        )
+    except Exception:
+        logger.exception(
+            "get_doctor_schedule_for_booking: availability marking failed - returning the "
+            "schedule unmarked rather than failing the whole lookup"
+        )
 
     return {"status": "found", "schedules": schedules}
 
