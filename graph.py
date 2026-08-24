@@ -1909,11 +1909,17 @@ def _build_channel_identity_directive(channel_phone: Optional[str]) -> str:
         f"CHANNEL IDENTITY (THE USER'S OWN WHATSAPP NUMBER): {channel_phone}\n"
         "============================================================\n"
         "This conversation DOES have a verified WhatsApp/channel number "
-        "(shown above, never to be printed in a reply). Wherever any flow "
-        f"number as a VALUE - passing it to a tool, saving it on a "
-        f"booking or a complaint - that number is {channel_phone}. Use it "
-        "directly; never ask them to type a number they are already "
-        "messaging from.\n\n"
+        "(shown above, never to be printed in a reply).\n\n"
+        "Wherever ANY flow needs the patient's phone number as a VALUE - "
+        "passing it to a tool, LOOKING UP their existing appointment "
+        "with it, saving it on a booking or on a complaint - that number "
+        f"is {channel_phone}. Use it directly. Never ask them to type a "
+        "number they are already messaging from, and never ask for a "
+        "booking reference as a substitute for it.\n\n"
+        "(That sentence was previously truncated mid-clause and read as "
+        "nonsense - \"Wherever any flow number as a VALUE\" - which is "
+        "very likely why the rule kept failing to hold. It is written "
+        "out in full here.)\n\n"
         "DO NOT PRINT THE NUMBER IN YOUR REPLY. Both of you already know "
         "which number this is, so writing out the digits adds noise and "
         "makes a one-line question look like a form. Ask the short yes/no "
@@ -1921,7 +1927,18 @@ def _build_channel_identity_directive(channel_phone: Optional[str]) -> str:
         "نفس رقم الواتساب ده؟ ✅\" - with no digits, no country code, and "
         "no parenthetical. Then WAIT for their answer.\n\n"
         "If they say yes, use the number above as the phone value with no "
-        "OTP. Only if they want a DIFFERENT number do the "
+        "OTP - and ACT ON IT IN THAT SAME TURN. \"Yes\" is not an answer "
+        "that needs a follow-up question; it is permission to proceed. "
+        "For a cancellation or a change, that means calling "
+        "`lookup_appointment` with the number above immediately.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: the assistant asked \"نكمل "
+        "تعديل موعدك على نفس رقم الواتساب ده؟\", the patient answered "
+        "\"اه\", and the reply was \"ممكن تعطيني رقم الحجز أو رقم جوالك "
+        "عشان أقدر أجيب بيانات موعدك؟\" - asking for the very number it "
+        "had just been given permission to use, one message after "
+        "offering it. From the patient's side the assistant asked a "
+        "question, got an answer, and ignored it.\n\n"
+        "Only if they want a DIFFERENT number do the "
         "validate/compare/OTP steps apply - and only then does a number "
         "appear in the conversation at all, because they typed it.\n\n"
     )
@@ -2963,6 +2980,12 @@ def _apply_output_contract(
 
 _REPLY_VERIFIERS = (
     (
+        lambda reply, state, agent_name: _reply_asks_for_a_phone_already_known(reply, state),
+        lambda reply, state: _PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE,
+        "reply asked for a phone number (or a booking reference instead) right after "
+        "the patient agreed to proceed on the channel number the service already has",
+    ),
+    (
         lambda reply, state, agent_name: _reply_denies_a_branch_the_tools_offered(reply, state),
         lambda reply, state: _BRANCH_DENIAL_CORRECTION_DIRECTIVE,
         "reply said a branch had nothing available, while a tool result in this "
@@ -3761,6 +3784,75 @@ _BRANCH_DENIAL_CORRECTION_DIRECTIVE = (
 )
 
 
+_ASKS_FOR_PHONE_RE = re.compile(
+    r"رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?موبايل|رقم\s*(?:ال)?تليفون|رقم\s*(?:ال)?هاتف|"
+    r"رقم\s*(?:ال)?حجز|(?:ال)?رقم\s*(?:ال)?مرجعي|"
+    r"your\s+(?:mobile|phone)\s+number|booking\s+(?:reference|number)"
+)
+
+# A bare yes. The patient agreeing to a yes/no question the assistant
+# itself asked.
+_BARE_AFFIRMATION_RE = re.compile(
+    r"^\s*(?:اه|ايه|أيوه|ايوه|ايوا|نعم|تمام|اوك|أوك|ok|okay|yes|yep|sure|"
+    r"اكمل|كمل|اه\s*اكمل|ماشي|حاضر|طبعا|أكيد|اكيد)"
+    r"\s*[.!؟?،,]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _reply_asks_for_a_phone_already_known(reply_text: str, state: AgentState) -> bool:
+    """True when the reply asks the patient for their phone number (or a
+    booking reference in its place) immediately after they agreed to
+    proceed on the channel number the service already has.
+
+    CONFIRMED REAL PRODUCTION FAILURE: "نكمل تعديل موعدك على نفس رقم
+    الواتساب ده؟" -> "اه" -> "ممكن تعطيني رقم الحجز أو رقم جوالك عشان
+    أقدر أجيب بيانات موعدك؟". The assistant asked a question, was given
+    an answer, and asked for the very thing it had just been granted.
+
+    Requires ALL of: a channel number exists, the patient's last message
+    is a bare yes, and the reply asks for a number - so a patient who
+    genuinely wants to use a different number is unaffected, because
+    that is never a bare "اه".
+    """
+
+    if not reply_text or not state.get("channel_phone"):
+        return False
+
+    if not _ASKS_FOR_PHONE_RE.search(_norm_ar(reply_text)):
+        return False
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    for msg in reversed(state.get("messages", []) or []):
+        if not isinstance(msg, _HumanMessage):
+            continue
+        content = getattr(msg, "content", "")
+        text = content if isinstance(content, str) else str(content)
+        return bool(_BARE_AFFIRMATION_RE.match(_norm_ar(text)))
+
+    return False
+
+
+_PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU ASKED FOR A NUMBER YOU ALREADY HAVE - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft asked the patient for their phone number, or "
+    "for a booking reference instead of it. They have just answered "
+    "\"yes\" to YOUR OWN question about continuing on the WhatsApp "
+    "number they are messaging from. You have that number. Asking for "
+    "it now means you asked a question, got an answer, and ignored "
+    "it.\n\n"
+    "Do not reply with a question at all this turn. Call "
+    "`lookup_appointment` with the channel number given at the top of "
+    "this prompt, and answer from what it returns.\n\n"
+    "Only a patient who explicitly says they want a DIFFERENT number "
+    "should ever be asked to type one - and that is never a bare "
+    "\"اه\".\n\n"
+)
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -4084,7 +4176,28 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
             )
 
         if normalized != response.content:
-            response = AIMessage(content=normalized)
+            if not (normalized or "").strip():
+                # EVERY processing step above can, in principle, remove
+                # everything: the question trimmer, the scaffolding
+                # stripper, the response contract. Any of them producing
+                # an empty string means the patient gets NOTHING back -
+                # a silent turn, which is the worst failure this service
+                # has, because it looks identical to being ignored and
+                # there is nothing for them to react to.
+                #
+                # Confirmed reachable: a reply consisting only of a
+                # scaffolding line strips to "".
+                #
+                # The original draft is kept instead. It may be
+                # imperfect, but an imperfect answer is recoverable and
+                # silence is not.
+                logger.error(
+                    "agent[%s]: output contract emptied the reply - keeping the original "
+                    "rather than sending nothing. Original: %r",
+                    agent_name, response.content,
+                )
+            else:
+                response = AIMessage(content=normalized)
 
     if not has_tool_calls and not state.get("greeted"):
         first_user_message = state["messages"][0].content if state["messages"] else ""
