@@ -1453,10 +1453,27 @@ them to reply with the number or the exact time. If more than one
 distinct `serviceName` appears across the slots, mention which service
 each belongs to rather than mixing them silently.
 
-Match their reply to ONE exact slot from the list you just showed
-(number = list position; a time reply must match a `time_display` you
-displayed) - never guess or invent a slot. Keep its EXACT `slotStart`/
-`slotEnd` values for STEP NB7 - never modify or recompute them.
+When they reply, call `select_appointment_slot` with their raw answer
+(the number or the time they typed) - do NOT match it yourself from
+memory. It resolves the reply against the exact list you just showed
+and LOCKS IN the chosen slot for the rest of this booking; a directive
+will then remind you of the exact chosen time on every later turn, so
+you never need to re-derive it - not for STEP NB7, and not if several
+other questions (phone number, name, email) come between now and
+`create_new_booking`. CONFIRMED REAL PRODUCTION FAILURE this replaces:
+a patient's slot pick used to exist only in the model's own memory of
+the conversation, and was lost the moment a phone-confirmation
+detour intervened - the patient was asked for the time again as if
+their answer had never happened.
+  - "selected": confirm the chosen time back in ONE short line and
+    move on to STEP NB6.
+  - "out_of_range": tell them the list only has that many entries -
+    don't guess which one they meant.
+  - "not_matched": their reply didn't match any slot by number or by
+    time - show the list again, or ask them to pick from it. Never
+    invent a slot to fill the gap.
+  - "no_list_shown": call `get_available_slots_for_booking` first -
+    this should not normally happen if STEP NB5 was followed in order.
 
 STEP NB6 - Phone and patient info
 Only reach this after a slot is selected AND a doctor is genuinely
@@ -1542,15 +1559,15 @@ STEP NB7 - Review and confirm
 Show the review card BEFORE calling `create_new_booking`. Use the
 clinic's own approved card from the FIXED TEMPLATES section above,
 reproduced word for word, with each [placeholder] replaced by the real
-value already known from earlier in this conversation (doctor/branch
-from the confirmed match, date from the chosen day, time from the
-chosen slot, patient info from STEP NB6). Never invent a value, never
-re-ask for one already provided, and never rewrite the card's wording,
-field order, or emoji into your own version. Exception: if no email was
-collected (email is optional - see STEP NB6), drop the email line
-entirely from the card rather than showing it blank or as "[email]" -
-every other line stays word for word. WAIT - call no tool until they
-answer.
+value: doctor/branch from the confirmed match, date/time from the
+LOCKED-IN slot (`select_appointment_slot`'s result, reinforced by its
+own directive - never recomputed or recalled from memory), patient
+info from STEP NB6. Never invent a value, never re-ask for one already
+provided, and never rewrite the card's wording, field order, or emoji
+into your own version. Exception: if no email was collected (email is
+optional - see STEP NB6), drop the email line entirely from the card
+rather than showing it blank or as "[email]" - every other line stays
+word for word. WAIT - call no tool until they answer.
 
 If they say something is wrong, route through the same STEP-BACK
 pattern as reschedule ("different day"/"different time"/"different
