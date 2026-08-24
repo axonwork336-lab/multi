@@ -2873,6 +2873,12 @@ def _apply_output_contract(
 
 _REPLY_VERIFIERS = (
     (
+        lambda reply, state, agent_name: _reply_wrongly_rejects_full_name(reply, state),
+        lambda reply, state: _NAME_REJECTION_CORRECTION_DIRECTIVE,
+        "reply asked the patient to re-send a full name that already had at "
+        "least two parts",
+    ),
+    (
         lambda reply, state, agent_name: _reply_offers_cancellation_without_lookup(reply, state),
         lambda reply, state: _CANCELLATION_CORRECTION_DIRECTIVE,
         "reply asked the patient to confirm cancelling an appointment, but no "
@@ -3372,6 +3378,134 @@ def _build_scope_directive(templates: dict) -> str:
     )
 
 
+_NAME_REJECTION_RE = re.compile(
+    r"اسمين\s*علي\s*الاقل|اسمين\s*على\s*الأقل|"
+    r"(?:ال)?اسم\s*(?:ال)?اول\s*و\s*(?:اسم\s*)?(?:ال)?عائله|"
+    r"at\s+least\s+two\s+names|first\s+(?:name\s+)?and\s+(?:the\s+)?(?:family|last)\s+name"
+)
+
+# A name PART: two or more letters, Arabic or Latin. Deliberately not a
+# dictionary check - "محمد" and "Aymen" are equally valid, and no list
+# could ever cover the names real patients have.
+_NAME_PART_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
+
+# Words that are never part of a name, so "اسمي ساره محمد" counts as two
+# parts rather than three.
+_NAME_FILLER_WORDS = {
+    "اسمي", "اسمى", "انا", "أنا", "الاسم", "اسم", "هو", "my", "name", "is", "im",
+}
+
+
+def _count_name_parts(text: str) -> int:
+    """How many name parts the patient actually supplied."""
+
+    if not text:
+        return 0
+
+    parts = [
+        part for part in _NAME_PART_RE.findall(text)
+        if _norm_ar(part).lower() not in _NAME_FILLER_WORDS
+    ]
+    return len(parts)
+
+
+def _reply_wrongly_rejects_full_name(reply_text: str, state: AgentState) -> bool:
+    """True when the reply sends the patient back to re-type a name that
+    ALREADY has at least two parts.
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient answered "ساره محمد" -
+    two names, exactly what was asked for - and was told
+    "يجب أن يحتوي على اسمين على الأقل ... أعطني اسمك الكامل". There is
+    nothing they could have typed to satisfy it; the name was already
+    correct. The two-name requirement lived only in the prompt as a
+    judgement for the model to make, and it made it wrong.
+
+    Counting the parts in code removes the judgement entirely: the
+    objection is only allowed to stand when the name genuinely has
+    fewer than two parts.
+    """
+
+    if not reply_text or not _NAME_REJECTION_RE.search(_norm_ar(reply_text)):
+        return False
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    for msg in reversed(state.get("messages", []) or []):
+        if not isinstance(msg, _HumanMessage):
+            continue
+        content = getattr(msg, "content", "")
+        text = content if isinstance(content, str) else str(content)
+        # The name is whatever they last typed that wasn't an email or a
+        # phone number.
+        candidate = re.sub(r"\S+@\S+|\+?\d[\d\s\-()]{5,}", " ", text)
+        if _count_name_parts(candidate) >= 2:
+            return True
+        if candidate.strip():
+            return False
+
+    return False
+
+
+_NAME_REJECTION_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "THE NAME THEY GAVE IS ALREADY VALID - DO NOT ASK AGAIN\n"
+    "============================================================\n"
+    "Your previous draft told the patient their name needs at least two "
+    "parts. It already HAS at least two parts - this was checked in "
+    "code, not guessed. Asking again is asking them to retype something "
+    "that was correct the first time, and there is nothing they could "
+    "send that would satisfy you.\n\n"
+    "Accept the name exactly as they wrote it, including any spelling "
+    "you might have expected differently - it is their name, not "
+    "yours - and continue the booking from where it stands. If they "
+    "also gave an email, acknowledge it in the same breath and move "
+    "on.\n\n"
+    "Rewrite the reply now, accepting the name.\n\n"
+)
+
+
+_REVIEW_CARD_PHONE_DIRECTIVE = (
+    "============================================================\n"
+    "THE REVIEW CARD SHOWS THE NUMBER ITSELF, NOT A DESCRIPTION OF IT\n"
+    "============================================================\n"
+    "The phone line of the review card must contain the actual digits. "
+    "For this conversation that is:\n"
+    "    {phone}\n\n"
+    "Write exactly that. Never write a DESCRIPTION of the number in its "
+    "place - not \"رقم الواتساب الحالي\", not \"نفس الرقم\", not \"the "
+    "number you're messaging from\", not \"your current WhatsApp "
+    "number\".\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: a review card went out reading "
+    "\"📱 الجوال: رقم الواتساب الحالي\". The patient is being asked to "
+    "check their booking details are correct, and the one field they "
+    "most need to verify was a sentence about itself instead of a "
+    "number they could read back. The number was known the entire "
+    "time.\n\n"
+    "The same rule applies to every other line of the card: real "
+    "values only, never a phrase standing in for one.\n\n"
+)
+
+
+def _build_review_card_phone_directive(state: AgentState, session_id: str) -> str:
+    """Supplies the actual phone number whenever the booking is at or
+    near the review-card step, so it can never be described in words."""
+
+    channel_phone = (state or {}).get("channel_phone")
+    if not channel_phone:
+        return ""
+
+    if not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    if not (session.get("doctor_id") and session.get("branch_id")):
+        return ""
+
+    normalized = tools.normalize_phone_number(channel_phone, state) or channel_phone
+
+    return _REVIEW_CARD_PHONE_DIRECTIVE.format(phone=normalized)
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -3490,6 +3624,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         state["messages"], state.get("session_id"), agent_name,
     )
     scope_directive = _build_scope_directive(state.get("templates") or {})
+    review_phone_directive = _build_review_card_phone_directive(state, state.get("session_id"))
 
     # The scoped prompt for whoever owns this turn. Rebuilt per turn for
     # the same reason load_config rebuilds: a prompts.py/CSV edit must
@@ -3521,7 +3656,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + resolved_day_directive + entity_list_directive
         + abandoned_booking_directive + bare_entity_directive
         + doctor_branches_directive + branch_question_directive
-        + scope_directive
+        + review_phone_directive + scope_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
