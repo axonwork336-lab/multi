@@ -446,6 +446,33 @@ _pending: Dict[str, tuple] = {}
 last_delivered: Dict[str, str] = {}
 
 
+# When a progress message was handed to the webhook, and whether one is
+# still mid-flight. Both are what `end_turn` uses to guarantee ORDERING.
+_delivery_finished_at: Dict[str, float] = {}
+_delivery_in_progress: Dict[str, threading.Event] = {}
+
+# How far ahead of the real answer an interim message must be.
+#
+# WHY THIS EXISTS AT ALL: the interim line and the answer travel by two
+# INDEPENDENT paths - progress POSTs straight to the webhook from a
+# timer thread, while the answer goes back as the /chat response and is
+# then delivered by n8n. Nothing about "sent first" makes them "arrive
+# first". Confirmed repeatedly in production: the line reading "لحظة من
+# فضلك، جاري البحث عن الأوقات المتاحة… 🕐" landing UNDERNEATH the list
+# of times it was supposed to precede.
+#
+# No amount of checking before sending can fix that - by the time the
+# check runs, the only thing left to control is when the ANSWER goes
+# out. So the answer is held back until the interim line has had a
+# clear head start. Paid only on turns that actually sent one.
+_MIN_ORDERING_GAP_SECONDS = 0.6
+
+# Hard ceiling on the total hold, so a webhook that has gone slow or
+# unresponsive can never stall a patient's answer. Exceeding this is
+# logged: if it shows up, the webhook is the thing to look at.
+_MAX_ORDERING_WAIT_SECONDS = 2.0
+
+
 def begin_turn(session_id: str) -> None:
     """Called once when a user message starts being processed."""
 
@@ -453,6 +480,8 @@ def begin_turn(session_id: str) -> None:
         _cancel_locked(session_id)
         _in_flight[session_id] = True
         _delivered[session_id] = False
+        _delivery_finished_at.pop(session_id, None)
+        _delivery_in_progress.pop(session_id, None)
         # NOT set here on purpose - see _turn_started's comment above.
         # Left over from a PRIOR turn shouldn't leak in either, so it's
         # explicitly cleared; schedule() sets it fresh the first time
@@ -465,7 +494,22 @@ def end_turn(session_id: str) -> None:
 
     Cancelling here is what makes a fast turn produce no interim message
     at all - the timer never gets to fire.
+
+    ALSO ENFORCES ORDERING. If an interim message went out during this
+    turn, this blocks briefly so the answer cannot overtake it - see
+    _MIN_ORDERING_GAP_SECONDS. This runs on the request thread, on
+    purpose: the caller is about to return the reply, and delaying that
+    return by a few hundred milliseconds is the only remaining way to
+    control which of the two messages the patient sees first.
+
+    Never raises, and never waits longer than
+    _MAX_ORDERING_WAIT_SECONDS.
     """
+
+    try:
+        _await_ordering_gap(session_id)
+    except Exception as exc:  # pragma: no cover - must never break a turn
+        logger.warning("progress[%s]: ordering wait failed (%s)", session_id, exc)
 
     with _lock:
         # Cleared before anything else: a timer thread already inside
@@ -476,6 +520,54 @@ def end_turn(session_id: str) -> None:
         _delivered.pop(session_id, None)
         _turn_started.pop(session_id, None)
         _pending.pop(session_id, None)
+        _delivery_finished_at.pop(session_id, None)
+        _delivery_in_progress.pop(session_id, None)
+
+
+def _await_ordering_gap(session_id: str) -> None:
+    """Hold the answer back until any interim message this turn is
+    provably ahead of it."""
+
+    with _lock:
+        pending_send = _delivery_in_progress.get(session_id)
+        finished_at = _delivery_finished_at.get(session_id)
+
+    if pending_send is None and finished_at is None:
+        # Nothing was sent this turn - the overwhelming majority of
+        # turns - so there is nothing to order against.
+        return
+
+    started_waiting = time.monotonic()
+
+    if pending_send is not None and not pending_send.is_set():
+        # The POST is still in flight. Wait for it to land, otherwise
+        # the gap below would be measured from the wrong moment.
+        if not pending_send.wait(timeout=_MAX_ORDERING_WAIT_SECONDS):
+            logger.warning(
+                "progress[%s]: interim message still unsent after %.1fs - releasing the "
+                "answer anyway; the two may arrive out of order. Check the progress webhook.",
+                session_id, _MAX_ORDERING_WAIT_SECONDS,
+            )
+            return
+
+        with _lock:
+            finished_at = _delivery_finished_at.get(session_id)
+
+    if finished_at is None:
+        return
+
+    elapsed_since_send = time.monotonic() - finished_at
+    remaining_gap = _MIN_ORDERING_GAP_SECONDS - elapsed_since_send
+
+    budget_left = _MAX_ORDERING_WAIT_SECONDS - (time.monotonic() - started_waiting)
+    hold = min(remaining_gap, budget_left)
+
+    if hold > 0:
+        logger.info(
+            "progress[%s]: holding the answer %.2fs so the interim message stays ahead of it",
+            session_id, hold,
+        )
+        time.sleep(hold)
 
 
 def _cancel_locked(session_id: str) -> None:
@@ -684,12 +776,25 @@ def _deliver(session_id: str, client_id: str, text: str) -> None:
             )
             return
 
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=config.PROGRESS_TIMEOUT_SECONDS,
-            headers={"Content-Type": "application/json"},
-        )
+        # Opened BEFORE the POST and closed after it, so `end_turn` can
+        # tell "nothing was sent" from "a send is still in flight" and
+        # wait for the latter rather than releasing the answer into a
+        # race - see _await_ordering_gap.
+        sent_marker = threading.Event()
+        with _lock:
+            _delivery_in_progress[session_id] = sent_marker
+
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=config.PROGRESS_TIMEOUT_SECONDS,
+                headers={"Content-Type": "application/json"},
+            )
+        finally:
+            with _lock:
+                _delivery_finished_at[session_id] = time.monotonic()
+            sent_marker.set()
 
         # The window cannot be closed entirely from this side - the
         # request is already with n8n by now. Logging when it happens at
