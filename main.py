@@ -25,7 +25,7 @@ from typing import Dict
 
 from langchain_core.messages import HumanMessage
 
-from config import POST_SUCCESS_TIMEOUT_SECONDS, SESSION_TIMEOUT_SECONDS, THREAD_ID_PREFIX, configure_logging
+from config import POST_SUCCESS_TIMEOUT_SECONDS, SESSION_TIMEOUT_SECONDS, THREAD_ID_PREFIX, configure_logging, get_messages
 from graph import graph
 
 import progress
@@ -370,6 +370,33 @@ def send_message_with_signals(
             progress.end_turn(session_id)
 
             reply = result["messages"][-1].content
+
+            # LAST LINE OF DEFENCE: never hand the channel a blank reply.
+            #
+            # A blank reply reaches the patient as NOTHING AT ALL. From
+            # their side that is indistinguishable from being ignored -
+            # they have no error, no acknowledgement, nothing to react
+            # to, and the usual response is to repeat themselves or give
+            # up. Confirmed in production: a patient answered "اه" to a
+            # yes/no question and received no message back.
+            #
+            # Whatever caused it (an empty model response, a processing
+            # step removing everything, a tool loop ending without a
+            # final message), the right behaviour at this boundary is
+            # the same: say something, and log loudly enough that the
+            # cause can be found.
+            if not (reply or "").strip():
+                templates = get_messages(client_id, client_row_override=client_config)
+                reply = (
+                    templates.get("msg_On_failure")
+                    or "عذرًا، حصلت مشكلة مؤقتة. ممكن تبعت رسالتك تاني؟ 🌷"
+                )
+                logger.error(
+                    "session_id=%s: the turn produced an EMPTY reply - sent the failure "
+                    "message instead of nothing. Last message: %r",
+                    session_id, result["messages"][-1],
+                )
+
             logger.info("session_id=%s: reply=%r", session_id, reply)
 
             new_messages_this_turn = result["messages"][previous_count:]
