@@ -132,8 +132,23 @@ DOCTOR_LIST_CACHE_SECONDS: float = float(
     os.getenv("DOCTOR_LIST_CACHE_SECONDS", "90")
 )
 
+# How far ahead to look for a bookable slot.
+#
+# RAISED FROM 14 DAYS. Clinics publish the next season's rota in
+# advance, and patients are expected to book into it - confirmed in
+# production, a doctor's Monday rota was valid from 01/10 while the
+# search window ended two weeks out, so those Mondays could not be found
+# no matter what the patient asked. With the schedule lookup no longer
+# hiding future rotas (see api.get_doctor_schedule's `include_future`),
+# a short window here would just move the same blind spot one step
+# later: the schedule would show Monday and the day search would find
+# nothing.
+#
+# Cost is one request either way - the sweep is a single paged call, not
+# a call per day - so the change is more rows returned, not more round
+# trips. Lower it if a client's booking horizon is genuinely shorter.
 DOCTOR_AVAILABILITY_WINDOW_DAYS: int = int(
-    os.getenv("DOCTOR_AVAILABILITY_WINDOW_DAYS", "14")
+    os.getenv("DOCTOR_AVAILABILITY_WINDOW_DAYS", "60")
 )
 
 
@@ -509,6 +524,42 @@ def get_dialect_template(dialect: str) -> Optional[dict]:
     return None
 
 
+def _unwrap_quotes(value: str) -> str:
+    """Remove a pair of quote characters wrapping an entire value.
+
+    Message templates are authored in a spreadsheet / Data Table, where
+    it is natural to type quotes around a sentence to show where it
+    begins and ends. Those quotes are part of the VALUE, not of the CSV
+    encoding, so they survive parsing and get sent to the patient.
+
+    Confirmed in production data: `msg_On_failure` reads
+    '"حدث خطأ تقني 😕. تحب تحاول مرة ثانية؟"' for BOTH clients -
+    quote marks included. It is a message the patient only ever sees
+    when something has already gone wrong, so it is the least likely to
+    be noticed in testing and the worst moment to look sloppy.
+
+    Only stripped when a matching pair wraps the WHOLE value, so a
+    quotation used INSIDE a message is untouched.
+    """
+
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if len(text) < 2:
+        return value
+
+    for opening, closing in (('"', '"'), ("'", "'"), ("\u201c", "\u201d"), ("\u00ab", "\u00bb")):
+        if text[0] == opening and text[-1] == closing:
+            inner = text[1:-1].strip()
+            # Don't strip when the value is several quoted fragments
+            # ("a" and "b") - only when it is one wrapped sentence.
+            if opening not in inner and closing not in inner:
+                return inner
+
+    return value
+
+
 def get_messages(client_id: str, dialect: Optional[str] = None, client_row_override: Optional[dict] = None) -> dict:
     """
     Build the merged message-template dict used by build_response and the
@@ -550,7 +601,7 @@ def get_messages(client_id: str, dialect: Optional[str] = None, client_row_overr
     for key in _CLIENT_OVERRIDE_KEYS:
         value = client_row.get(key)
         if value:
-            merged[key] = value
+            merged[key] = _unwrap_quotes(value)
 
     # A few non-message fields nodes/prompts need directly, not just for
     # templating - kept alongside the message dict so callers only need
