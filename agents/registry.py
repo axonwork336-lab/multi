@@ -247,6 +247,7 @@ and never alter a slot value returned by
             "list_available_days_for_booking",
             "get_doctor_schedule_for_booking",
             "get_available_slots_for_booking",
+            "select_appointment_slot",
             "create_new_booking",
             "get_doctor_fees",
             "resolve_available_day",
