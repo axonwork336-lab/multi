@@ -3123,6 +3123,12 @@ def _apply_output_contract(
 
 _REPLY_VERIFIERS = (
     (
+        lambda reply, state, agent_name: _reply_asks_for_a_slot_already_locked_in(reply, state),
+        lambda reply, state: _selected_slot_correction_directive(reply, state),
+        "reply asked for the appointment time, but a slot has already been locked in "
+        "via select_appointment_slot for this booking",
+    ),
+    (
         lambda reply, state, agent_name: _reply_asks_for_a_phone_already_known(reply, state),
         lambda reply, state: _PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE,
         "reply asked for a phone number (or a booking reference instead) right after "
@@ -4017,6 +4023,109 @@ _PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE = (
 )
 
 
+_SELECTED_SLOT_DIRECTIVE = (
+    "============================================================\n"
+    "THE APPOINTMENT TIME IS ALREADY LOCKED IN - DO NOT ASK FOR IT AGAIN\n"
+    "============================================================\n"
+    "`select_appointment_slot` has already resolved and saved this "
+    "booking's time. It is:\n"
+    "    {date_display} {weekday_display} — {time_display}"
+    "{service_suffix}\n\n"
+    "Use these exact values whenever the flow needs them - especially "
+    "`slot_start`/`slot_end` for `create_new_booking` - and never ask "
+    "the patient for the time, the date, or which slot they meant "
+    "again, no matter how many other questions (phone number, name, "
+    "email) come between now and the booking itself.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: a patient picked a slot, was "
+    "asked to confirm their WhatsApp number, answered \"yes\" - and was "
+    "then asked to give the appointment time again, as if the earlier "
+    "answer had never happened. It had; nothing had reminded the model "
+    "of it across the intervening question, so it was lost. This "
+    "reminder exists so that never happens again: the values above are "
+    "not something to recall from earlier in the conversation, they are "
+    "written here, every turn, for exactly as long as this booking is "
+    "in progress.\n\n"
+)
+
+
+def _build_selected_slot_directive(session_id: str) -> str:
+    """Fires whenever this booking has a locked-in slot
+    (`select_appointment_slot` succeeded) and the booking has not yet
+    completed - keeps the exact chosen time in front of the model on
+    every turn, the same way `_build_channel_identity_directive` keeps
+    the phone number in front of it, so neither has to survive purely on
+    the model's recollection of an earlier turn."""
+
+    if not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    slot = session.get("selected_slot")
+
+    if not slot:
+        return ""
+
+    service_name = (slot.get("serviceName") or "").strip()
+    service_suffix = f" — {service_name}" if service_name else ""
+
+    return _SELECTED_SLOT_DIRECTIVE.format(
+        date_display=slot.get("date_display") or "",
+        weekday_display=slot.get("weekday_display") or "",
+        time_display=slot.get("time_display") or "",
+        service_suffix=service_suffix,
+    )
+
+
+_ASKS_FOR_SLOT_RE = re.compile(
+    r"وقت\s*(?:بالضبط|محدد)|الوقت\s*الذي|أي\s*وقت\s*تفضل|"
+    r"الرقم\s*من\s*(?:ال)?قائمه|من\s*(?:ال)?قائمه\s*(?:ال)?سابقه|"
+    r"exact\s*time|which\s*(?:time|slot)"
+)
+
+
+def _reply_asks_for_a_slot_already_locked_in(reply_text: str, state: AgentState) -> bool:
+    """True when the reply asks the patient for the appointment time,
+    while a slot has already been resolved via `select_appointment_slot`
+    for this booking.
+
+    CONFIRMED REAL PRODUCTION FAILURE: a patient picked slot "2", was
+    asked to confirm their WhatsApp number, answered "yes" - and was
+    then asked to give the time again, as if the earlier answer had
+    never happened. `_build_selected_slot_directive` now reminds the
+    model of the locked-in time on every turn; this catches the case
+    where the reminder didn't hold, the same escalation already applied
+    to the phone-number equivalent in pass 11.
+    """
+
+    if not reply_text or not _ASKS_FOR_SLOT_RE.search(_norm_ar(reply_text)):
+        return False
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return False
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    return bool(session.get("selected_slot"))
+
+
+def _selected_slot_correction_directive(reply_text: str, state: AgentState) -> str:
+    session = tools._BOOKING_SESSIONS.get(state.get("session_id")) or {}
+    slot = session.get("selected_slot") or {}
+
+    return (
+        "============================================================\n"
+        "THE TIME WAS ALREADY GIVEN - DO NOT ASK FOR IT AGAIN\n"
+        "============================================================\n"
+        "Your previous draft asked for the appointment time. It is "
+        "already locked in for this booking:\n"
+        f"    {slot.get('date_display', '')} {slot.get('weekday_display', '')} — "
+        f"{slot.get('time_display', '')}\n\n"
+        "Continue the booking from wherever it actually stands - do not "
+        "ask for the time, the date, or which slot they meant.\n\n"
+        "Rewrite the reply now, without asking for the time.\n\n"
+    )
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -4136,6 +4245,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     )
     scope_directive = _build_scope_directive(state.get("templates") or {})
     review_phone_directive = _build_review_card_phone_directive(state, state.get("session_id"))
+    selected_slot_directive = _build_selected_slot_directive(state.get("session_id"))
 
     # The scoped prompt for whoever owns this turn. Rebuilt per turn for
     # the same reason load_config rebuilds: a prompts.py/CSV edit must
@@ -4167,7 +4277,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + resolved_day_directive + entity_list_directive
         + abandoned_booking_directive + bare_entity_directive
         + doctor_branches_directive + branch_question_directive
-        + review_phone_directive + scope_directive
+        + review_phone_directive + selected_slot_directive + scope_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
