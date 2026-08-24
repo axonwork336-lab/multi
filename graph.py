@@ -627,6 +627,20 @@ def _build_entity_list_directive(messages: list) -> str:
 
     items = data.get(items_key) or []
 
+    # A SINGLE BRANCH FROM list_branches_for_specialty IS NOT A BRANCH
+    # LIST TO SHOW - IT IS THE END OF THAT QUESTION. The real list, the
+    # one the patient needs to pick from, is that one branch's DOCTORS -
+    # which is exactly what `list_branches_for_specialty` remembers under
+    # entity_type="doctor" in this exact case (see its own comment).
+    # Rendered here from the SAME nested array, so display and memory
+    # can never disagree - the same guarantee every other list in this
+    # block already has.
+    if tool_name == "list_branches_for_specialty" and len(items) == 1 and items[0].get("doctors"):
+        branch_name = items[0].get("name") or ""
+        items = items[0]["doctors"]
+        items_key = "doctors"
+        heading = f"الدكاترة المتاحين في فرع {branch_name}" if branch_name else "الدكاترة المتاحين"
+
     # `find_best_doctor_in_specialty` returns ONE doctor under "doctor",
     # not a list - it is a recommendation, not a roster, so it is left
     # to the flow's own wording rather than forced into a list of one.
