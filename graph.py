@@ -745,12 +745,27 @@ _SUCCESS_TEMPLATE_FIELDS = {
     "time": ("time_display",),
     "doctorName": ("doctorName",),
     "branchName": ("branchName",),
-    "new_date": ("date_display",),
-    "new_time": ("time_display",),
+    # RESCHEDULE: new values come from the reschedule result, old values
+    # from the lookup that preceded it. Both were previously mapped onto
+    # the SAME appointment record, which has only one date on it - so
+    # "the new appointment" and "the appointment it replaced" could only
+    # ever have shown the same value, and {old_date}/{old_time} had no
+    # source at all and reached a patient as literal text.
+    # NO FALLBACK to `date_display` here on purpose. Falling back would
+    # print the OLD appointment's date under the label "the new
+    # appointment" - a card that looks perfectly filled in and is wrong,
+    # which is worse than one that visibly fails. If the reschedule
+    # result has no new time, the card is skipped entirely (see the
+    # leftover-placeholder check below) and the model composes instead.
+    "new_date": ("_new_date_display",),
+    "new_time": ("_new_time_display",),
     "old_date": ("_old_date_display",),
     "old_time": ("_old_time_display",),
     "bookingRefNum": ("ref",),
 }
+
+# Anything still looking like {placeholder} after filling.
+_UNFILLED_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_ /ص م\u0600-\u06FF]*\}")
 
 
 def _fill_success_template(template_text: str, appointment: dict) -> str:
@@ -854,11 +869,40 @@ def _build_terminal_success_directive(messages: list, templates: dict) -> str:
         # {placeholders}.
         return ""
 
+    # The record fetched BEFORE the change is, by definition, the OLD
+    # appointment - that is what the flow looked up in order to change
+    # it. Its date/time therefore fill {old_date}/{old_time}, while the
+    # NEW ones come from the reschedule result itself.
+    values = dict(appointment)
+    values["_old_date_display"] = appointment.get("date_display")
+    values["_old_time_display"] = appointment.get("time_display")
+
+    for key in ("new_date_display", "new_time_display"):
+        if data.get(key):
+            values[f"_{key}"] = data[key]
+
     block = _fill_success_template(
-        template_text.replace("\r\n", "\n").replace("\r", "\n"), appointment,
+        template_text.replace("\r\n", "\n").replace("\r", "\n"), values,
     ).strip()
 
     if not block:
+        return ""
+
+    leftover = _UNFILLED_PLACEHOLDER_RE.findall(block)
+    if leftover:
+        # A card with a hole in it is worse than no card: it is the last
+        # message the patient receives and the one they keep. Confirmed
+        # in production - "تم إلغاء الموعد السابق المحدد بتاريخ
+        # {old_date} الساعة {old_time}" went out exactly like that.
+        #
+        # Falling back to the model's normal instructions produces a
+        # sentence that at least reads as a sentence, and the log line
+        # names the field that had no source.
+        logger.error(
+            "terminal success template for %s has unfillable placeholder(s) %s - "
+            "falling back to a composed reply rather than sending a card with holes in it",
+            label, leftover,
+        )
         return ""
 
     return (
@@ -2919,6 +2963,12 @@ def _apply_output_contract(
 
 _REPLY_VERIFIERS = (
     (
+        lambda reply, state, agent_name: _reply_denies_a_branch_the_tools_offered(reply, state),
+        lambda reply, state: _BRANCH_DENIAL_CORRECTION_DIRECTIVE,
+        "reply said a branch had nothing available, while a tool result in this "
+        "conversation lists that branch as an option and none reported it empty",
+    ),
+    (
         lambda reply, state, agent_name: _reply_wrongly_rejects_full_name(reply, state),
         lambda reply, state: _NAME_REJECTION_CORRECTION_DIRECTIVE,
         "reply asked the patient to re-send a full name that already had at "
@@ -3589,6 +3639,126 @@ def _is_scope_refusal(reply_text: str, templates: dict) -> bool:
 
     block = _build_out_of_scope_block(templates)
     return bool(block) and _normalize_for_compare(block) in _normalize_for_compare(reply_text)
+
+
+_BRANCH_DENIAL_RE = re.compile(
+    r"ما\s*عنده\s*دكاتره|ما\s*في\s*دكاتره|مفيش\s*دكاتره|لا\s*يوجد\s*(?:اطباء|دكاتره)|"
+    r"ما\s*عنده\s*مواعيد|مفيش\s*مواعيد|غير\s*متاح|مش\s*متاح|"
+    r"no\s+doctors?\s+available|not\s+available\s+at"
+)
+
+
+def _reply_denies_a_branch_the_tools_offered(reply_text: str, state: AgentState) -> bool:
+    """True when the reply says a branch has nothing available, while a
+    tool result in this same conversation lists that branch as one of
+    the options.
+
+    CONFIRMED REAL PRODUCTION FAILURE: a doctor was chosen, the patient
+    asked for فرع الدقي, and was told الدقي had no doctors available -
+    then, one turn later, that الشيخ زايد had none either. Both were
+    false: `list_available_days_for_booking` went on to return that same
+    doctor's real working days AT الدقي. The patient was turned away
+    twice from branches the doctor actually works at, and only got
+    through by insisting.
+
+    A denial is only allowed to stand when no tool has said otherwise.
+    """
+
+    if not reply_text or not _BRANCH_DENIAL_RE.search(_norm_ar(reply_text)):
+        return False
+
+    offered = _branches_named_by_tools(state)
+    if not offered:
+        return False
+
+    folded_reply = _norm_ar(reply_text)
+
+    for name in offered:
+        folded_name = _norm_ar(name)
+        if len(folded_name) < 3 or folded_name not in folded_reply:
+            continue
+
+        # The branch is named in a reply that denies availability, and a
+        # tool result offered it. Only a tool result that ITSELF reported
+        # emptiness can justify that.
+        if not _tools_reported_branch_empty(state):
+            return True
+
+    return False
+
+
+def _branches_named_by_tools(state: AgentState) -> set:
+    """Every branch name any tool result in this conversation offered."""
+
+    names = set()
+
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "type", None) != "tool":
+            continue
+        try:
+            data = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        for key in ("branches", "schedules"):
+            for item in data.get(key) or []:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("branchName")
+                    if name:
+                        names.add(str(name))
+
+    return names
+
+
+_EMPTY_RESULT_STATUSES = {
+    "not_found", "no_doctors", "empty", "none", "no_slots", "not_available",
+}
+
+
+def _tools_reported_branch_empty(state: AgentState) -> bool:
+    """Whether any tool result actually reported nothing available."""
+
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "type", None) != "tool":
+            continue
+        try:
+            data = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        status = str(data.get("status") or "").lower()
+        if status in _EMPTY_RESULT_STATUSES:
+            return True
+        if status == "found" and not any(
+            data.get(key) for key in ("doctors", "days", "slots", "branches", "schedules")
+        ):
+            return True
+
+    return False
+
+
+_BRANCH_DENIAL_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU TURNED THE PATIENT AWAY FROM A BRANCH THAT IS AVAILABLE\n"
+    "============================================================\n"
+    "Your previous draft told the patient a branch has nothing "
+    "available. A tool result in THIS conversation lists that branch as "
+    "one of the options, and no tool has reported it empty.\n\n"
+    "Do not decide a branch is unavailable. Check it: call "
+    "`list_available_days_for_booking` for the confirmed doctor at that "
+    "branch, and answer from what it returns.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: a patient asking for فرع الدقي "
+    "was told it had no doctors, then told الشيخ زايد had none either - "
+    "and the same doctor's real working days at الدقي came back from "
+    "the very next tool call. They were turned away twice from branches "
+    "that were available the whole time, and only got through by "
+    "insisting. Most patients do not insist; they leave.\n\n"
+    "Rewrite the reply - or better, call the tool and answer from it.\n\n"
+)
 
 
 def _run_agent(state: AgentState, agent_name: str) -> dict:
