@@ -3941,7 +3941,7 @@ def _mark_fully_booked_schedule_days(state, base_url: str, doctor_id: str,
         if not indexes:
             continue
 
-        starts_on = _parse_iso_date(row.get("effectiveFrom") or row.get("fromDateTimeFrom"))
+        starts_on = _schedule_row_effective_from(row)
 
         if branch_id not in open_weekdays_by_branch:
             open_weekdays_by_branch[branch_id] = _weekdays_with_open_slots(
@@ -3988,6 +3988,63 @@ def _parse_iso_date(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
     except (ValueError, TypeError):
         return None
+
+
+# THE FIELD NAME BELOW HAS NEVER BEEN CONFIRMED AGAINST A REAL RESPONSE.
+#
+# Every other field this file reads off a DoctorSchedules row -
+# `recurringDaysNames`, `fromDateTime`, `toDateTime`, `branchId` - is
+# marked in api.py as "confirmed directly from the API's real response".
+# The validity-range field (the one behind the admin panel's "Effective
+# From" / "Effective To" columns) never got that same confirmation. It
+# was guessed as "effectiveFrom" when the future-rota exemption was
+# first written, and every fully-booked check since has quietly
+# inherited that same unverified guess.
+#
+# CONFIRMED SUSPECT: a doctor's branch was reported "fully booked" in
+# production while her own admin-panel schedule showed a genuinely
+# upcoming rota at that same branch (Effective From a later date). If
+# the real field is spelled differently, `_parse_iso_date` above always
+# returns None for it, `starts_on` is always None, and the future-rota
+# exemption this file relies on in three places never fires - it looks
+# like working code and silently does nothing.
+#
+# This checks every plausible spelling rather than one, and - the part
+# that actually closes the question - logs the row's own keys the FIRST
+# time none of them match, once per process. The next production log
+# will show exactly what the field is really called, ending the
+# guessing rather than extending it.
+_EFFECTIVE_FROM_CANDIDATE_KEYS = (
+    "effectiveFrom", "fromDateTimeFrom", "effectiveDate", "effectiveFromDate",
+    "validFrom", "startDate", "fromDate", "scheduleFrom", "startEffectiveDate",
+)
+
+_effective_from_field_unknown_logged = False
+
+
+def _schedule_row_effective_from(row: dict):
+    """The date this schedule row's validity BEGINS, or None if no
+    candidate field name matched - see the module-level note above for
+    why this is a temporary, defensive lookup rather than a single
+    trusted key."""
+
+    global _effective_from_field_unknown_logged
+
+    for key in _EFFECTIVE_FROM_CANDIDATE_KEYS:
+        parsed = _parse_iso_date(row.get(key))
+        if parsed:
+            return parsed
+
+    if not _effective_from_field_unknown_logged and row:
+        _effective_from_field_unknown_logged = True
+        logger.warning(
+            "_schedule_row_effective_from: none of %s matched on a real schedule row - "
+            "the future-rota exemption cannot fire until the correct field name is known. "
+            "Row's actual keys: %s",
+            _EFFECTIVE_FROM_CANDIDATE_KEYS, sorted(row.keys()),
+        )
+
+    return None
 
 
 def _branches_with_real_availability(state, base_url: str, doctor_id: str, branch_options: list,
@@ -4264,7 +4321,7 @@ def list_available_days_for_booking(
                     # first one seen per branch - otherwise a branch
                     # whose only future rota appears on its second row
                     # would never be exempted below.
-                    starts_on = _parse_iso_date(item.get("effectiveFrom") or item.get("fromDateTimeFrom"))
+                    starts_on = _schedule_row_effective_from(item)
                     if starts_on and starts_on > date.today():
                         future_branch_ids.add(item_branch_id)
 
@@ -4793,7 +4850,12 @@ def get_doctor_schedule_for_booking(
             "serviceName": _service_name(item, conversation_language(state)),
             # Kept so the availability check below can group by branch
             # and tell a not-yet-started rota from a full one.
-            "effectiveFrom": item.get("effectiveFrom") or item.get("fromDateTimeFrom"),
+            # Resolved with _schedule_row_effective_from on the RAW item
+            # (which still has every candidate field name available),
+            # not a single guessed key - see that helper for why. Stored
+            # under this one canonical name so the later fully-booked
+            # check (which reads "effectiveFrom" first) finds it.
+            "effectiveFrom": (lambda d: d.isoformat() if d else None)(_schedule_row_effective_from(item)),
         }
         for item in items
     ]
