@@ -2798,6 +2798,43 @@ _GYN_CORRECTION_DIRECTIVE = (
 # The single finaliser every outgoing reply passes through
 # ==========================================================
 
+# Scaffolding the DIRECTIVES use to delimit text the model must copy
+# verbatim. It is instruction plumbing and must never reach a patient.
+#
+# CONFIRMED REAL PRODUCTION FAILURE: a greeting went out with
+# "[END-EXACT-TEXT]" printed underneath it. Every directive tells the
+# model in words not to include these lines, and that held right up
+# until it didn't - which is the whole argument for stripping them in
+# code instead of asking. The cost of being wrong here is a patient
+# seeing internal machinery in the first message the clinic ever sends
+# them; the cost of the strip is nothing, because no legitimate reply
+# ever contains these tokens.
+_DIRECTIVE_SCAFFOLD_RE = re.compile(
+    r"^[ \t]*(?:"
+    r"\[(?:BEGIN|END)-EXACT-TEXT\]|"
+    r"\[/?INTERNAL[^\]\n]*\]|"
+    r"\[(?:BEGIN|END)[A-Z\- ]*\]|"
+    r"[=\-]{6,}"
+    r")[ \t]*$\n?",
+    re.MULTILINE,
+)
+
+
+def _strip_directive_scaffolding(text: str) -> tuple:
+    """Remove directive scaffolding lines. Returns (cleaned, n_removed)."""
+
+    if not text:
+        return text, 0
+
+    cleaned, removed = _DIRECTIVE_SCAFFOLD_RE.subn("", text)
+
+    if removed:
+        # Collapse the blank run a removed line can leave behind.
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    return cleaned, removed
+
+
 def _apply_output_contract(
     text: str,
     state: AgentState,
@@ -2817,6 +2854,8 @@ def _apply_output_contract(
     invisible from the outside and impossible to explain.
 
     Order matters and is the original order:
+      0. Strip directive scaffolding ([BEGIN/END-EXACT-TEXT], rule
+         lines). First, so nothing downstream has to reason about it.
       1. Trim any question beyond the first (ONE QUESTION PER MESSAGE).
       2. Emoji list badges, so every list looks the same - including
          lists no pre-built directive exists for.
@@ -2825,7 +2864,14 @@ def _apply_output_contract(
          irregular blank lines).
     """
 
-    trimmed, removed = _strip_extra_questions(text, state.get("templates") or {})
+    descaffolded, scaffold_lines = _strip_directive_scaffolding(text)
+    if scaffold_lines:
+        logger.warning(
+            "agent[%s]: reply contained %d line(s) of directive scaffolding - stripped. Original: %r",
+            agent_name, scaffold_lines, text,
+        )
+
+    trimmed, removed = _strip_extra_questions(descaffolded, state.get("templates") or {})
     if removed:
         logger.warning(
             "agent[%s]: reply contained %d extra question(s) beyond the first - trimmed. Original: %r",
@@ -3363,6 +3409,21 @@ def _build_scope_directive(templates: dict) -> str:
         "religion, politics, other companies, general trivia, coding, "
         "translation, or any other request that is not about this "
         "hospital.\n\n"
+        "IT DOES NOT MEAN ORDINARY CONVERSATION. Greetings (\"أهلاً\", "
+        "\"السلام عليكم\", \"صباح الخير\", \"hi\"), thanks, apologies, "
+        "goodbyes, \"كيف حالك\", a patient describing a symptom, saying "
+        "yes or no, or any short reply that keeps this conversation "
+        "moving are ALL in scope. Answer those normally and warmly.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: a patient opened with "
+        "\"اهلا\" and received the welcome message with the refusal "
+        "above stapled underneath it - told they were off-topic by the "
+        "very first message the clinic ever sent them, for saying "
+        "hello. If the message is a greeting, the greeting IS the "
+        "reply. Never attach the refusal to it.\n\n"
+        "The refusal is for a question you were asked and cannot "
+        "answer. It is never an addition to a reply that already "
+        "answered something - if you are already saying something else, "
+        "the refusal does not belong in that message at all.\n\n"
         "Do NOT call a tool for such a question. No tool here can answer "
         "it, and calling one does not make an answer available - it just "
         "spends the patient's time and produces an irrelevant result you "
@@ -3504,6 +3565,30 @@ def _build_review_card_phone_directive(state: AgentState, session_id: str) -> st
     normalized = tools.normalize_phone_number(channel_phone, state) or channel_phone
 
     return _REVIEW_CARD_PHONE_DIRECTIVE.format(phone=normalized)
+
+
+# The refusal's distinctive middle clause. Matched rather than
+# comparing the whole block, because the model may reword the clinic
+# name or drop the trailing line while still clearly emitting "this is
+# outside what I do".
+_SCOPE_REFUSAL_ANCHOR_RE = re.compile(
+    r"مختصه\s*بمساعدتك\s*في\s*خدمات\s*(?:ال)?مستشفي|"
+    r"مختص\s*بمساعدتك\s*في\s*خدمات\s*(?:ال)?مستشفي|"
+    r"only\s+help\s+(?:you\s+)?with\s+(?:the\s+)?hospital"
+)
+
+
+def _is_scope_refusal(reply_text: str, templates: dict) -> bool:
+    """Whether this reply is (or contains) the out-of-scope refusal."""
+
+    if not reply_text:
+        return False
+
+    if _SCOPE_REFUSAL_ANCHOR_RE.search(_norm_ar(reply_text)):
+        return True
+
+    block = _build_out_of_scope_block(templates)
+    return bool(block) and _normalize_for_compare(block) in _normalize_for_compare(reply_text)
 
 
 def _run_agent(state: AgentState, agent_name: str) -> dict:
@@ -3837,6 +3922,29 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
 
         if greeting and not _already_contains_greeting(response.content or "", greeting):
             reply_content = response.content or ""
+
+            # THE REFUSAL NEVER RIDES ALONG WITH THE GREETING.
+            #
+            # CONFIRMED REAL PRODUCTION FAILURE: a patient opened with
+            # "اهلا" and got the welcome message with the out-of-scope
+            # refusal stapled underneath - told they were off-topic by
+            # the first message the clinic ever sent them, for saying
+            # hello. The directive now says this in words too, but
+            # words are what failed; the greeting turn is a place where
+            # this can be settled in code, so it is.
+            #
+            # A greeting is in scope by definition. If the model
+            # produced nothing else of substance, the greeting alone IS
+            # the whole reply - which is exactly what it should have
+            # been.
+            if reply_content and _is_scope_refusal(reply_content, state.get("templates") or {}):
+                logger.warning(
+                    "agent[%s]: the scope refusal was attached to the opening greeting - "
+                    "dropped. A greeting is in scope. Original: %r",
+                    agent_name, reply_content,
+                )
+                reply_content = ""
+
             if reply_content and _is_redundant_closing_question_only(reply_content, greeting):
                 reply_content = ""
             combined = f"{greeting.strip()}\n\n{reply_content}".strip() if reply_content else greeting.strip()
