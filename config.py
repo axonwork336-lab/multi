@@ -375,7 +375,26 @@ PROGRESS_WEBHOOK_URL: str = os.getenv("PROGRESS_WEBHOOK_URL", "").strip()
 # told to wait. Most tool calls finish well inside this, so most turns
 # still produce exactly one message. Raise it if the interim line feels
 # too eager, lower it if patients are waiting in silence.
-PROGRESS_DELAY_SECONDS: float = float(os.getenv("PROGRESS_DELAY_SECONDS", "1.5"))
+# How long a tool phase must ALREADY have been running before the
+# patient is told to wait.
+#
+# RAISED FROM 1.5s. At 1.5s the timer fired on turns that were about to
+# finish anyway: the interim line and the real answer left the app
+# within a few tens of milliseconds of each other, and since they are
+# two separate deliveries through n8n, their ARRIVAL order is not
+# guaranteed. Confirmed in production - the "please wait" line showing
+# up underneath the answer it was supposed to precede, which reads as
+# though the assistant lost track of the conversation.
+#
+# Measured on the live medtown deployment, a turn that needs an interim
+# message at all runs 5-12s; the turns that were producing out-of-order
+# messages were finishing in 2-4s. 3.0s sits between the two, so slow
+# turns still get their line and quick ones stay silent.
+#
+# This is a latency-vs-noise trade-off, not a correctness fix: the
+# ordering guard in progress.py is what makes it safe. Raise it further
+# if the warning it logs still appears.
+PROGRESS_DELAY_SECONDS: float = float(os.getenv("PROGRESS_DELAY_SECONDS", "3.0"))
 
 # Kept short: this is a courtesy message, and its delivery must never
 # hold anything up.
