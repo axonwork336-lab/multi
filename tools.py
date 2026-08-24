@@ -1460,8 +1460,21 @@ def list_branches_for_specialty(
     # Which branch is each doctor at? The Doctors endpoint doesn't
     # reliably carry that, but DoctorSchedules does (branchId/branchName
     # per row) - and one call covers every doctor at once.
+    #
+    # `effective_date`/`include_future` for the same reason as every
+    # other schedule lookup in this file: without them, a doctor whose
+    # assignment to a branch has already LAPSED still counts as working
+    # there for the purposes of this specialty-wide branch listing.
+    specialty_effective_date = None
+    try:
+        timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+        specialty_effective_date = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+    except Exception:
+        logger.exception("list_branches_for_specialty: failed to compute today's date")
+
     schedule_result = api.get_doctor_schedule(
         base_url, doctor_ids=list(doctors_by_id.keys()), page_size=500,
+        effective_date=specialty_effective_date, include_future=True,
      language=conversation_language(state),)
 
     if not schedule_result["success"]:
@@ -3172,12 +3185,62 @@ def match_entity_for_booking(
         # doctor actually has a schedule, derived from their own
         # DoctorSchedules rows (same source used to display schedules),
         # rather than every clinic branch regardless of relevance.
-        schedule_result = api.get_doctor_schedule(base_url, doctor_ids=[session["doctor_id"]], language=conversation_language(state))
+        #
+        # `effective_date`/`include_future` ARE REQUIRED HERE.
+        #
+        # CONFIRMED REAL PRODUCTION FAILURE: this call used to omit both,
+        # so it returned EVERY row ever created for this doctor -
+        # including branches whose assignment had fully expired weeks
+        # earlier. A doctor whose only three schedule rows at فرع الشيخ
+        # زايد had all ended in May/July was still offered that branch
+        # as an option in August, then correctly found nothing bookable
+        # there and called it "fully booked" - which is not what was
+        # true. She does not work there any more; the assignment lapsed,
+        # it isn't merely full.
+        #
+        # `get_doctor_schedule_for_booking` (the schedule DISPLAY call)
+        # already passes these two and correctly excludes lapsed
+        # branches - confirmed directly, in the same production trace,
+        # where it saw only one still-valid branch while this call, right
+        # next to it, still offered two. Bringing this call in line with
+        # that one, rather than inventing a second mechanism.
+        today_iso = None
+        try:
+            timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+            today_iso = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+        except Exception:
+            logger.exception("match_entity_for_booking (branch, doctor-filtered): failed to compute today's date for effective_date filtering")
+
+        schedule_result = api.get_doctor_schedule(
+            base_url, doctor_ids=[session["doctor_id"]],
+            effective_date=today_iso, include_future=True,
+            language=conversation_language(state),
+        )
         if not schedule_result["success"]:
             logger.error("match_entity_for_booking (branch, doctor-filtered): get_doctor_schedule failed: status_code=%s error=%s", schedule_result.get("status_code"), schedule_result.get("error"))
             return {"matched": False, "ambiguous": False, "status": "error"}
 
         schedule_items = (schedule_result["data"] or {}).get("items", [])
+
+        # SAME DIAGNOSTIC AS get_doctor_schedule_for_booking, for direct
+        # comparison - both calls now use the same effective_date/
+        # include_future filtering, so their raw results should agree.
+        # If they don't, the difference between the two calls (not a
+        # guess) is what explains it.
+        logger.info(
+            "match_entity_for_booking (branch, doctor-filtered): doctor_id=%s effective_date=%s -> "
+            "api returned %d raw row(s): %s",
+            session["doctor_id"], today_iso, len(schedule_items),
+            [
+                {
+                    "branchId": it.get("branchId"), "branchName": it.get("branchName"),
+                    "recurringDaysNames": it.get("recurringDaysNames"),
+                    "fromDateTime": it.get("fromDateTime"), "toDateTime": it.get("toDateTime"),
+                }
+                for it in schedule_items
+            ],
+        )
+
         doctor_branch_ids = {s.get("branchId") for s in schedule_items if s.get("branchId")}
 
         if not doctor_branch_ids:
@@ -3656,7 +3719,24 @@ def resolve_available_day(
         # production frustration where the model kept asking "which
         # branch?" despite the schedule it had ALREADY shown uniquely
         # determining the answer from the day the user just named.
-        schedule_result = api.get_doctor_schedule(base_url, doctor_ids=[doctor_id], language=conversation_language(state))
+        #
+        # `effective_date`/`include_future` applied here for the same
+        # reason as every other schedule lookup in this file: without
+        # them, a branch whose assignment for this doctor has already
+        # LAPSED can still get auto-confirmed as "the" branch for a
+        # weekday, on the strength of a row that no longer applies.
+        disambiguation_effective_date = None
+        try:
+            disambiguation_timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+            disambiguation_effective_date = datetime.now(ZoneInfo(disambiguation_timezone_name)).date().isoformat()
+        except Exception:
+            logger.exception("resolve_available_day: failed to compute today's date for the branch-disambiguation lookup")
+
+        schedule_result = api.get_doctor_schedule(
+            base_url, doctor_ids=[doctor_id],
+            effective_date=disambiguation_effective_date, include_future=True,
+            language=conversation_language(state),
+        )
         if schedule_result["success"]:
             english_weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
             target_name_en = english_weekday_names[target_weekday]
@@ -3881,9 +3961,23 @@ def _doctor_works_weekday(state, base_url: str, doctor_id: str, branch_id: str,
     """
 
     try:
+        # `effective_date`/`include_future` for the same reason as every
+        # other schedule lookup here: without them, an assignment that
+        # LAPSED weeks ago still counts as "she works this day" and this
+        # would answer "fully_booked" (implying an active rota, just
+        # full) for a weekday she no longer works at all - "not_found"
+        # is the honest answer in that case.
+        today_iso = None
+        try:
+            timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+            today_iso = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+        except Exception:
+            logger.exception("_doctor_works_weekday: failed to compute today's date")
+
         result = api.get_doctor_schedule(
             base_url, doctor_ids=[doctor_id],
             branch_ids=[branch_id] if branch_id else None,
+            effective_date=today_iso, include_future=True,
             language=conversation_language(state),
         )
         if not result["success"]:
@@ -4261,7 +4355,24 @@ def list_available_days_for_booking(
         # Same auto-disambiguation resolve_available_day does: if this
         # doctor works at exactly one branch, there is no real choice to
         # make, so don't manufacture a question about it.
-        schedule_result = api.get_doctor_schedule(base_url, doctor_ids=[doctor_id], language=conversation_language(state))
+        #
+        # `effective_date`/`include_future` for the same reason as every
+        # other schedule lookup in this file: without them, a branch
+        # whose assignment has already LAPSED can still be the "only"
+        # branch found here and get auto-confirmed, when she does not
+        # currently work there at all.
+        auto_confirm_effective_date = None
+        try:
+            timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+            auto_confirm_effective_date = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+        except Exception:
+            logger.exception("list_available_days_for_booking: failed to compute today's date for branch auto-confirm")
+
+        schedule_result = api.get_doctor_schedule(
+            base_url, doctor_ids=[doctor_id],
+            effective_date=auto_confirm_effective_date, include_future=True,
+            language=conversation_language(state),
+        )
         if schedule_result["success"]:
             schedule_items = (schedule_result["data"] or {}).get("items", [])
             branch_ids = {s.get("branchId") for s in schedule_items if s.get("branchId")}
@@ -4804,6 +4915,36 @@ def get_doctor_schedule_for_booking(
         return {"status": "error"}
 
     items = (result["data"] or {}).get("items", [])
+
+    # DIAGNOSTIC - SETTLES WHETHER include_future ACTUALLY WORKS.
+    #
+    # CONFIRMED REAL PRODUCTION DISCREPANCY: a doctor's admin-panel
+    # schedule shows a genuine, currently-open Monday rota at a branch
+    # (Effective From a date weeks away), alongside a Thursday rota
+    # already in effect. Only the Thursday row showed up in this
+    # function's result; Monday never appeared, in a call made with
+    # `include_future=True` specifically so that it would.
+    #
+    # Either `include_future` isn't doing what `api.get_doctor_schedule`
+    # believes it does, or something between the API and here drops the
+    # row. This can only be settled by seeing the RAW response - which
+    # this line makes visible in the log, once per call, at INFO level
+    # (not a rare-condition WARNING, since the whole point is to see it
+    # on every request until the question is closed).
+    logger.info(
+        "get_doctor_schedule_for_booking: doctor_id=%s effective_date=%s include_future=%s -> "
+        "api returned %d raw row(s): %s",
+        doctor_id, effective_date, not target_date, len(items),
+        [
+            {
+                "branchId": it.get("branchId"), "branchName": it.get("branchName"),
+                "recurringDaysNames": it.get("recurringDaysNames"),
+                "fromDateTime": it.get("fromDateTime"), "toDateTime": it.get("toDateTime"),
+            }
+            for it in items
+        ],
+    )
+
     if not items:
         return {"status": "not_found"}
 
