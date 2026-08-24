@@ -2184,7 +2184,29 @@ def reschedule_appointment(
         )
         return {"status": "error"}
 
-    return {"status": "success"}
+    language = conversation_language(state)
+    timezone_name = (state.get("templates") or {}).get("_timezone")
+    local_new_from = to_riyadh(new_time_from, timezone_name)
+
+    # THE NEW TIME, READY TO DISPLAY.
+    #
+    # This used to return {"status": "success"} and nothing else, while
+    # the clinic's own success message asks for BOTH the new appointment
+    # and the old one it replaced. With no source for either, its
+    # placeholders were filled from whatever the model remembered - and
+    # confirmed in production, {old_date} and {old_time} reached a
+    # patient as literal text.
+    #
+    # The OLD values are deliberately NOT returned here: they come from
+    # the `lookup_appointment` record this flow is required to have
+    # fetched first, which is the authoritative copy of what was
+    # actually booked. See graph._build_terminal_success_directive.
+    return {
+        "status": "success",
+        "new_date_display": _display_date(local_new_from),
+        "new_time_display": _display_time_12h(local_new_from, language),
+        "new_weekday_display": _display_weekday(local_new_from, language),
+    }
 
 
 # ==========================================================
