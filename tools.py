@@ -2987,6 +2987,14 @@ def match_entity_for_booking(
            for numeric selection. Show THAT list, numbered - never
            re-show doctor names from before the branch was chosen,
            because not every doctor works at every branch.
+    {"matched": true, ..., "fullyBooked": true}
+        -> the branch is REAL and this doctor does work there, but has
+           no open slot in the booking window right now. Say exactly
+           that - "الفرع ده محجوز بالكامل حاليًا عند د. [name]" - and
+           offer the other branch, or a later date. NEVER say the
+           branch doesn't exist, and never act as though the patient
+           named something wrong: they named a branch you yourself
+           showed them.
     {"matched": true, ..., "doctorAlreadyConfirmed": true}
         -> the branch was confirmed while a DOCTOR was already
            confirmed earlier in this booking. There is no doctor list
@@ -3032,6 +3040,11 @@ def match_entity_for_booking(
 
     session_id = state.get("session_id")
     session = _get_booking_session(session_id)
+
+    # Set only on the doctor-filtered branch path below. None means
+    # "no availability check ran", which is NOT the same as "nothing
+    # is available" - see the fullyBooked flag near the end.
+    verified_branch_ids = None
 
     base_url = _doctors_base_url(state)
     if not base_url:
@@ -3143,18 +3156,33 @@ def match_entity_for_booking(
         # schedule assignment - with nothing actually bookable there
         # right now - is not offered as a choice. See
         # _branches_with_real_slots for why.
+        # MATCH FIRST, REPORT AVAILABILITY SECOND.
+        #
+        # This used to DROP branches with no open slot before matching,
+        # so a patient naming a branch that happened to be fully booked
+        # got "not_matched" - which the model faithfully reported as
+        # "ما لقيت فرع اسمه الدقي".
+        #
+        # CONFIRMED REAL PRODUCTION FAILURE: the assistant printed the
+        # doctor's schedule AT الدقي, the patient answered "الدقي", and
+        # was told no such branch exists. The branch was real, the
+        # doctor works there, and the only true statement was "it is
+        # fully booked" - the one thing the patient was never told.
+        #
+        # The branches stay in the candidate list so the NAME resolves.
+        # Whether anything is open there is reported separately, on the
+        # match, as `fully_booked`.
         verified_branch_ids = _branches_with_real_slots(
             state, base_url, session["doctor_id"], [b["id"] for b in candidate_branches if b.get("id")],
         )
         if verified_branch_ids is not None:
-            before = len(candidate_branches)
-            candidate_branches = [b for b in candidate_branches if b.get("id") in verified_branch_ids]
-            if len(candidate_branches) != before:
+            full = [b for b in candidate_branches if b.get("id") not in verified_branch_ids]
+            if full:
                 logger.info(
-                    "match_entity_for_booking (branch, doctor-filtered): dropped %d "
-                    "branch(es) with no real open slot for doctor_id=%s despite a "
-                    "general schedule assignment there",
-                    before - len(candidate_branches), session["doctor_id"],
+                    "match_entity_for_booking (branch, doctor-filtered): %d branch(es) are "
+                    "rostered for doctor_id=%s but fully booked - keeping them matchable and "
+                    "flagging them rather than denying they exist",
+                    len(full), session["doctor_id"],
                 )
 
         result = {"success": True, "data": {"items": candidate_branches}, "error": None}
@@ -3304,6 +3332,18 @@ def match_entity_for_booking(
         session[f"{entity_type}_display_name"] = _arabic_preferred_name(shaped)
 
     response = {"matched": True, "needsConfirmation": needs_confirmation, "item": shaped}
+
+    # The branch resolved, but has nothing open. Reported here so the
+    # reply can say "fully booked" - which is true, useful, and lets the
+    # patient ask about a later date - instead of the branch being
+    # dropped before matching and reported as not existing.
+    if (
+        entity_type == "branch"
+        and shaped.get("id")
+        and verified_branch_ids is not None
+        and shaped["id"] not in verified_branch_ids
+    ):
+        response["fullyBooked"] = True
 
     if entity_type == "branch" and not needs_confirmation and shaped.get("id"):
         if session.get("doctor_id"):
@@ -3669,17 +3709,27 @@ def resolve_available_day(
 
 
 def _branches_with_real_availability(state, base_url: str, doctor_id: str, branch_options: list) -> list:
-    """Keep only the branches where this doctor genuinely has something
-    bookable in the availability window.
+    """Mark each branch with whether the doctor actually has anything
+    bookable there. Returns the SAME branches, annotated - never fewer.
 
-    A schedule row means ROSTERED, not AVAILABLE - the roster can be
+    A schedule row means ROSTERED, not AVAILABLE: the roster can be
     full, or the schedule can have lapsed. Each candidate is therefore
-    checked with the same slot query the next step will run.
+    checked with the same slot query the next step will run, and the
+    ones with nothing open get `fully_booked: True`.
 
-    A branch whose check FAILS (transient API error) is kept, not
-    dropped: hiding a real branch because of a network blip is the worse
-    of the two mistakes, and the next step will surface the truth
-    anyway.
+    WHY ANNOTATE RATHER THAN DROP: an earlier version removed them
+    outright, which was wrong in two ways at once. The patient could see
+    from the doctor's own schedule that she works Thursdays at الدقي,
+    and the assistant then behaved as though that branch did not exist -
+    "ما لقيت فرع اسمه الدقي" - which is both false and impossible to
+    argue with. And it withholds the one fact that actually helps: the
+    branch is right, the doctor is right, the slots are simply taken.
+    A patient told "fully booked" can ask about a later date; a patient
+    told the branch doesn't exist can only give up.
+
+    A branch whose check FAILS (transient API error) is left unmarked -
+    unknown is not the same as full, and the next step surfaces the
+    truth anyway.
     """
 
     if len(branch_options) <= 1:
@@ -3696,11 +3746,9 @@ def _branches_with_real_availability(state, base_url: str, doctor_id: str, branc
     now_local = datetime.now(tz)
     window_end = now_local + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)
 
-    kept = []
     for option in branch_options:
         branch_id = option.get("id")
         if not branch_id:
-            kept.append(option)
             continue
 
         slots = _open_slots_on_day(
@@ -3711,20 +3759,18 @@ def _branches_with_real_availability(state, base_url: str, doctor_id: str, branc
         if slots is None:
             logger.info(
                 "_branches_with_real_availability: availability check failed for branch_id=%s - "
-                "keeping it rather than hiding a branch over a transient error",
+                "leaving it unmarked (unknown is not the same as full)",
                 branch_id,
             )
-            kept.append(option)
-        elif slots:
-            kept.append(option)
-        else:
+        elif not slots:
+            option["fully_booked"] = True
             logger.info(
-                "_branches_with_real_availability: dropping branch %r (%s) - doctor is rostered "
-                "there but has no open slots in the window",
+                "_branches_with_real_availability: branch %r (%s) is rostered but has no open "
+                "slots in the window - marking it fully booked",
                 option.get("name"), branch_id,
             )
 
-    return kept
+    return branch_options
 
 
 def _open_slots_on_day(state, base_url: str, doctor_id: str, branch_id: str,
@@ -3930,21 +3976,14 @@ def list_available_days_for_booking(
                         # escape by typing the branch name.
                         branch_options.append({"id": item_branch_id, "name": name})
 
-                # ONLY BRANCHES THAT ACTUALLY HAVE SOMETHING BOOKABLE.
+                # MARK WHICH ONES ARE ACTUALLY BOOKABLE.
                 #
                 # A schedule row means the doctor is ROSTERED at that
-                # branch. It says nothing about whether any slot there is
-                # still open - the roster can be full, or the schedule
-                # can have lapsed. Offering it anyway sends the patient
-                # to a branch with nothing available, which reads as the
-                # assistant inventing a branch. Confirmed in production
-                # and reported as exactly that.
-                #
-                # Each candidate is checked with the same availability
-                # query the next step will run, so what is offered is
-                # what can be booked. Typically 2-3 extra calls, made
-                # once, at the only point where the patient is being
-                # asked to choose.
+                # branch, not that anything is open there. Each candidate
+                # is checked with the same availability query the next
+                # step will run, and the full ones are FLAGGED - not
+                # removed. See _branches_with_real_availability for why
+                # removing them was worse than offering them.
                 branch_options = _branches_with_real_availability(
                     state, base_url, doctor_id, branch_options,
                 )
