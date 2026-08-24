@@ -1538,6 +1538,45 @@ def list_branches_for_specialty(
 
     _remember_list(state, "branch", branches)
 
+    # A SINGLE BRANCH IS NOT A CHOICE - AND ITS DOCTORS ARE THE REAL LIST.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: exactly this case. Only one
+    # branch came back, so the model skipped the pointless "which
+    # branch?" step and presented that branch's DOCTORS as a numbered
+    # list instead - "1️⃣ د. سارة عبد الله" - which is the right call to
+    # make. But nothing had EVER remembered that list under
+    # entity_type="doctor" - only the (single-item, never-shown) branch
+    # list was remembered - so when the patient answered "1", the tool
+    # correctly reported "no doctor list is remembered for this
+    # session", and the reply that followed had to deny understanding a
+    # number the patient was only ever given because it appeared in the
+    # bot's own message a turn earlier.
+    #
+    # The branch is auto-confirmed here too, for the same reason
+    # get_doctor_schedule_for_booking and list_available_days_for_booking
+    # already auto-confirm a doctor's one-and-only branch: there is no
+    # real decision left to make about it.
+    if len(branches) == 1:
+        only_branch = branches[0]
+        session_id = state.get("session_id")
+        if session_id and only_branch.get("id"):
+            session = _get_booking_session(session_id)
+            if not session.get("branch_id"):
+                session["branch_id"] = only_branch["id"]
+                session["branch_display_name"] = _arabic_preferred_name(only_branch) or only_branch.get("name")
+                logger.info(
+                    "list_branches_for_specialty: auto-confirmed the only branch_id=%s (%s)",
+                    only_branch["id"], session["branch_display_name"],
+                )
+
+        if only_branch.get("doctors"):
+            _remember_list(state, "doctor", only_branch["doctors"])
+            logger.info(
+                "list_branches_for_specialty: remembered %d doctor(s) at the only branch, "
+                "under entity_type=doctor, so a positional reply resolves",
+                len(only_branch["doctors"]),
+            )
+
     logger.info(
         "list_branches_for_specialty: specialty_ids=%s broadened=%s -> %d branch(es), %d doctor(s)",
         specialty_ids, broadened, len(branches), len(doctors),
