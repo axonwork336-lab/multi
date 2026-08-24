@@ -486,6 +486,7 @@ def get_doctor_schedule(
     page_size: int = 50,
     client_id: Optional[str] = None,
     language: Optional[str] = None,
+    include_future: bool = False,
 ) -> dict:
     """POST {base_url}/api/DoctorSchedules/GetList.
 
@@ -499,13 +500,19 @@ def get_doctor_schedule(
     only - used by the New Booking flow once a branch is confirmed
     (otherwise the schedule spans every branch the doctor works at).
 
-    `effective_date` (e.g. "2026-07-30"), when given, filters to ONLY
-    schedule rows that are actually effective/valid on that date - using
-    `fromDateTimeTo`=effective_date (the row's own validity START must be
-    on or before this date) and `toDateTimeFrom`=effective_date (the
-    row's own validity END must be on or after this date). Without this,
-    stale/expired or not-yet-started schedule rows for the doctor could
-    also be returned alongside the currently valid one."""
+    `effective_date` (e.g. "2026-07-30"), when given, excludes EXPIRED
+    schedule rows - the row's own validity END must be on or after this
+    date (`toDateTimeFrom`).
+
+    `include_future=False` (the default) ALSO requires the row to have
+    already started (`fromDateTimeTo`), i.e. it must be valid on exactly
+    that date. Correct when asking about one specific day.
+
+    `include_future=True` drops that second condition, so a rota the
+    clinic has published for a LATER period is returned too. Use it for
+    any general "when does this doctor work?" question - clinics publish
+    the next season's rota in advance so patients can book into it, and
+    hiding it makes the doctor look less available than they are."""
 
     url = f"{base_url}/api/DoctorSchedules/GetList"
     payload = {"pageNumber": 1, "pageSize": page_size, "doctorIds": doctor_ids}
@@ -514,8 +521,24 @@ def get_doctor_schedule(
         payload["branchIds"] = branch_ids
 
     if effective_date:
-        payload["fromDateTimeTo"] = effective_date
+        # `toDateTimeFrom` excludes EXPIRED rows: the schedule's validity
+        # must end on or after this date. That is the part worth
+        # filtering - a lapsed schedule is not bookable.
         payload["toDateTimeFrom"] = effective_date
+
+        # `fromDateTimeTo` would additionally require the schedule to
+        # have ALREADY STARTED, and that is only correct when asking
+        # about one specific date.
+        #
+        # For a general "when does this doctor work?" it is wrong: a
+        # clinic publishes next season's rota in advance precisely so
+        # patients can book into it. Confirmed in production - a doctor
+        # had Thursdays (valid until 01/09) and Mondays (valid from
+        # 01/10), and the Mondays were invisible, so the assistant
+        # reported the doctor works only Thursdays while the clinic had
+        # deliberately opened Monday bookings.
+        if not include_future:
+            payload["fromDateTimeTo"] = effective_date
 
     return _post_json(url, payload, client_id=client_id, language=language)
 
