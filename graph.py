@@ -2873,6 +2873,12 @@ def _apply_output_contract(
 
 _REPLY_VERIFIERS = (
     (
+        lambda reply, state, agent_name: _reply_offers_cancellation_without_lookup(reply, state),
+        lambda reply, state: _CANCELLATION_CORRECTION_DIRECTIVE,
+        "reply asked the patient to confirm cancelling an appointment, but no "
+        "appointment has ever been looked up in this conversation",
+    ),
+    (
         lambda reply, state, agent_name: _reply_invents_availability(reply, state),
         lambda reply, state: _AVAILABILITY_CORRECTION_DIRECTIVE,
         "reply stated an appointment date/time that NO availability tool returned "
@@ -3199,6 +3205,173 @@ def _build_branch_question_directive(messages: list, session_id: str, agent_name
     return _BRANCH_QUESTION_PHRASING_DIRECTIVE
 
 
+# ==========================================================
+# "Offered to cancel an appointment nothing looked up" verifier
+# ==========================================================
+#
+# CONFIRMED REAL PRODUCTION FAILURE, mid-BOOKING: the patient was shown
+# ten available slots, picked one ("٤"), and the reply came back
+#
+#     هذا هو موعدك الذي تبغى تلغيه؟
+#     الطبيب: طه مبروك / الفرع: الشيخ زايد / التاريخ: 29/08/2026
+#
+# - the CANCELLATION confirmation, during a booking, with no
+# cancellation tool called anywhere in the conversation. The patient was
+# one "نعم" away from confirming the cancellation of an appointment that
+# does not exist.
+#
+# `_reply_invents_availability` did not catch it: the date really did
+# appear in a tool result - the slots list they were choosing FROM - so
+# every date and time in the reply checked out. The fabrication was not
+# in the values, it was in what the message claimed to be.
+#
+# The rule is simple and has no false-positive surface: you cannot ask
+# someone to confirm cancelling an appointment you have never looked up.
+_CANCELLATION_FRAMING_RE = re.compile(
+    r"تلغيه|تلغيها|تلغي\s*(?:ال)?موعد|الغاء\s*(?:ال)?موعد|"
+    r"(?:ال)?موعد\s*(?:ال)?لي\s*تبي\s*تلغيه|"
+    r"cancel\s+(?:this|your|the)\s+appointment|"
+    r"appointment\s+(?:you|to)\s+(?:want\s+to\s+)?cancel"
+)
+
+_APPOINTMENT_LOOKUP_TOOLS = ("lookup_appointment", "check_booking_status")
+
+
+def _reply_offers_cancellation_without_lookup(reply_text: str, state: AgentState) -> bool:
+    """True when the reply frames something as an appointment the patient
+    is about to cancel, while no appointment has been looked up."""
+
+    if not reply_text:
+        return False
+
+    if not _CANCELLATION_FRAMING_RE.search(_norm_ar(reply_text)):
+        return False
+
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "name", None) in _APPOINTMENT_LOOKUP_TOOLS:
+            try:
+                data = json.loads(msg.content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and data.get("appointment"):
+                return False
+
+    return True
+
+
+_CANCELLATION_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU OFFERED TO CANCEL AN APPOINTMENT NOTHING LOOKED UP - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft asked the patient to confirm cancelling an "
+    "appointment. No appointment has been looked up in this "
+    "conversation - `lookup_appointment` and `check_booking_status` have "
+    "either never run or never returned one - so there is no "
+    "appointment to cancel and the details you listed are not a real "
+    "booking.\n\n"
+    "Read the conversation again and answer what they ACTUALLY asked. "
+    "If they picked a number from a list of available TIMES, they are "
+    "choosing a slot to BOOK - continue the booking with that slot. "
+    "Never turn a booking into a cancellation.\n\n"
+    "If the patient genuinely does want to cancel something, you must "
+    "first find the appointment with `lookup_appointment` and confirm "
+    "the details it returns - never details you assembled yourself.\n\n"
+    "Rewrite the reply now.\n\n"
+)
+
+
+def _build_out_of_scope_block(templates: dict) -> str:
+    """The clinic's scope refusal, as ONE fixed text.
+
+    Built from the client's own agent/clinic name so it is branded, and
+    identical every time so an off-topic question gets the same answer
+    for every patient - rather than the model improvising a different
+    polite deflection each turn.
+
+    A client can author their own via `msg_out_of_scope`.
+    """
+
+    authored = (templates or {}).get("msg_out_of_scope")
+    if authored and authored.strip():
+        return authored.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # The block is Arabic, so the ARABIC name fields come first. Using
+    # `_agent_name`/`_clinic_name` here put "أنا Latifa، المساعدة
+    # الافتراضية في Dar El Oyoun Hospitals" into an otherwise Arabic
+    # sentence - a Latin-script name mid-sentence in RTL text, in the
+    # one message that is supposed to be the clinic's most polished.
+    templates = templates or {}
+    agent_name = (
+        templates.get("_agent_name_ar")
+        or templates.get("_agent_name")
+        or "المساعدة الافتراضية"
+    )
+    clinic_name = (
+        templates.get("_clinic_name_ar")
+        or templates.get("_clinic_name")
+        or "المستشفى"
+    )
+
+    return (
+        f"عذرًا 🌷 أنا {agent_name}، المساعدة الافتراضية في {clinic_name}، "
+        "ومختصة بمساعدتك في خدمات المستشفى مثل حجز أو تعديل المواعيد، "
+        "إلغاء المواعيد، اختيار التخصص أو الطبيب المناسب، الاستفسار عن "
+        "خدمات المستشفى، تقديم شكوى، أو التواصل مع خدمة العملاء.\n"
+        "يسعدني مساعدتك في أي من هذه الخدمات 😊"
+    )
+
+
+def _build_scope_directive(templates: dict) -> str:
+    """Always present, deliberately short.
+
+    CONFIRMED REAL PRODUCTION FAILURE: asked "موسم الرياض خلص ولا لسه"
+    - a question about a public entertainment season, with no connection
+    to the hospital whatsoever - the assistant called
+    `list_hospital_services` (a tool that cannot answer it), then
+    ANSWERED it as fact ("موسم الرياض انتهى") and appended a service
+    list nobody asked for. Two failures at once: a tool called because
+    something had to be called, and a claim about the outside world
+    stated with confidence and no source.
+    """
+
+    block = _build_out_of_scope_block(templates)
+
+    return (
+        "============================================================\n"
+        "WHAT YOU ARE FOR - AND WHAT TO DO WITH EVERYTHING ELSE\n"
+        "============================================================\n"
+        "You handle this hospital's own services ONLY: booking, "
+        "changing and cancelling appointments; choosing the right "
+        "specialty or doctor; questions about the hospital's own "
+        "services, doctors, branches and hours; complaints; and "
+        "handing over to a human.\n\n"
+        "ANYTHING ELSE gets this EXACT text as your ENTIRE reply, "
+        "copied verbatim, with nothing added before or after it and no "
+        "question appended:\n\n"
+        "[BEGIN-EXACT-TEXT]\n"
+        f"{block}\n"
+        "[END-EXACT-TEXT]\n\n"
+        "\"Anything else\" means anything the hospital's own systems "
+        "cannot answer: news, public events, seasons and festivals, "
+        "sport, weather, prices of things the hospital does not sell, "
+        "religion, politics, other companies, general trivia, coding, "
+        "translation, or any other request that is not about this "
+        "hospital.\n\n"
+        "Do NOT call a tool for such a question. No tool here can answer "
+        "it, and calling one does not make an answer available - it just "
+        "spends the patient's time and produces an irrelevant result you "
+        "will then be tempted to build a reply around.\n\n"
+        "Do NOT answer it from your own knowledge, not even when you are "
+        "confident and not even in one word. You have no way to check "
+        "whether it is still true, and a confident aside about the "
+        "outside world is exactly what makes a patient trust the "
+        "medical parts of this conversation more than they should.\n\n"
+        "Do NOT mix the two: never answer the off-topic part AND then "
+        "add hospital information. Reply with the text above, and "
+        "nothing else.\n\n"
+    )
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -3316,6 +3489,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     branch_question_directive = _build_branch_question_directive(
         state["messages"], state.get("session_id"), agent_name,
     )
+    scope_directive = _build_scope_directive(state.get("templates") or {})
 
     # The scoped prompt for whoever owns this turn. Rebuilt per turn for
     # the same reason load_config rebuilds: a prompts.py/CSV edit must
@@ -3347,6 +3521,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + resolved_day_directive + entity_list_directive
         + abandoned_booking_directive + bare_entity_directive
         + doctor_branches_directive + branch_question_directive
+        + scope_directive
         + empty_branch_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
