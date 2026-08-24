@@ -5174,7 +5174,120 @@ def get_available_slots_for_booking(
     if len(slots) > MAX_SLOTS_TO_SHOW:
         slots = slots[:MAX_SLOTS_TO_SHOW]
 
+    # REMEMBERED, THE SAME WAY DOCTOR AND BRANCH LISTS ALREADY ARE.
+    #
+    # This was the one remaining numbered list in the whole booking flow
+    # left ENTIRELY to the model's own memory of the conversation - no
+    # code ever recorded which slot corresponded to which number. Doctor
+    # and branch picks had exactly this problem (passes 22-23: a
+    # patient's numbered answer resolved against the wrong stored order,
+    # or against nothing at all) before being fixed the same way.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE this enables fixing: a patient
+    # picked slot "2", was asked to confirm their WhatsApp number, said
+    # "yes" - and was then asked to give the appointment time again, as
+    # if the selection had never happened. It hadn't been recorded
+    # anywhere; it only ever existed as something the model had to recall
+    # across an intervening phone-confirmation turn, and that recall
+    # failed. See `select_appointment_slot` and
+    # graph._build_selected_slot_directive for the two halves of the fix.
+    _remember_list(state, "slot", slots)
+
     return {"status": "found", "slots": slots}
+
+
+@tool
+def select_appointment_slot(state: Annotated[AgentState, InjectedState], user_input: str) -> dict:
+    """For a NEW BOOKING: resolve the patient's reply to ONE exact slot
+    from the list `get_available_slots_for_booking` just showed, and
+    LOCK IT IN for this booking - CALL THIS instead of matching the
+    slot yourself from memory.
+
+    `user_input`: the patient's raw reply - a bare number ("2", "٢"),
+    or the exact time they typed back ("11:00", "11 الصبح").
+
+    WHY THIS EXISTS: doctor and branch picks are resolved this same way,
+    in code, against the exact list just shown - this was the one
+    remaining numbered list left entirely to your own memory of the
+    conversation. CONFIRMED REAL PRODUCTION FAILURE: a patient picked
+    slot "2", was asked to confirm their WhatsApp number, said "yes" -
+    and was then asked to give the time again, because nothing had
+    actually recorded which slot "2" was; it only existed as something
+    to recall several turns later, and that recall failed. Once this
+    tool resolves a slot, it is saved on the booking session and stays
+    there - you never need to re-derive it, including across the phone
+    number question, and a directive will remind you of the exact
+    values when it's time to call `create_new_booking`.
+
+    Returns:
+    {"status": "selected", "slot": {"slotStart", "slotEnd", "date_display",
+     "weekday_display", "time_display", "serviceName"}}
+        -> confirm it back in ONE short line and move on to STEP NB6 -
+           never re-ask for the time now that this succeeded.
+    {"status": "no_list_shown"}  # no slot list is remembered for this
+        session - call `get_available_slots_for_booking` first, never
+        guess a time.
+    {"status": "out_of_range", "list_size": N}  # a number outside the
+        list that was shown - tell them the valid range, don't guess.
+    {"status": "not_matched"}  # their reply matches no remembered slot
+        by position or by time - show the list again, or ask them to
+        pick from it, never invent a slot to fill the gap."""
+
+    session_id = state.get("session_id")
+    session = _get_booking_session(session_id)
+    last_list = session.get("last_list")
+
+    if not last_list or last_list.get("entity_type") != "slot":
+        logger.warning(
+            "select_appointment_slot: no slot list is remembered for session_id=%s",
+            session_id,
+        )
+        return {"status": "no_list_shown"}
+
+    slots = last_list.get("items") or []
+
+    position = _extract_selection_number(user_input)
+    if position is not None:
+        if not (1 <= position <= len(slots)):
+            logger.warning(
+                "select_appointment_slot: position %d out of range for %d remembered slot(s)",
+                position, len(slots),
+            )
+            return {"status": "out_of_range", "list_size": len(slots)}
+        chosen = slots[position - 1]
+    else:
+        # Not a number - try to match the exact time they typed against
+        # each remembered slot's own displayed time. Folded the same way
+        # every other Arabic comparison in this file is, so digit style
+        # and minor spacing differences don't cause a false miss.
+        folded_input = _normalize_arabic((user_input or "").strip())
+        chosen = None
+        for slot in slots:
+            folded_time = _normalize_arabic(str(slot.get("time_display") or ""))
+            if folded_time and (folded_time in folded_input or folded_input in folded_time):
+                chosen = slot
+                break
+
+        if chosen is None:
+            logger.info(
+                "select_appointment_slot: %r matched no remembered slot by position or time (session_id=%s)",
+                user_input, session_id,
+            )
+            return {"status": "not_matched"}
+
+    # LOCKED IN. This is the one place the rest of the booking flow reads
+    # the chosen time from - never the model's own recollection of the
+    # conversation. See graph._build_selected_slot_directive, which
+    # reinforces these exact values in the prompt for as long as this
+    # booking is in progress.
+    session["selected_slot"] = dict(chosen)
+
+    logger.info(
+        "select_appointment_slot: session_id=%s locked in slotStart=%s (%s %s)",
+        session_id, chosen.get("slotStart"), chosen.get("date_display"), chosen.get("time_display"),
+    )
+
+    return {"status": "selected", "slot": chosen}
 
 
 @tool
@@ -5670,6 +5783,7 @@ ALL_TOOLS = [
     create_new_booking,
     get_doctor_schedule_for_booking,
     get_available_slots_for_booking,
+    select_appointment_slot,
     find_best_doctor_in_specialty,
     send_complaint_email,
     request_human_handoff,
