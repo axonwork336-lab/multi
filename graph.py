@@ -488,6 +488,12 @@ _ENTITY_LIST_TOOLS = {
     "find_best_doctor_in_specialty": ("doctors", "الأطباء المتاحين"),
     "list_specialties": ("specialties", "التخصصات المتاحة"),
     "list_branches_for_specialty": ("branches", "الفروع المتاحة"),
+    # `list_available_days_for_booking` returns a BRANCH list when the
+    # branch isn't settled yet ("missing_branch"). That list is shown to
+    # the patient and answered by number, so it needs the same fixed
+    # shape as every other list - it was previously the only one the
+    # model formatted freehand.
+    "list_available_days_for_booking": ("branches", "الفروع اللي الدكتور متاح فيها"),
 }
 
 
@@ -513,6 +519,15 @@ def _entity_list_line(item: dict) -> str:
     count = item.get("doctorCount")
     if count:
         details.append(f"{count} طبيب")
+
+    # SAY IT, don't hide it. A branch the doctor is rostered at but has
+    # nothing open at is still a real answer to "which branches?" - and
+    # "fully booked" is the fact that actually helps, because it tells
+    # the patient the branch and doctor are right and only the timing is
+    # the problem. Omitting it made the assistant deny the branch
+    # existed at all.
+    if item.get("fully_booked"):
+        details.append("محجوز بالكامل حاليًا")
 
     if details:
         return f"{name} — {' · '.join(details)}"
@@ -544,7 +559,10 @@ def _build_entity_list_directive(messages: list) -> str:
     except (ValueError, TypeError):
         return ""
 
-    if data.get("status") != "found":
+    # "missing_branch" is a list result too: it means "I can't go on
+    # until you pick a branch, and here they are". Treated the same as
+    # "found" so that list gets the same fixed shape as every other.
+    if data.get("status") not in ("found", "missing_branch"):
         return ""
 
     items = data.get(items_key) or []
@@ -1284,6 +1302,7 @@ def _build_schedule_display_directive(messages: list) -> str:
     # days underneath it.
     by_branch: dict = {}
     branch_order = []
+    fully_booked_days: set = set()
     for s_row in schedules:
         branch = s_row.get("branchName") or ""
         if branch not in by_branch:
@@ -1293,11 +1312,42 @@ def _build_schedule_display_directive(messages: list) -> str:
         from_time = _arabic_time_12h(s_row.get("fromDateTime"))
         to_time = _arabic_time_12h(s_row.get("toDateTime"))
         service = (s_row.get("serviceName") or "").strip()
+        # A roster entry is not availability - see
+        # tools._mark_fully_booked_schedule_days.
+        #
+        # A day with nothing left is NOT LISTED. This block answers
+        # "when does this doctor work?", and the useful answer is the
+        # days they can actually book. Listing a full day next to the
+        # bookable ones invites them to pick it and be turned away a
+        # turn later; the earlier version that printed "محجوز بالكامل
+        # حاليًا" inline still put a dead end in front of them.
+        #
+        # The flag stays in the tool result, so if the patient asks
+        # about that specific day they get the real answer - see the
+        # instruction text below.
+        if s_row.get("fully_booked"):
+            fully_booked_days.add(
+                _ARABIC_DAY_NAMES.get((days[0] or "").strip().lower(), days[0]) if days else ""
+            )
+            continue
         for day in days:
             arabic_day = _ARABIC_DAY_NAMES.get((day or "").strip().lower(), day)
             entry = (arabic_day, from_time, to_time, service)
             if entry not in by_branch[branch]:
                 by_branch[branch].append(entry)
+
+    # Branches left with nothing bookable are dropped entirely, for the
+    # same reason.
+    for branch in list(by_branch):
+        if not by_branch[branch]:
+            del by_branch[branch]
+    branch_order = [b for b in branch_order if b in by_branch]
+
+    if not branch_order:
+        # Everything this doctor has is taken. There is no list to
+        # print, so the model composes - it still has the tool result,
+        # including which days are full.
+        return ""
 
     total_day_rows = sum(len(v) for v in by_branch.values())
 
@@ -1326,6 +1376,24 @@ def _build_schedule_display_directive(messages: list) -> str:
     block = "\n\n".join(branch_blocks)
 
     single_branch = len(branch_order) == 1
+
+    # Days that exist on the rota but have nothing left. They are NOT in
+    # the block above on purpose - the list should only contain days the
+    # patient can book. This note exists for the one case where the fact
+    # is useful: they ask about that specific day.
+    hidden_full_days = sorted(d for d in fully_booked_days if d)
+    if hidden_full_days:
+        full_days_note = (
+            "\nNOTE - NOT PART OF YOUR REPLY. These days are on this "
+            f"doctor's rota but have nothing left: {', '.join(hidden_full_days)}. "
+            "They are deliberately absent from the list above; do NOT add "
+            "them, do NOT mention them, and do NOT explain why they are "
+            "missing. Only if the patient ASKS about one of them "
+            "specifically, tell them plainly that it is fully booked at "
+            "the moment and offer the days that are listed.\n\n"
+        )
+    else:
+        full_days_note = ""
 
     if total_day_rows == 1:
         only_day = next(iter(by_branch.values()))[0][0]
@@ -1372,6 +1440,7 @@ def _build_schedule_display_directive(messages: list) -> str:
         "[BEGIN-EXACT-TEXT]\n"
         f"{block}\n"
         "[END-EXACT-TEXT]\n\n"
+        f"{full_days_note}"
     )
 
 
