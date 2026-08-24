@@ -2895,7 +2895,7 @@ def _fetch_doctors_for_booking(
 
 
 def _branches_with_real_slots(state: AgentState, base_url: str, doctor_id: str,
-                                branch_ids: list) -> Optional[set]:
+                                branch_ids: list, future_branch_ids: Optional[set] = None) -> Optional[set]:
     """Which of `branch_ids` genuinely have at least one open (non-booked)
     slot for `doctor_id` within the booking window.
 
@@ -2905,6 +2905,21 @@ def _branches_with_real_slots(state: AgentState, base_url: str, doctor_id: str,
     anything bookable there. A patient was shown a branch purely because
     a schedule ROW exists for that pairing, picked it, and only found
     out afterwards that she had nothing open there.
+
+    `future_branch_ids`: branches with a rota that has not STARTED yet
+    (effectiveFrom in the future). These are ALWAYS returned as having
+    slots, regardless of what the slot sweep finds.
+
+    WHY THIS MATTERS, CONFIRMED IN PRODUCTION: a doctor's only Thursday
+    rota at a branch had expired, and her Monday rota there (effective
+    a future date) genuinely had an open slot - but the branch was
+    reported "محجوز بالكامل حاليًا" anyway. Publishing a rota does not
+    guarantee the underlying booking system has already generated
+    bookable slots for it; the slot sweep below simply may not reach
+    that far yet. `_mark_fully_booked_schedule_days` (the day-level
+    schedule display) already carried this exemption - this branch-level
+    check did not, and the gap is exactly what produced the false
+    "fully booked".
 
     ONE QUERY PER BRANCH, ON PURPOSE.
     --------------------------------
@@ -2941,11 +2956,14 @@ def _branches_with_real_slots(state: AgentState, base_url: str, doctor_id: str,
     now = datetime.now(tz)
     window_end = now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)
 
-    have_slots = set()
+    have_slots = set(future_branch_ids or ())
     any_lookup_succeeded = False
 
     for branch_id in branch_ids:
-        if not branch_id:
+        if not branch_id or branch_id in have_slots:
+            # Already counted as available via future_branch_ids - no
+            # need to spend a call confirming what we've already decided
+            # not to doubt.
             continue
 
         slots = _open_slots_on_day(
@@ -2963,7 +2981,7 @@ def _branches_with_real_slots(state: AgentState, base_url: str, doctor_id: str,
         if slots:
             have_slots.add(branch_id)
 
-    if not any_lookup_succeeded:
+    if not any_lookup_succeeded and not future_branch_ids:
         logger.warning(
             "_branches_with_real_slots: every availability lookup failed for doctor_id=%s - "
             "reporting 'unknown' so nothing gets marked full on a transient error",
@@ -3197,8 +3215,34 @@ def match_entity_for_booking(
         # The branches stay in the candidate list so the NAME resolves.
         # Whether anything is open there is reported separately, on the
         # match, as `fully_booked`.
+        #
+        # A branch with a NOT-YET-STARTED rota is never counted as full
+        # here - see _branches_with_real_slots's `future_branch_ids`
+        # parameter for why: this is the second, and more damaging, of
+        # the two places that check needed this exemption. The day-level
+        # schedule display already had it; this branch-level check did
+        # not, and CONFIRMED REAL PRODUCTION FAILURE followed directly
+        # from the gap - a doctor whose only Thursday rota had expired
+        # and whose Monday rota (Effective From 2026-10-01) genuinely had
+        # an open slot was reported as "محجوز بالكامل حاليًا" at that
+        # branch, because the slot sweep simply hadn't reached that far
+        # yet. Publishing a rota does not guarantee the underlying
+        # booking system has generated bookable slots for it immediately
+        # - this project's own day-level check already accounted for
+        # that; this one now does too.
+        future_branch_ids = {
+            s.get("branchId")
+            for s in schedule_items
+            if s.get("branchId")
+            and (lambda d: d and d > date.today())(
+                _parse_iso_date(s.get("effectiveFrom") or s.get("fromDateTimeFrom"))
+            )
+        }
+
         verified_branch_ids = _branches_with_real_slots(
-            state, base_url, session["doctor_id"], [b["id"] for b in candidate_branches if b.get("id")],
+            state, base_url, session["doctor_id"],
+            [b["id"] for b in candidate_branches if b.get("id")],
+            future_branch_ids=future_branch_ids,
         )
         if verified_branch_ids is not None:
             full = [b for b in candidate_branches if b.get("id") not in verified_branch_ids]
@@ -3946,7 +3990,8 @@ def _parse_iso_date(value):
         return None
 
 
-def _branches_with_real_availability(state, base_url: str, doctor_id: str, branch_options: list) -> list:
+def _branches_with_real_availability(state, base_url: str, doctor_id: str, branch_options: list,
+                                     future_branch_ids: Optional[set] = None) -> list:
     """Mark each branch with whether the doctor actually has anything
     bookable there. Returns the SAME branches, annotated - never fewer.
 
@@ -3954,6 +3999,14 @@ def _branches_with_real_availability(state, base_url: str, doctor_id: str, branc
     full, or the schedule can have lapsed. Each candidate is therefore
     checked with the same slot query the next step will run, and the
     ones with nothing open get `fully_booked: True`.
+
+    `future_branch_ids`: branches with a rota that has not STARTED yet
+    (effectiveFrom in the future) are NEVER marked fully booked,
+    regardless of what the slot sweep finds - publishing a rota does not
+    guarantee the underlying system has already generated bookable slots
+    for it. See `_branches_with_real_slots` for the confirmed production
+    failure this prevents; this is the same exemption, for the sibling
+    function used by `list_available_days_for_booking`'s branch list.
 
     WHY ANNOTATE RATHER THAN DROP: an earlier version removed them
     outright, which was wrong in two ways at once. The patient could see
@@ -3983,10 +4036,16 @@ def _branches_with_real_availability(state, base_url: str, doctor_id: str, branc
 
     now_local = datetime.now(tz)
     window_end = now_local + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)
+    future_branch_ids = future_branch_ids or set()
 
     for option in branch_options:
         branch_id = option.get("id")
         if not branch_id:
+            continue
+
+        if branch_id in future_branch_ids:
+            # A not-yet-started rota exists here - never call this full,
+            # regardless of what the sweep below would have found.
             continue
 
         slots = _open_slots_on_day(
@@ -4193,9 +4252,23 @@ def list_available_days_for_booking(
                 if branches_result["success"]:
                     branches_lookup = {b.get("id"): b for b in (branches_result["data"] or {}).get("items", []) if b.get("id")}
                 seen = set()
+                future_branch_ids = set()
                 for item in (schedule_result["data"] or {}).get("items", []):
                     item_branch_id = item.get("branchId")
-                    if not item_branch_id or item_branch_id in seen:
+                    if not item_branch_id:
+                        continue
+
+                    # A branch can have MULTIPLE schedule rows (e.g. an
+                    # expiring Thursday and a future-starting Monday).
+                    # This has to be checked on EVERY row, not just the
+                    # first one seen per branch - otherwise a branch
+                    # whose only future rota appears on its second row
+                    # would never be exempted below.
+                    starts_on = _parse_iso_date(item.get("effectiveFrom") or item.get("fromDateTimeFrom"))
+                    if starts_on and starts_on > date.today():
+                        future_branch_ids.add(item_branch_id)
+
+                    if item_branch_id in seen:
                         continue
                     seen.add(item_branch_id)
                     match = branches_lookup.get(item_branch_id)
@@ -4224,6 +4297,7 @@ def list_available_days_for_booking(
                 # removing them was worse than offering them.
                 branch_options = _branches_with_real_availability(
                     state, base_url, doctor_id, branch_options,
+                    future_branch_ids=future_branch_ids,
                 )
         except Exception:
             logger.exception("list_available_days_for_booking: failed to build branch options for missing_branch")
