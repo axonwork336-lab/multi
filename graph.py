@@ -2966,9 +2966,33 @@ _BRANCH_QUESTION_OFFER_RE = re.compile(
 )
 
 
-def _reply_reoffers_doctor_roster_after_confirming_one(reply_text: str) -> bool:
+def _reply_reoffers_doctor_roster_after_confirming_one(reply_text: str, state: AgentState = None) -> bool:
+    """True when a reply both settles a doctor and re-offers the doctor
+    roster in the same breath.
+
+    GATED ON A DOCTOR ACTUALLY BEING SETTLED. This guard belongs to the
+    BOOKING flow, where a doctor is already chosen and the roster must
+    not be re-offered. It used to look at the reply text alone, which
+    made it fire on replies that have nothing to do with a booking.
+
+    CONFIRMED REAL FALSE POSITIVE: asked simply "ايه فروع المستشفي", the
+    reply listed the branches and mentioned in passing that some of them
+    "ما فيها دكاترة متاحين", ending with "تحب تعرف معلومات أكثر عن أي فرع
+    منهم؟". The roster pattern matched "دكاتره متاحين" and the branch
+    pattern matched "أي فرع" - two phrases that happen to co-occur in a
+    perfectly ordinary branch listing, with no doctor confirmed anywhere
+    in the conversation. The forced "correction" then rewrote a correct
+    reply into a WORSE one that silently dropped three real branches
+    from the list the patient had asked for.
+    """
+
     if not reply_text:
         return False
+
+    if state is not None:
+        session = tools._BOOKING_SESSIONS.get(state.get("session_id")) or {}
+        if not session.get("doctor_id"):
+            return False
 
     folded = _norm_ar(reply_text)
 
@@ -3264,7 +3288,7 @@ _REPLY_VERIFIERS = (
         "raised successfully in this conversation",
     ),
     (
-        lambda reply, state, agent_name: _reply_reoffers_doctor_roster_after_confirming_one(reply),
+        lambda reply, state, agent_name: _reply_reoffers_doctor_roster_after_confirming_one(reply, state),
         lambda reply, state: _DOCTOR_ROSTER_CORRECTION_DIRECTIVE,
         "reply confirmed a doctor then offered the doctor roster again in the same message",
     ),
@@ -3703,6 +3727,24 @@ def _build_branches_info_directive(messages: list) -> str:
         "you have\" question) - and do not ask the patient to first pick "
         "a specialty or a doctor before you'll show them the branches "
         "list; that information was never asked for.\n\n"
+        "SHOW EVERY BRANCH THE TOOL RETURNED, AND SAY NOTHING ABOUT "
+        "DOCTOR AVAILABILITY. They asked which branches exist - that is "
+        "a question about the hospital, not about who is bookable today. "
+        "So:\n"
+        "  - Never omit a branch because its `hasAvailableDoctors` is "
+        "false. A branch that exists is part of the honest answer.\n"
+        "  - Never add a line like \"أما فرع كذا فما فيه دكاترة "
+        "متاحين\". Nobody asked, it makes real branches sound broken, "
+        "and it drags a booking-flow concern into a plain info answer.\n"
+        "  - `hasAvailableDoctors` is there so you never OFFER TO BOOK "
+        "at an empty branch - it is not something to announce, and not a "
+        "filter for this list.\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: asked for the hospital's "
+        "branches, the reply listed three, then announced that المعادي, "
+        "مصر الجديدة and بني سويف have no doctors - and the final "
+        "message the patient actually received had those three branches "
+        "missing entirely. Six real branches were asked about; three "
+        "were shown.\n\n"
     )
 
 
