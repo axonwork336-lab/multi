@@ -3295,12 +3295,17 @@ def _build_abandoned_booking_directive(messages: list, session_id: str) -> str:
 # The bare words a patient uses to ANSWER "by specialty or by doctor?"
 # and "a particular branch, or shall I show you them?" - i.e. the word
 # itself, with no name attached.
+#
+# NOTE: "دكتور"/"doctor" is deliberately NOT in this regex any more - it
+# has its own, different handling below (_BARE_DOCTOR_ANSWER_RE), because
+# the product decision for that one path changed: ask for the specific
+# doctor's name first, rather than dumping the whole roster immediately.
+# "تخصص" and "فرع" are unaffected and still show their list right away.
 _BARE_ENTITY_ANSWER_RE = re.compile(
     r"^\s*(?:"
-    r"(?:ال)?(?:دكتور|دكتوره|دكتورة|دكاتره|دكاترة|طبيب|طبيبه|طبيبة|اطباء|أطباء)|"
     r"(?:ال)?(?:تخصص|تخصصات|قسم|اقسام|أقسام)|"
     r"(?:ال)?(?:فرع|فروع)|"
-    r"doctors?|specialt(?:y|ies)|departments?|branch(?:es)?"
+    r"specialt(?:y|ies)|departments?|branch(?:es)?"
     r")\s*[.!؟?،,]*\s*$",
     re.IGNORECASE,
 )
@@ -3309,29 +3314,163 @@ _BARE_ENTITY_ANSWER_DIRECTIVE = (
     "============================================================\n"
     "THEY ANSWERED WITH THE CATEGORY, NOT A NAME - SHOW THE LIST\n"
     "============================================================\n"
-    "The patient's reply is the bare WORD (\"دكتور\", \"تخصص\", \"فرع\", "
-    "\"doctor\", \"branch\") answering the choice you just offered them. "
-    "It is an ANSWER, not the name of anything.\n\n"
+    "The patient's reply is the bare WORD (\"تخصص\", \"فرع\", "
+    "\"specialty\", \"branch\") answering the choice you just offered "
+    "them. It is an ANSWER, not the name of anything.\n\n"
     "They are telling you which way they want to go, and asking you to "
     "show them the options. So SHOW THEM, this turn:\n"
-    "  - \"دكتور\"/\"doctor\"  -> call `find_available_doctors` (or "
-    "`match_entity_for_booking` in list mode) and show the numbered list "
-    "of doctors.\n"
     "  - \"تخصص\"/\"specialty\" -> call `list_specialties` and show the "
     "numbered list of specialties.\n"
     "  - \"فرع\"/\"branch\"    -> call `list_branches_for_specialty` and "
     "show the numbered list of branches.\n\n"
-    "Do NOT reply by asking for a name (\"اسم الدكتور إيه؟\", \"أي "
-    "تخصص؟\"). The patient does not know who works here or which "
-    "specialties exist - that is exactly why they asked you to show "
-    "them. Asking them to name one is asking for information only the "
-    "system has, and it wastes a turn.\n\n"
-    "Never fuzzy-match the bare word itself against a real doctor, "
-    "specialty or branch name. Confirmed real production failure: the "
-    "bare word \"فرع\" was matched to an actual branch the patient had "
-    "never named or seen, and the whole booking then ran against the "
-    "wrong one.\n\n"
+    "Do NOT reply by asking for a name (\"أي تخصص؟\"). The patient does "
+    "not know which specialties/branches exist - that is exactly why "
+    "they asked you to show them. Asking them to name one is asking for "
+    "information only the system has, and it wastes a turn.\n\n"
+    "Never fuzzy-match the bare word itself against a real specialty or "
+    "branch name. Confirmed real production failure: the bare word "
+    "\"فرع\" was matched to an actual branch the patient had never named "
+    "or seen, and the whole booking then ran against the wrong one.\n\n"
+    "(If instead the bare word was \"دكتور\"/\"doctor\", that is handled "
+    "separately - see the DOCTOR PATH directive.)\n\n"
 )
+
+
+# ==========================================================
+# "دكتور" answered bare -> ASK FOR THE NAME, don't list yet
+# ==========================================================
+#
+# Product decision: the patient choosing the DOCTOR PATH with the bare
+# word "دكتور"/"doctor" (no name attached) should be asked to type the
+# specific doctor's name FIRST, rather than immediately being shown the
+# entire roster. The full list is still available - but only once the
+# patient has said they don't have a particular doctor in mind, or asks
+# outright to see everyone. This keeps the roster from being dumped on
+# every patient who simply meant "let me pick by doctor, not by
+# specialty" and may well already know who they want.
+_BARE_DOCTOR_ANSWER_RE = re.compile(
+    r"^\s*(?:ال)?(?:دكتور|دكتوره|دكتورة|دكاتره|دكاترة|طبيب|طبيبه|طبيبة|"
+    r"اطباء|أطباء|doctors?)\s*[.!؟?،,]*\s*$",
+    re.IGNORECASE,
+)
+
+_BARE_DOCTOR_ANSWER_DIRECTIVE = (
+    "============================================================\n"
+    "THEY CHOSE THE DOCTOR PATH - ASK FOR THE NAME, DO NOT LIST YET\n"
+    "============================================================\n"
+    "The patient's reply is the bare word (\"دكتور\"/\"doctor\") "
+    "answering the specialty-vs-doctor choice you just offered them. It "
+    "means they want to pick BY DOCTOR - it does NOT mean \"show me "
+    "everyone\".\n\n"
+    "Ask exactly ONE question this turn, and do NOT call any doctor-list "
+    "tool yet:\n"
+    "    من فضلك اكتب اسم الدكتور اللي حابب تحجز معاه\n\n"
+    "  - If they then give a NAME -> treat it exactly like any other "
+    "named doctor: call `match_entity_for_booking` and continue the "
+    "normal flow from STEP NB2.\n"
+    "  - If they say they don't know one, or ask you to just show "
+    "everyone (\"معرفش\", \"مش عارف\", \"ما اعرف\", \"اعرض كل "
+    "الدكاتره\", \"ورينى الكل\", \"I don't know\", \"show me all\") -> "
+    "THAT is the moment to call `find_available_doctors` (or "
+    "`match_entity_for_booking` in list mode) and show the full "
+    "numbered roster - never before it.\n\n"
+    "Do not show the doctor list on this turn just because the bare "
+    "word \"دكتور\" was said - that only tells you WHICH PATH they "
+    "chose, not that they want the whole roster dumped on them.\n\n"
+)
+
+
+def _build_bare_doctor_answer_directive(messages: list) -> str:
+    """Fires when the patient's latest message is just the bare word
+    ("دكتور"/"doctor"), answering a specialty-vs-doctor choice the
+    assistant just offered - see _BARE_DOCTOR_ANSWER_DIRECTIVE for the
+    ask-for-a-name flow this should trigger instead of listing
+    immediately."""
+
+    if not messages:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _BARE_DOCTOR_ANSWER_RE.match(text.strip()):
+        return ""
+
+    return _BARE_DOCTOR_ANSWER_DIRECTIVE
+
+
+# The follow-up turn: the assistant just asked "من فضلك اكتب اسم
+# الدكتور اللي حابب تحجز معاه" (or an equivalent), and the patient's
+# reply says they don't know one / wants to see everyone instead of
+# naming one.
+_DONT_KNOW_DOCTOR_NAME_RE = re.compile(
+    r"معرفش|مش\s*عارف|مش\s*عارفه|ما\s*اعرف|لا\s*اعرف|مش\s*عارفة|"
+    r"اعرض\s*(?:كل|جميع)?\s*(?:ال)?دكاتره|"
+    r"ورين[ىي]\s*(?:كل|جميع)?\s*(?:ال)?دكاتره|"
+    r"كل\s*(?:ال)?دكاتره\s*المتاح|وريني\s*الكل|اعرض\s*الكل|"
+    r"don'?t\s*know|show\s*(?:me\s*)?all|show\s*(?:me\s*)?every"
+)
+
+# Matches the exact question _BARE_DOCTOR_ANSWER_DIRECTIVE tells the
+# model to ask, loosely enough to survive minor rewording.
+_ASKED_FOR_DOCTOR_NAME_RE = re.compile(r"اسم\s*(?:ال)?دكتور[^\n]{0,40}تحجز")
+
+_SHOW_ALL_DOCTORS_AFTER_ASK_DIRECTIVE = (
+    "============================================================\n"
+    "THEY DON'T KNOW A DOCTOR'S NAME - SHOW THE FULL LIST NOW\n"
+    "============================================================\n"
+    "You just asked the patient to name a specific doctor, and their "
+    "reply says they don't know one / asks you to just show everyone. "
+    "This IS the moment to show the full roster: call "
+    "`find_available_doctors` (or `match_entity_for_booking` in list "
+    "mode) and present the numbered list of every currently available "
+    "doctor. Do not ask them to try naming one again - they already "
+    "told you they can't, and repeating the same question is a dead "
+    "end for them.\n\n"
+)
+
+
+def _build_show_all_doctors_after_ask_directive(messages: list) -> str:
+    """Fires the turn right after the assistant asked the patient to
+    name a specific doctor (per _BARE_DOCTOR_ANSWER_DIRECTIVE), when the
+    patient's reply says they don't know one / asks to see everyone
+    instead of naming one."""
+
+    history = list(messages or [])
+    if len(history) < 2:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage, AIMessage as _AIMessage
+
+    last = history[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+    if not _DONT_KNOW_DOCTOR_NAME_RE.search(_norm_ar(text)):
+        return ""
+
+    previous_ai = None
+    for msg in reversed(history[:-1]):
+        if isinstance(msg, _AIMessage):
+            previous_ai = msg
+            break
+    if previous_ai is None:
+        return ""
+
+    previous_content = getattr(previous_ai, "content", "")
+    previous_text = previous_content if isinstance(previous_content, str) else str(previous_content)
+    if not _ASKED_FOR_DOCTOR_NAME_RE.search(_norm_ar(previous_text)):
+        return ""
+
+    return _SHOW_ALL_DOCTORS_AFTER_ASK_DIRECTIVE
 
 
 def _build_bare_entity_answer_directive(messages: list) -> str:
@@ -3420,22 +3559,58 @@ def _build_doctor_branches_directive(messages: list, session_id: str) -> str:
 
 _BRANCH_QUESTION_PHRASING_DIRECTIVE = (
     "============================================================\n"
-    "THE BRANCH QUESTION - EXACT PHRASING\n"
+    "DOCTOR CONFIRMED, NO BRANCH YET - SHOW THE SCHEDULE, DON'T ASK\n"
     "============================================================\n"
-    "A doctor is settled for this booking. The next thing you do not "
-    "know is the BRANCH, so that is the one question this turn.\n\n"
-    "Ask it in this shape, with the doctor's real name in place of "
-    "[اسم الدكتور]:\n"
-    "    تحب تحجز في فرع معيّن، ولا أعرض لك كل الفروع اللي "
-    "د. [اسم الدكتور] متاح فيهم؟\n\n"
-    "The alternative you offer is THAT DOCTOR'S BRANCHES. Never offer "
-    "\"كل الدكاترة المتاحين\" or any doctor list here - the doctor "
-    "question is answered, and re-offering the roster invites them to "
-    "undo a choice they just made. Confirmed in production five separate "
-    "times.\n\n"
-    "If they then ask to see the branches, call "
-    "`get_doctor_schedule_for_booking` - that returns this doctor's own "
-    "branches with the days and hours at each.\n\n"
+    "A doctor is settled for this booking and no branch is confirmed "
+    "yet. Do NOT ask a branch question here (e.g. \"تحب تحجز في فرع "
+    "معيّن، ولا أعرض لك كل الفروع اللي د. [اسم الدكتور] متاح فيهم؟\") - "
+    "that just spends a turn asking when the real answer (this doctor's "
+    "actual branches, days, and hours) is one tool call away. Never "
+    "offer \"كل الدكاترة المتاحين\" or any doctor list here either - the "
+    "doctor question is already settled.\n\n"
+    "Call `get_doctor_schedule_for_booking` NOW, with no question asked "
+    "first, and show its result grouped by branch - one line per "
+    "weekday/hours per branch, using only the real names/days/hours the "
+    "tool returned, e.g.:\n\n"
+    "    مواعيد الدكتور [اسم الدكتور] في فرع [اسم الفرع الأول]:\n"
+    "    • [اليوم]: من [من الساعة] لـ [إلى الساعة] — [اسم الخدمة]\n\n"
+    "    وفي فرع [اسم الفرع الثاني]:\n"
+    "    • [اليوم]: من [من الساعة] لـ [إلى الساعة] — [اسم الخدمة]\n\n"
+    "    حابب تحجز في أنهي فرع وأنهي يوم؟\n\n"
+    "If the tool result has only ONE branch, there is still no ASKING "
+    "to do (since there's nothing to choose between) - but you must "
+    "still SHOW the schedule message exactly as above, e.g.:\n\n"
+    "    مواعيد الدكتور محمد زايد في فرع عيادات سكاي التخصصية:\n"
+    "    • الاثنين: من 2:40 مساءً لـ 5:40 مساءً — جلسة تحليل سلوك تطبيقي\n\n"
+    "`get_doctor_schedule_for_booking` already auto-confirms the single "
+    "branch into the session for you, so do NOT ask \"which branch?\" - "
+    "but the patient should still see where and when this doctor works "
+    "before you move to the day/time question. Never skip straight from "
+    "\"doctor confirmed\" to asking about a day, or to "
+    "`list_available_days_for_booking`, without first showing this "
+    "schedule line - even when there was only ever one branch to show.\n\n"
+    "AUTO-RESOLVING A PARTIAL ANSWER - only when the schedule you JUST "
+    "showed makes it unambiguous:\n"
+    "  - They name ONLY a day, and that day appears at exactly ONE of "
+    "the branches you showed -> treat that branch as chosen "
+    "automatically. Do not ask them to also name it.\n"
+    "  - They name ONLY a branch, and that branch has exactly ONE day "
+    "in the schedule you showed -> treat that day as chosen "
+    "automatically the same way.\n"
+    "  - In every OTHER case - including whenever you are not fully "
+    "certain the combination they named genuinely matches a row in the "
+    "schedule you just displayed - do not guess: confirm the branch "
+    "with `match_entity_for_booking` (entity_type=\"branch\") and "
+    "validate the day with `resolve_available_day`. A branch/day "
+    "combination is never assumed valid just because each half looked "
+    "plausible on its own; it must be confirmed by a real tool result.\n\n"
+    "Only once a branch AND a day are genuinely confirmed - by the "
+    "schedule's own unambiguous shape, or by these tools - do you move "
+    "on to show the real nearest available appointment (STEP NB3/NB4) "
+    "and ask whether it suits them. Never state or imply a 'nearest "
+    "appointment' yourself; that fact only ever comes from "
+    "`resolve_available_day` / `list_available_days_for_booking`'s "
+    "actual result, never from your own reasoning about the schedule.\n\n"
 )
 
 
@@ -3462,8 +3637,11 @@ def _doctor_is_settled(messages: list, session_id: str) -> bool:
 
 def _build_branch_question_directive(messages: list, session_id: str, agent_name: str) -> str:
     """Fires in the booking flow once a doctor is settled and no branch
-    is confirmed yet - the exact point at which the branch question gets
-    asked, and the point at which it has repeatedly been asked wrong."""
+    is confirmed yet - the exact point where a branch QUESTION used to
+    be asked. Now instructs showing the doctor's real schedule (every
+    branch, day, and hour) immediately instead of asking, per the
+    product decision to remove that extra turn - see
+    _BRANCH_QUESTION_PHRASING_DIRECTIVE."""
 
     if agent_name not in ("booking", "concierge") or not session_id:
         return ""
@@ -4237,6 +4415,8 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
             )
 
     bare_entity_directive = _build_bare_entity_answer_directive(state["messages"])
+    bare_doctor_directive = _build_bare_doctor_answer_directive(state["messages"])
+    show_all_doctors_directive = _build_show_all_doctors_after_ask_directive(state["messages"])
     doctor_branches_directive = _build_doctor_branches_directive(
         state["messages"], state.get("session_id"),
     )
@@ -4276,6 +4456,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + slots_directive + available_days_directive
         + resolved_day_directive + entity_list_directive
         + abandoned_booking_directive + bare_entity_directive
+        + bare_doctor_directive + show_all_doctors_directive
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
         + empty_branch_directive + empty_day_directive
