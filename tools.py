@@ -1327,6 +1327,78 @@ def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list
     return doctors
 
 
+def _branch_ids_with_available_doctors(
+    state: AgentState, base_url: str, specialty_ids: Optional[list] = None,
+    days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
+) -> Optional[set]:
+    """Which branch ids CURRENTLY have at least one bookable, scheduled
+    doctor - narrowed to `specialty_ids` when given (the specialty this
+    booking is already about), clinic-wide otherwise.
+
+    Exists so a branch that is real in the system but currently has
+    nobody staffed there (e.g. a "فرع المعادي" with zero doctors) is
+    never offered as a fuzzy-match suggestion or silently confirmed as
+    if it were a real option. Uses the exact same
+    intersection_start/intersection_end availability window as every
+    other doctor lookup in this file, via `get_doctors` + the doctor
+    schedule endpoint's per-row `branchId` (the Doctors endpoint itself
+    doesn't reliably carry which branch each doctor is at - see
+    `list_branches_for_specialty` for the same pattern).
+
+    Returns None on an API failure (caller should then skip filtering
+    rather than hiding every branch on a transient error), or a
+    (possibly empty) set of branch ids on success."""
+
+    now = datetime.utcnow()
+    intersection_start = now.isoformat() + "Z"
+    intersection_end = (now + timedelta(days=days_ahead)).isoformat() + "Z"
+
+    doctors_result = api.get_doctors(
+        base_url,
+        specialty_ids=specialty_ids or None,
+        has_published_service=True,
+        has_service_schedule=True,
+        intersection_start=intersection_start,
+        intersection_end=intersection_end,
+        language=conversation_language(state),
+    )
+
+    if not doctors_result["success"]:
+        logger.warning(
+            "_branch_ids_with_available_doctors: get_doctors failed - status_code=%s error=%s",
+            doctors_result.get("status_code"), doctors_result.get("error"),
+        )
+        return None
+
+    doctor_items = [i for i in (doctors_result["data"] or {}).get("items", []) if i.get("hasSlots") is not False]
+    doctor_ids = [i.get("id") for i in doctor_items if i.get("id")]
+
+    if not doctor_ids:
+        return set()
+
+    effective_date = None
+    try:
+        timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+        effective_date = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+    except Exception:
+        logger.exception("_branch_ids_with_available_doctors: failed to compute today's date")
+
+    schedule_result = api.get_doctor_schedule(
+        base_url, doctor_ids=doctor_ids, page_size=500,
+        effective_date=effective_date, include_future=True,
+        language=conversation_language(state),
+    )
+
+    if not schedule_result["success"]:
+        logger.warning(
+            "_branch_ids_with_available_doctors: get_doctor_schedule failed - status_code=%s error=%s",
+            schedule_result.get("status_code"), schedule_result.get("error"),
+        )
+        return None
+
+    return {row.get("branchId") for row in (schedule_result["data"] or {}).get("items", []) if row.get("branchId")}
+
+
 def _resolve_branch_by_name(base_url: str, branch_name: str, language: str = "ar", state=None) -> Optional[dict]:
     """Fuzzy-match the user's raw branch text against the clinic's real
     branch list. Returns the raw branch row, or None if nothing matched
@@ -1351,6 +1423,36 @@ def _resolve_branch_by_name(base_url: str, branch_name: str, language: str = "ar
     branch_items = (branches_result["data"] or {}).get("items", [])
     if state is not None:
         branch_items = _with_branch_aliases(branch_items, state)
+
+        # Narrow the candidate pool to branches that ACTUALLY have a
+        # bookable doctor right now, before fuzzy-matching against it.
+        # CONFIRMED REAL PRODUCTION FAILURE: the raw text "فرع المنار"
+        # (not a real branch name) fuzzy-matched to "فرع المعادي" - a
+        # real branch that currently has zero doctors in the specialty
+        # being booked - and the patient was walked into a dead end
+        # instead of being shown a branch that actually has someone.
+        #
+        # Falls back to the UNFILTERED list whenever the filter itself
+        # can't be trusted: an API failure (`None`), or a filter that
+        # would leave zero candidates (better to fuzzy-match against the
+        # real names and let the normal "not_found_in_branch" handling
+        # further downstream explain the branch has nobody, than to
+        # silently refuse to match a real branch name at all).
+        session = _get_booking_session(state.get("session_id"))
+        specialty_ids = session.get("specialty_ids") or None
+        active_branch_ids = _branch_ids_with_available_doctors(state, base_url, specialty_ids)
+
+        if active_branch_ids:
+            narrowed = [b for b in branch_items if b.get("id") in active_branch_ids]
+            if narrowed:
+                branch_items = narrowed
+            else:
+                logger.info(
+                    "_resolve_branch_by_name: no currently-staffed branch to narrow to for "
+                    "specialty_ids=%s - falling back to the unfiltered branch list",
+                    specialty_ids,
+                )
+
     match_result = _fuzzy_match(branch_name, branch_items, ["name", "altName", "formatedName", "cityName", "_configAliases"])
 
     if match_result["result"] == "matched":
@@ -3359,7 +3461,32 @@ def match_entity_for_booking(
         result = {"success": True, "data": {"items": candidate_branches}, "error": None}
         name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
     else:
-        result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
+        # NO doctor confirmed yet - the same "which real branch did they
+        # mean" narrowing as `_resolve_branch_by_name` applies here too,
+        # for the identical reason: a branch that exists in the system
+        # but currently has zero available doctors (e.g. "فرع المعادي")
+        # must never be offered as a match or a "did you mean" suggestion
+        # just because its name is a close string match. Narrow to
+        # branches with a currently-available doctor (in this booking's
+        # specialty, when known) BEFORE fuzzy-matching against it.
+        all_result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
+        result = all_result
+        if all_result["success"]:
+            all_items = (all_result["data"] or {}).get("items", [])
+            active_branch_ids = _branch_ids_with_available_doctors(
+                state, base_url, session.get("specialty_ids") or None,
+            )
+            if active_branch_ids:
+                narrowed_items = [b for b in all_items if b.get("id") in active_branch_ids]
+                if narrowed_items:
+                    result = {"success": True, "data": {"items": narrowed_items}, "error": None}
+                else:
+                    logger.info(
+                        "match_entity_for_booking (branch, no doctor yet): no currently-staffed "
+                        "branch to narrow to for specialty_ids=%s - falling back to the "
+                        "unfiltered branch list",
+                        session.get("specialty_ids"),
+                    )
         name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
 
     if not result["success"]:
