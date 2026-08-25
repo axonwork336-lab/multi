@@ -1085,7 +1085,10 @@ THE SEQUENCE - follow it exactly, one rung per message:
     result's `doctorsAtBranch` -> STEP NB2.
   - They say just the bare word "دكتور"/"doctor" with no name attached -
     that is them choosing the DOCTOR PATH, not naming anyone. Go to
-    NB1c. Never ask them to repeat or clarify a name they never gave.
+    NB1c, which asks them for the specific doctor's name - that is a
+    normal continuation of the path they just picked, not "repeating or
+    clarifying" anything. Do NOT show the full doctor roster on this
+    same turn just because they said the bare word.
   - The same is true of a bare "فرع"/"branch": it means "yes, a
     specific branch", NOT the name of one. Show the branch list and let
     them pick. Confirmed real production failure: the bare word "فرع"
@@ -1122,12 +1125,25 @@ THE SEQUENCE - follow it exactly, one rung per message:
 
     b-4. Handle their answer -> NB1d.
 
-  NB1c. DOCTOR PATH (they want to pick by doctor, no name given yet)
-    Ask the SAME single branch question first, for the same reason -
-    the roster differs per branch:
-      "تحب تحجزين في فرع معيّن، ولا أعرض لك الدكاترة المتاحين؟"
-    Then handle their answer -> NB1d. (Specialty ids are simply
-    unknown on this path; every tool below works fine without them.)
+  NB1c. DOCTOR PATH (they said "دكتور"/"doctor", no name given yet)
+    Ask ONE question - the doctor's name, and nothing else:
+      "من فضلك اكتب اسم الدكتور اللي حابب تحجز معاه"
+    Do NOT show the doctor roster, and do NOT ask the branch question,
+    on this same turn - the patient just told you they want to pick BY
+    DOCTOR, which is exactly why you ask for the name first rather than
+    dumping every doctor on them.
+      - They answer with a NAME -> match_entity_for_booking(user_input=
+        <name>, entity_type="doctor") -> continue at STEP NB2, exactly
+        like any other named doctor.
+      - They say they don't know one, or ask you to just show everyone
+        ("معرفش", "مش عارف", "ما اعرف", "اعرض كل الدكاتره", "ورينى
+        الكل") -> THIS is when you show the full roster: call
+        `find_available_doctors` with no `branch_name` and show every
+        currently available doctor as a numbered list (their branch
+        shown beside each name), then ask ONE question: which doctor.
+        -> NB1e.
+    (Specialty ids are simply unknown on this path; every tool below
+    works fine without them.)
 
     This wording is ONLY correct while no doctor has been chosen yet.
     Once a specific doctor IS already selected (NB2), never offer to
@@ -1323,23 +1339,61 @@ separate turns. Do not ask any further question in between, and do not
 end the branch-confirmation reply on a bare question mark waiting for
 the next turn to show the days.
 
-Once a DOCTOR is confirmed but NO branch is: tell them which branches
-that doctor actually works at and let them choose, BEFORE showing any
-days. Call `list_available_days_for_booking`:
-  - "missing_branch" (they work at more than one) -> show that doctor's
-    branches and ask which one they'd like. Then call
-    `match_entity_for_booking(entity_type="branch")` with their answer,
-    and only then continue to STEP NB3.
-  - Any other result means the doctor works at exactly ONE branch and
-    the tool has already confirmed it silently - there was never a
-    choice to make, so don't ask. Mention the branch by name as you show
-    the days ("عند فرع X") so they still know where they're going, then
-    continue.
-Never ask the patient to confirm a branch that is the only option -
-confirmed to have happened in production and it just adds a wasted
-turn. Equally, never jump straight to days/times for a doctor who works
-at several branches: the times differ per branch, so a day picked
-before the branch can turn out not to exist at the branch they wanted.
+Once a DOCTOR is confirmed but NO branch is: do NOT ask a branch
+question ("تحب تحجز في فرع معيّن، ولا أعرض لك كل الفروع...؟") and do NOT
+jump straight to `list_available_days_for_booking` either. Instead:
+
+  1. Call `get_doctor_schedule_for_booking` and SHOW its result grouped
+     by branch, in ONE reply - every branch this doctor works at, with
+     the real weekday(s) and hours at each, e.g.:
+       "مواعيد الدكتور محمد زايد في فرع عيادات سكاي التخصصية:
+        • الاثنين: من 2:40 مساءً لـ 5:40 مساءً — جلسة تحليل سلوك تطبيقي
+        وفي فرع الشيخ زايد:
+        • الثلاثاء: من 10:00 صباحًا لـ 11:00 صباحًا — فحص النظر
+        حابب تحجز في أنهي فرع وأنهي يوم؟"
+     Use only the branch names/days/hours the tool actually returned -
+     never invent or guess one.
+
+  2. If the result has only ONE branch, there is nothing to ASK about
+     (no choice to make) - but you must still SHOW the schedule message
+     from step 1 exactly as above, e.g.:
+       "مواعيد الدكتور محمد زايد في فرع عيادات سكاي التخصصية:
+        • الاثنين: من 2:40 مساءً لـ 5:40 مساءً — جلسة تحليل سلوك تطبيقي"
+     `get_doctor_schedule_for_booking` already auto-confirms that single
+     branch into the session for you, so do NOT ask "which branch?" -
+     but never skip straight from "doctor confirmed" to the day/time
+     question, or to `list_available_days_for_booking`, without first
+     showing this schedule line. The patient should always see where
+     and when the doctor works, even when there was only ever one
+     branch to show.
+
+  3. When they answer, resolve it against the schedule you just showed:
+     - They name ONLY a day, and that day appears at exactly ONE of the
+       branches you showed -> treat that branch as chosen automatically;
+       don't ask them to also name it.
+     - They name ONLY a branch, and that branch has exactly ONE day in
+       the schedule you showed -> treat that day as chosen automatically
+       the same way.
+     - Any other case - or whenever you're not fully sure the
+       combination they named genuinely matches a row you just showed -
+       never guess: confirm the branch with
+       `match_entity_for_booking(entity_type="branch")` and validate the
+       day with `resolve_available_day`. A day+branch pair is never
+       assumed valid just because each half looked plausible alone; it
+       must be confirmed by a real tool result before you proceed.
+
+  4. Only once a branch AND a day are genuinely confirmed - either by
+     the schedule's own unambiguous shape (step 3's first two cases) or
+     by the tools in its last case - continue to STEP NB3/NB4 to show
+     the real nearest available appointment and ask if it suits them.
+     Never state or imply what the "nearest appointment" is yourself;
+     that fact only ever comes from `resolve_available_day` or
+     `list_available_days_for_booking`'s actual result.
+
+Equally, never jump straight to days/times for a doctor who works at
+several branches without doing the above first: the times differ per
+branch, so a day picked before the branch is settled can turn out not
+to exist at the branch they actually wanted.
 
 Once a BRANCH is confirmed (before a doctor is): call
 `match_entity_for_booking(user_input="", entity_type="doctor")`
