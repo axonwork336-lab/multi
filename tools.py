@@ -1221,10 +1221,35 @@ def _doctors_with_real_slots(state: AgentState, base_url: str, doctor_ids: list,
     every candidate doctor at once, so the roster shown matches what
     booking will actually honour.
 
-    Returns None (meaning "unknown, don't filter anything out") if the
-    verification call itself fails - a transient error here must not
-    silently hide every doctor, the same principle `_open_slots_on_day`
-    already follows elsewhere in this file."""
+    Returns None (meaning "unknown, don't filter anything out") if EVERY
+    verification call fails - a transient error here must not silently
+    hide every doctor, the same principle `_open_slots_on_day` already
+    follows elsewhere in this file.
+
+    ONE QUERY PER DOCTOR, ON PURPOSE.
+    --------------------------------
+    This used to make a single batched call for the whole roster and
+    then group the returned slots by each slot's `doctorId`. That is the
+    EXACT pattern `_branches_with_real_slots` already had to abandon:
+    the slots endpoint returns slotStart/slotEnd/isBooked, and the
+    id fields it echoes back are not something this project can rely on.
+    When `doctorId` is absent, the grouping finds nothing for anybody,
+    and every doctor whose `hasSlots` flag was ambiguous gets dropped
+    from the roster.
+
+    CONFIRMED REAL PRODUCTION FAILURE: د. وائل عويس has a live rota at
+    فرع الدقي (Mon/Wed/Thu 10:00-12:00, effective 2026-07-13 to
+    2026-08-31 - i.e. genuinely in effect), and `find_available_doctors`
+    listed him at that branch correctly. The branch roster built through
+    THIS function silently dropped him, so the patient could never pick
+    him. `find_available_doctors` does not use this cross-check, which
+    is exactly why the same doctor appeared in one list and not the
+    other.
+
+    Asking per doctor means the ANSWER is what the query was scoped to,
+    rather than something inferred from a field that may not be there.
+    That is a handful of calls, made once, at the only point it matters.
+    """
 
     if not doctor_ids:
         return set()
@@ -1236,29 +1261,51 @@ def _doctors_with_real_slots(state: AgentState, base_url: str, doctor_ids: list,
         tz = ZoneInfo(DEFAULT_TIMEZONE)
 
     now = datetime.now(tz)
-    result = api.get_doctor_schedule_slots(
-        base_url, doctor_ids=doctor_ids, branch_ids=[branch_id],
-        from_date=now.isoformat(),
-        to_date=(now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)).isoformat(),
-        is_booked=False, page_size=1000,
-     language=conversation_language(state),)
-
-    if not result["success"]:
-        logger.warning(
-            "_doctors_with_real_slots: verification call failed for branch_id=%s "
-            "(status_code=%s) - keeping every candidate rather than hiding real "
-            "availability on a transient error",
-            branch_id, result.get("status_code"),
-        )
-        return None
+    window_end = now + timedelta(days=DOCTOR_AVAILABILITY_WINDOW_DAYS)
 
     have_slots = set()
-    for item in (result["data"] or {}).get("items", []):
-        if item.get("isBooked"):
+    any_lookup_succeeded = False
+
+    for doctor_id in doctor_ids:
+        if not doctor_id:
             continue
-        doctor_id = item.get("doctorId")
-        if doctor_id:
+
+        result = api.get_doctor_schedule_slots(
+            base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
+            from_date=now.isoformat(), to_date=window_end.isoformat(),
+            is_booked=False, page_size=1000,
+            language=conversation_language(state),
+        )
+
+        if not result["success"]:
+            # This doctor's check failed. Treat them as available rather
+            # than hiding someone who may well have appointments.
+            logger.warning(
+                "_doctors_with_real_slots: verification call failed for doctor_id=%s at "
+                "branch_id=%s (status_code=%s) - keeping them rather than hiding real "
+                "availability on a transient error",
+                doctor_id, branch_id, result.get("status_code"),
+            )
             have_slots.add(doctor_id)
+            continue
+
+        any_lookup_succeeded = True
+
+        for item in (result["data"] or {}).get("items", []):
+            if item.get("isBooked"):
+                continue
+            # The query was scoped to THIS doctor, so any open slot in
+            # the response is theirs - no id field needs to be trusted.
+            have_slots.add(doctor_id)
+            break
+
+    if not any_lookup_succeeded:
+        logger.warning(
+            "_doctors_with_real_slots: every verification lookup failed at branch_id=%s - "
+            "reporting 'unknown' so nobody gets dropped on a transient error",
+            branch_id,
+        )
+        return None
 
     return have_slots
 
@@ -1308,12 +1355,22 @@ def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list
     )
     if verified_ids is not None:
         before = len(doctors)
+        dropped = [d for d in doctors if d.get("id") not in verified_ids]
         doctors = [d for d in doctors if d.get("id") in verified_ids]
-        if len(doctors) != before:
+        if dropped:
+            # NAMES, not just a count. A doctor silently vanishing from a
+            # branch roster is a reported complaint ("الدكتور وائل
+            # متعرضش مع انه موجود"), and a bare count made it impossible
+            # to tell whether the filter was right (genuinely nothing
+            # open) or wrong (a slot-sweep gap, like the one
+            # `_branches_with_real_slots` needed its future-rota
+            # exemption for). Logging who was dropped makes that
+            # answerable from a single production trace.
             logger.info(
-                "_doctors_at_branch: dropped %d doctor(s) with no real open slot "
-                "at branch_id=%s despite an ambiguous hasSlots flag",
-                before - len(doctors), branch_id,
+                "_doctors_at_branch: dropped %d of %d doctor(s) at branch_id=%s - no open "
+                "slot found in the booking window despite an ambiguous hasSlots flag: %s",
+                len(dropped), before, branch_id,
+                [{"id": d.get("id"), "name": d.get("name")} for d in dropped],
             )
 
     if doctors:
@@ -1754,6 +1811,66 @@ def _booking_branch_is_stale(state, session) -> bool:
     return active_agent not in ("booking", "reschedule")
 
 
+def _resolve_service_for_booking(state, service_text: str) -> Optional[dict]:
+    """Resolve the patient's service text - a name ("فحص النظر") or a
+    bare number picking from the service list they were just shown - to
+    {"id", "name"}.
+
+    Checks the remembered service list first (that IS the list they saw,
+    so a positional pick can only mean one thing), then falls back to
+    fuzzy-matching the name against it."""
+
+    if not service_text:
+        return None
+
+    session = _get_booking_session(state.get("session_id"))
+    last_list = session.get("last_list") or {}
+
+    items = last_list.get("items") or [] if last_list.get("entity_type") == "service" else []
+
+    if items:
+        position = _extract_selection_number(service_text)
+        if position is not None and 1 <= position <= len(items):
+            chosen = items[position - 1]
+            if chosen.get("id"):
+                return {"id": chosen["id"], "name": chosen.get("name")}
+
+        match = _fuzzy_match(service_text, items, ["name"])
+        if match["result"] == "matched" and match["item"].get("id"):
+            return {"id": match["item"]["id"], "name": match["item"].get("name")}
+
+    # Nothing remembered (or no match in it) - look the service up in
+    # the branch's real catalogue.
+    base_url = _doctors_base_url(state)
+    branch_id = session.get("branch_id")
+    if not base_url:
+        return None
+
+    result = api.get_services(
+        base_url, branch_ids=[branch_id] if branch_id else None,
+        is_published=True, language=conversation_language(state),
+    )
+    if not result["success"]:
+        logger.error(
+            "_resolve_service_for_booking: get_services failed: status_code=%s error=%s",
+            result.get("status_code"), result.get("error"),
+        )
+        return None
+
+    language = conversation_language(state)
+    candidates = [
+        {"id": i.get("id"), "name": _preferred_name(i, language)}
+        for i in (result["data"] or {}).get("items", [])
+        if i.get("id") and _preferred_name(i, language)
+    ]
+
+    match = _fuzzy_match(service_text, candidates, ["name"])
+    if match["result"] == "matched":
+        return {"id": match["item"]["id"], "name": match["item"].get("name")}
+
+    return None
+
+
 @tool
 def find_available_doctors(
     state: Annotated[AgentState, InjectedState],
@@ -1762,6 +1879,7 @@ def find_available_doctors(
     branch_name: str = "",
     allow_broader_search: bool = True,
     all_branches: bool = False,
+    service_name: str = "",
 ) -> dict:
     """Find doctors who currently have a bookable service AND an available
     schedule slot within the next `days_ahead` days, across one or more
@@ -1776,8 +1894,19 @@ def find_available_doctors(
     user doesn't know which branches exist, call
     `list_branches_for_specialty` instead of guessing.
 
-    `all_branches=True`: search the WHOLE hospital, ignoring any branch
-    settled earlier in the conversation. Pass this whenever the user asks
+    `service_name`: pass the SERVICE the patient chose (e.g. "فحص
+    النظر"), or a bare number picking one from a service list you just
+    showed. The service is resolved against the branch's real catalogue
+    and its id is sent as `serviceIds` - so only doctors who actually
+    provide THAT service come back. Use this whenever a service has been
+    chosen: it answers "who can do this for me?" directly, and asking
+    "specialty or doctor?" instead throws away a choice the patient has
+    already made. CONFIRMED REAL PRODUCTION FAILURE: the patient picked
+    "فحص النظر" and said yes to booking, and the reply was "تحب تبدأ
+    بالتخصص ولا بالدكتور؟" followed by a specialty list - restarting the
+    flow from scratch.
+
+    `all_branches=True`: search the WHOLE hospital, ignoring any branch    settled earlier in the conversation. Pass this whenever the user asks
     to look more widely - "شوف في أي دكتور في المستشفى", "في فروع
     ثانية؟", "anywhere", "any branch" - and whenever you are answering a
     NEW question that has nothing to do with an earlier booking attempt.
@@ -1902,10 +2031,31 @@ def find_available_doctors(
     intersection_start = now.isoformat() + "Z"
     intersection_end = (now + timedelta(days=days_ahead)).isoformat() + "Z"
 
+    # RESOLVE A CHOSEN SERVICE -> its id, for Doctors/GetList serviceIds.
+    service_ids = None
+    if service_name and service_name.strip():
+        resolved_service = _resolve_service_for_booking(state, service_name)
+        if resolved_service:
+            service_ids = [resolved_service["id"]]
+            session["service_id"] = resolved_service["id"]
+            session["service_display_name"] = resolved_service.get("name")
+            logger.info(
+                "find_available_doctors: resolved service %r -> id=%s (%s)",
+                service_name, resolved_service["id"], resolved_service.get("name"),
+            )
+        else:
+            logger.info("find_available_doctors: service_name=%r did not match any service", service_name)
+            return {"status": "service_not_matched"}
+    elif session.get("service_id"):
+        # A service chosen earlier in this booking keeps narrowing the
+        # doctor list, the same way a confirmed branch does.
+        service_ids = [session["service_id"]]
+
     result = api.get_doctors(
         base_url,
         specialty_ids=specialty_ids,
         branch_ids=branch_ids,
+        service_ids=service_ids,
         has_published_service=True,
         has_service_schedule=True,
         intersection_start=intersection_start,
@@ -2558,7 +2708,11 @@ def list_branch_services(
         description = (
             item.get("altDescription") if language != "en" else item.get("description")
         ) or item.get("description") or item.get("altDescription")
-        services.append({"name": name, "description": description})
+        # `id` IS REQUIRED. Picking a service is a real booking step:
+        # the id gets passed to `find_available_doctors(service_name=...)`
+        # -> Doctors/GetList `serviceIds`, which is what makes "who does
+        # فحص النظر?" answerable at all.
+        services.append({"id": item.get("id"), "name": name, "description": description})
 
     branch_info = {"id": branch_id, "name": branch_display}
 
@@ -2569,6 +2723,10 @@ def list_branch_services(
 
     if not services:
         return {"status": "not_found", "branch": branch_info}
+
+    # Remembered so a bare "1" picks a SERVICE by position, and so the
+    # chosen service's id can be recovered on a later turn.
+    _remember_list(state, "service", services)
 
     return {"status": "found", "branch": branch_info, "services": services}
 
