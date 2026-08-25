@@ -1376,6 +1376,29 @@ def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list
     if doctors:
         _remember_list(state, "doctor", doctors)
 
+    # KEEP THE "THIS BRANCH IS EMPTY" NOTE HONEST.
+    #
+    # `_note_info_branch_availability` sets `info_branch_no_doctors`
+    # when the INFO flow shows an empty branch, and the booking-intent
+    # directive reads it back on a later turn. Nothing was clearing it
+    # when the patient moved to a DIFFERENT branch through the booking
+    # tools (which go through here, not through `match_entity_info`), so
+    # the note went stale.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: فرع المعادي was browsed first
+    # (correctly noted as empty), the patient then moved to فرع الدقي,
+    # this function returned FOUR real doctors there - and the reply
+    # still said "فرع الدقي ما فيه دكاترة متاحين حاليا للحجز", straight
+    # from the stale note, contradicting the tool result in the very
+    # same turn.
+    session_id = state.get("session_id")
+    if session_id:
+        booking_session = _get_booking_session(session_id)
+        if doctors:
+            booking_session.pop("info_branch_no_doctors", None)
+        elif booking_session.get("info_branch_id") == branch_id:
+            booking_session["info_branch_no_doctors"] = booking_session.get("info_branch_name")
+
     logger.info(
         "_doctors_at_branch: branch_id=%s specialty_ids=%s -> %d doctor(s)",
         branch_id, specialty_ids, len(doctors),
