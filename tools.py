@@ -2668,6 +2668,38 @@ def _with_branch_aliases(items: list, state) -> list:
     return enriched
 
 
+def _note_info_branch_availability(state, branch_row: dict) -> None:
+    """Record, on the booking session, the branch the patient has just
+    been shown via the INFO flow and whether anything can be booked
+    there.
+
+    Exists because the very next turn ("I want to book there") is
+    routinely answered with no tool call at all, straight from the
+    model's memory of the conversation - so the availability fact has to
+    already be somewhere the next turn's system prompt can read it. See
+    graph._build_empty_branch_booking_intent_directive, which turns this
+    into an instruction on exactly that turn."""
+
+    if not state:
+        return
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return
+
+    session = _get_booking_session(session_id)
+    name = _arabic_preferred_name(branch_row) or branch_row.get("name")
+
+    if branch_row.get("hasAvailableDoctors") is False:
+        session["info_branch_no_doctors"] = name
+        logger.info(
+            "_note_info_branch_availability: session_id=%s - %r has no bookable doctors",
+            session_id, name,
+        )
+    else:
+        session.pop("info_branch_no_doctors", None)
+
+
 @tool
 def match_entity_info(
     state: Annotated[AgentState, InjectedState],
@@ -2907,6 +2939,20 @@ def match_entity_info(
                 except Exception:
                     logger.exception("match_entity_info: failed to compute hasAvailableDoctors for a positional pick")
 
+        # REMEMBER AN EMPTY BRANCH ON THE SESSION.
+        #
+        # The next turn is very often "I want to book there", and it is
+        # answered with NO tool call at all - straight from conversation
+        # memory. Without this, that turn has no access to the fact that
+        # the branch is empty, and the reply asks a doctor question that
+        # can never be answered. CONFIRMED REAL PRODUCTION FAILURE: after
+        # picking فرع المعادي the patient said "عاوزه احجز فيه مع دكتور"
+        # and got "اخترت فرع المعادي ✅ / تحب تحجز مع دكتور معيّن...؟" -
+        # a wasted turn, and a confirmation of a branch nothing can be
+        # booked at.
+        if entity_type == "branch":
+            _note_info_branch_availability(state, shaped_pos)
+
         return {"status": "matched", "item": shaped_pos}
 
     match_candidates = items
@@ -3031,8 +3077,7 @@ def match_entity_info(
     shape_fn = _shape_doctor if entity_type == "doctor" else _shape_branch
 
     if match_result["result"] == "matched":
-        # LOW-CONFIDENCE GUESS GATE - mirrors match_entity_for_booking's
-        # own needs_confirmation logic exactly (same 0.95 cutoff), which
+        # LOW-CONFIDENCE GUESS GATE - mirrors match_entity_for_booking's        # own needs_confirmation logic exactly (same 0.95 cutoff), which
         # this tool was missing entirely.
         #
         # CONFIRMED REAL PRODUCTION FAILURE: "فرع المنار" (not a real
@@ -3047,7 +3092,11 @@ def match_entity_info(
         # guard at all, despite using the very same `_fuzzy_match`.
         if match_result.get("score", 0) < 0.95:
             return {"status": "possible_match", "item": shape_fn(match_result["item"])}
-        return {"status": "matched", "item": shape_fn(match_result["item"])}
+        matched_item = shape_fn(match_result["item"])
+        if entity_type == "branch":
+            # Same reason as the positional-pick path above.
+            _note_info_branch_availability(state, matched_item)
+        return {"status": "matched", "item": matched_item}
 
     ambiguous_candidates = [shape_fn(i) for i in match_result["items"]]
     # Remembered too - a follow-up bare number ("2") should pick between
