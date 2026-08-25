@@ -406,6 +406,7 @@ def get_doctors(
     base_url: str,
     specialty_ids: Optional[list] = None,
     branch_ids: Optional[list] = None,
+    service_ids: Optional[list] = None,
     has_published_service: bool = True,
     has_service_schedule: bool = True,
     intersection_start: Optional[str] = None,
@@ -440,6 +441,13 @@ def get_doctors(
         payload["specialtyIds"] = specialty_ids
     if branch_ids:
         payload["branchIds"] = branch_ids
+    if service_ids:
+        # Confirmed request field: narrows to doctors who actually
+        # provide the given service(s). Used when the patient picked a
+        # SERVICE first ("فحص النظر") - the doctors for that service are
+        # the answer, and re-asking "specialty or doctor?" throws the
+        # choice they already made away.
+        payload["serviceIds"] = service_ids
     if intersection_start:
         payload["intersectionStart"] = intersection_start
     if intersection_end:
