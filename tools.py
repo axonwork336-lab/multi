@@ -2655,9 +2655,35 @@ def match_entity_info(
     Returns one of:
     {"status": "list", "items": [...]}
     {"status": "matched", "item": {...}}
+    {"status": "possible_match", "item": {...}}  # low-confidence guess
+        (score < 0.95) - likely a typo, OR the input may not really be a
+        branch/doctor in the system at all. Do NOT state this as fact -
+        ask the user "هل تقصد [altName/name]؟" and WAIT for them to
+        confirm before giving out its address/details/etc. For
+        branches, this guess is already restricted to ones that
+        currently have a real available doctor (see the "not_matched" +
+        `available_branches` case below for when none do) - but it is
+        still only a GUESS, never a confirmed fact, until the patient
+        agrees. CONFIRMED REAL PRODUCTION FAILURE: "فرع المنار" (not a
+        real branch) scored a mediocre 0.615 similarity against "فرع
+        المعادي" (a real, unrelated, and currently doctor-less branch)
+        and was reported as an outright match - "الفرع اللي ذكرته هو
+        فرع المعادي" - stated as settled fact with no confirmation
+        asked, pointing at a branch that could never actually help this
+        patient. A user's "yes" to the follow-up question is what makes
+        the match - don't act on the guessed branch/doctor until they've
+        actually agreed it's the one they meant.
     {"status": "ambiguous", "candidates": [...]}  # show each candidate's
         name and ask the user which one they meant
-    {"status": "not_matched"}
+    {"status": "not_matched"}  # doctors, or a branch with no viable
+        alternative available at all
+    {"status": "not_matched", "available_branches": [...]}  # branches
+        only: no confident/real match was found (or the only guesses
+        were branches with zero doctors right now, which are never
+        offered even as a guess) - `available_branches` already lists
+        the branches that DO currently have a doctor. Say plainly you
+        couldn't find a branch by that name, then show this list in the
+        SAME reply - don't ask a follow-up question just to get it.
     {"status": "not_configured"}  # no doctors_base_url set up for this client
     {"status": "error"}
 
@@ -2718,7 +2744,43 @@ def match_entity_info(
             return {"status": "not_matched"}
         return {"status": "list", "items": shaped}
 
-    match_result = _fuzzy_match(user_input, items, name_keys)
+    match_candidates = items
+
+    if entity_type == "branch":
+        # TWO-TIER RESOLUTION for branches.
+        #
+        # An EXACT/near-exact reference - the patient really did type
+        # this specific branch's name - is answered regardless of
+        # whether it currently has a doctor: that's a genuine, honest
+        # question ("info about فرع المعادي") and deserves a genuine
+        # answer even for a branch with nobody in it right now.
+        #
+        # But anything WEAKER than that - a guess, not an explicit
+        # reference - must never be allowed to land on a branch with no
+        # currently-available doctor. CONFIRMED REAL PRODUCTION FAILURE:
+        # "فرع المنار" (not a real branch at all) fuzzy-matched, at a
+        # mediocre 0.615 score, to "فرع المعادي" - a real branch with
+        # ZERO doctors available right now - and was confidently
+        # reported as the match. Checking availability only AFTER the
+        # fact (the `possible_match` confidence gate above) is not
+        # enough by itself: it still means asking "هل تقصد فرع
+        # المعادي؟" about a branch that can never actually help this
+        # patient. The availability check has to happen BEFORE a guess
+        # is even offered, exactly like `_resolve_branch_by_name` (used
+        # by the booking flow) already does.
+        exact_probe = _fuzzy_match(user_input, items, name_keys)
+        if not (exact_probe["result"] == "matched" and exact_probe.get("score", 0) >= 0.95):
+            active_branch_ids = _branch_ids_with_available_doctors(state, base_url)
+            if active_branch_ids:
+                narrowed = [b for b in items if b.get("id") in active_branch_ids]
+                # Only narrow when it leaves something to guess from -
+                # an API failure or a genuinely empty clinic falls back
+                # to the unfiltered list rather than manufacturing a
+                # false "not_matched" out of a transient error.
+                if narrowed:
+                    match_candidates = narrowed
+
+    match_result = _fuzzy_match(user_input, match_candidates, name_keys)
     logger.info(
         "match_entity_info: entity_type=%s user_input=%r api_returned=%d result=%s%s",
         entity_type, user_input, len(items), match_result["result"],
@@ -2726,6 +2788,30 @@ def match_entity_info(
     )
 
     if match_result["result"] == "not_matched":
+        if entity_type == "branch":
+            # Don't leave the patient with a bare "couldn't find it" -
+            # hand back the branches that ARE currently available, so
+            # the reply can say "لم أجد فرعًا باسم [x]، هذه الفروع
+            # المتاحة للمستشفى" and show them in the SAME turn, rather
+            # than guessing at an empty one or asking a second question
+            # just to get the same list.
+            available_branch_ids = _branch_ids_with_available_doctors(state, base_url)
+            available_items = (
+                [b for b in items if b.get("id") in available_branch_ids]
+                if available_branch_ids else items
+            )
+            return {
+                "status": "not_matched",
+                "available_branches": [
+                    {
+                        "name": b.get("name") or b.get("formatedName"),
+                        "altName": b.get("altName"),
+                        "address": b.get("address"),
+                        "cityName": b.get("cityName"),
+                    }
+                    for b in available_items
+                ],
+            }
         return {"status": "not_matched"}
 
     def _shape_doctor(i):
@@ -2756,6 +2842,22 @@ def match_entity_info(
     shape_fn = _shape_doctor if entity_type == "doctor" else _shape_branch
 
     if match_result["result"] == "matched":
+        # LOW-CONFIDENCE GUESS GATE - mirrors match_entity_for_booking's
+        # own needs_confirmation logic exactly (same 0.95 cutoff), which
+        # this tool was missing entirely.
+        #
+        # CONFIRMED REAL PRODUCTION FAILURE: "فرع المنار" (not a real
+        # branch) scored only 0.615 against "فرع المعادي" (an unrelated,
+        # real branch) - a mediocre score, but the ONLY candidate above
+        # the bare 0.6 inclusion floor, so it came back as a flat
+        # "matched" with no hint that this was a guess. The reply then
+        # stated it as settled fact ("الفرع اللي ذكرته هو فرع المعادي")
+        # instead of confirming first. `match_entity_for_booking` already
+        # guards against exactly this by asking "did you mean X?" below
+        # score 0.95 - this read-only info lookup had no equivalent
+        # guard at all, despite using the very same `_fuzzy_match`.
+        if match_result.get("score", 0) < 0.95:
+            return {"status": "possible_match", "item": shape_fn(match_result["item"])}
         return {"status": "matched", "item": shape_fn(match_result["item"])}
 
     return {"status": "ambiguous", "candidates": [shape_fn(i) for i in match_result["items"]]}
