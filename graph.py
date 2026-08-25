@@ -2234,6 +2234,14 @@ def _build_services_from_kb_directive(messages: list) -> str:
         "it. If it returns \"not_found\"/\"not_configured\", say plainly "
         "that you don't have that information and offer a staff "
         "handoff.\n\n"
+        "ANSWER ONLY THE SERVICES QUESTION. Do not open with, or append, "
+        "anything about doctors or booking availability - not even when "
+        "the branch under discussion happens to have no bookable doctor. "
+        "CONFIRMED REAL PRODUCTION FAILURE: asked to show a branch's "
+        "services, the reply began \"فرع المعادي مافي عنده دكاترة "
+        "متاحين حاليا للحجز. لكن يقدم خدمات عديدة...\" - leading with a "
+        "negative about a question that was never asked. Just answer "
+        "what they asked.\n\n"
     )
 
 
@@ -3593,6 +3601,102 @@ _BOOKING_INTENT_RE = re.compile(
 )
 
 
+def _build_branch_pick_directive(messages: list, session_id: str) -> str:
+    """Fires when the patient's latest message is a bare number picking
+    from a branch list that was just shown, and resolves it HERE, in the
+    system prompt, from the remembered list.
+
+    WHY THIS EXISTS: a positional pick is routinely answered with NO
+    tool call at all - the model already has the list in the
+    conversation, so it just replies from memory. That means
+    `match_entity_info` never runs, its `hasAvailableDoctors` flag never
+    arrives, and `tools._note_info_branch_availability` never fires.
+
+    CONFIRMED REAL PRODUCTION FAILURE: shown the six branches, the
+    patient replied "1" (فرع المعادي, zero doctors) and the reply -
+    written with no tool call - offered "...أو تحب أساعدك بحجز موعد
+    فيه؟", inviting a booking that cannot exist. Every earlier fix for
+    this lived behind a tool call, so none of them could reach this
+    turn. The remembered list already holds the answer; this puts it in
+    front of the model on the one turn it is needed."""
+
+    if not messages or not session_id:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    position = tools._extract_selection_number(text)
+    if position is None:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    last_list = session.get("last_list") or {}
+
+    if last_list.get("entity_type") != "branch":
+        return ""
+
+    items = last_list.get("items") or []
+    if not (1 <= position <= len(items)):
+        return ""
+
+    chosen = items[position - 1]
+    name = chosen.get("altName") or chosen.get("name") or ""
+    address = chosen.get("address") or ""
+
+    if not name:
+        return ""
+
+    if chosen.get("hasAvailableDoctors") is False:
+        # Remember it, so the NEXT turn ("I want to book there") is also
+        # covered - see _build_empty_branch_booking_intent_directive.
+        session["info_branch_no_doctors"] = name
+        return (
+            "============================================================\n"
+            "THEY PICKED A BRANCH THAT HAS NO BOOKABLE DOCTOR\n"
+            "============================================================\n"
+            f"Their reply is a pick from the branch list you just showed: "
+            f"option {position} is {name}"
+            f"{(', address: ' + address) if address else ''}.\n\n"
+            "This branch has NO doctor available for booking right now. "
+            "So this reply is exactly two things and nothing else:\n"
+            f"  1. Give the address of {name}.\n"
+            "  2. Ask ONE question: whether they'd like to know about "
+            "the SERVICES this branch provides.\n\n"
+            "Do NOT offer to book, do NOT ask if they want an "
+            "appointment there, and do NOT mention doctors or "
+            "availability at all. They asked about a branch, not about "
+            "booking - volunteering \"there are no doctors here\" answers "
+            "a question nobody asked and makes a real branch sound "
+            "broken.\n\n"
+            "CONFIRMED REAL PRODUCTION FAILURE: this exact turn replied "
+            "\"...تحب تعرف عن خدمات الفرع أو تحب أساعدك بحجز موعد فيه؟\" "
+            "- inviting a booking that cannot happen. Only if THEY ask "
+            "to book does the branch's emptiness get mentioned.\n\n"
+        )
+
+    session.pop("info_branch_no_doctors", None)
+    return (
+        "============================================================\n"
+        "THEY PICKED A BRANCH FROM THE LIST\n"
+        "============================================================\n"
+        f"Their reply is a pick from the branch list you just showed: "
+        f"option {position} is {name}"
+        f"{(', address: ' + address) if address else ''}.\n\n"
+        f"Give the address of {name}, then ask ONE question: whether "
+        "they'd like to know about this branch's SERVICES or its "
+        "available DOCTORS. Resolve the pick from the list you already "
+        "showed - never guess, and never re-ask which branch they "
+        "meant.\n\n"
+    )
+
+
 def _build_empty_branch_booking_intent_directive(messages: list, session_id: str) -> str:
     """Fires when the patient asks to BOOK at a branch the INFO flow has
     already established has no bookable doctor.
@@ -4715,6 +4819,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     channel_identity_directive = _build_channel_identity_directive(state.get("channel_phone"))
     services_directive = _build_services_from_kb_directive(state["messages"])
     empty_branch_directive = _build_empty_branch_directive(state["messages"])
+    branch_pick_directive = _build_branch_pick_directive(
+        state["messages"], state.get("session_id"),
+    )
     empty_branch_booking_directive = _build_empty_branch_booking_intent_directive(
         state["messages"], state.get("session_id"),
     )
@@ -4812,7 +4919,8 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + bare_doctor_directive + show_all_doctors_directive
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
-        + empty_branch_directive + empty_branch_booking_directive
+        + empty_branch_directive + branch_pick_directive
+        + empty_branch_booking_directive
         + branches_only_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
