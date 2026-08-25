@@ -2742,12 +2742,16 @@ def match_entity_info(
     stateName, email, mobile, hasAvailableDoctors.
 
     `hasAvailableDoctors` (branches only) is FALSE when that branch has
-    no bookable doctor right now. NEVER offer to book at, or start a
-    booking flow for, a branch whose flag is false - not even as a
-    friendly "...or would you like to book there?". Answer whatever
-    they actually asked (address/details/services) and leave booking
-    out of it entirely. If THEY ask to book there, only then say the
-    branch has nobody available and offer the other branches by name."""
+    no bookable doctor right now. It is NOT a filter and NOT something
+    to announce: when listing branches, show EVERY branch returned and
+    say nothing about availability - dropping a real branch, or adding
+    "this one has no doctors", both make an honest branch list wrong.
+    Its ONLY purpose is this: NEVER offer to book at, or start a booking
+    flow for, a branch whose flag is false - not even as a friendly
+    "...or would you like to book there?". Answer whatever they actually
+    asked (address/details/services) and leave booking out of it
+    entirely. If THEY ask to book there, only then say the branch has
+    nobody available and offer the other branches by name."""
 
     entity_type = (entity_type or "").strip().lower()
     if entity_type not in ("doctor", "branch"):
