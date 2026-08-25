@@ -3587,6 +3587,78 @@ def _build_show_all_doctors_after_ask_directive(messages: list) -> str:
     return _SHOW_ALL_DOCTORS_AFTER_ASK_DIRECTIVE
 
 
+_BOOKING_INTENT_RE = re.compile(
+    r"احجز|اح جز|حجز|احجزلي|عايز.{0,12}حجز|عاوز.{0,12}حجز|ابغ[يى].{0,12}حجز|"
+    r"اب[يى].{0,12}حجز|موعد|ميعاد|book|appointment|reserve"
+)
+
+
+def _build_empty_branch_booking_intent_directive(messages: list, session_id: str) -> str:
+    """Fires when the patient asks to BOOK at a branch the INFO flow has
+    already established has no bookable doctor.
+
+    WHY THIS EXISTS: that turn is routinely answered with NO tool call
+    at all - the model has the branch from conversation memory, so it
+    just replies. CONFIRMED REAL PRODUCTION FAILURE: right after being
+    shown فرع المعادي (zero doctors), the patient said "عاوزه احجز فيه
+    مع دكتور" and the reply was "اخترت فرع المعادي ✅ / تحب تحجز مع
+    دكتور معيّن عند فرع المعادي، ولا تبي أعرض لك الدكاترة المتاحين
+    هناك؟" - confirming a branch nothing can be booked at, and asking a
+    doctor question with no possible answer. Only after the patient
+    answered THAT did the tools finally run and report the branch empty.
+    Two wasted turns before the one true sentence.
+
+    `tools._note_info_branch_availability` puts the fact on the session
+    the moment the branch is shown; this reads it back on the turn it
+    matters."""
+
+    if not messages or not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    branch_name = session.get("info_branch_no_doctors")
+    if not branch_name:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _BOOKING_INTENT_RE.search(_norm_ar(text)):
+        return ""
+
+    return (
+        "============================================================\n"
+        "THEY WANT TO BOOK AT A BRANCH THAT HAS NOBODY - SAY SO NOW\n"
+        "============================================================\n"
+        f"The patient is asking to book at {branch_name}, which was "
+        "already established to have NO bookable doctor right now.\n\n"
+        "Answer that in THIS reply. Do not confirm the branch, do not "
+        "write \"اخترت فرع ... ✅\", and do not ask whether they want a "
+        "particular doctor or the list of available doctors there - "
+        "there is no doctor to pick and no list to show, so every one of "
+        "those is a question with no possible answer.\n\n"
+        "This reply, in one message:\n"
+        "  1. Say plainly that this branch has no doctors available for "
+        "booking right now.\n"
+        "  2. Call `list_branches_for_specialty` and show the branches "
+        "that DO have doctors - BY NAME ONLY, emoji-numbered, with no "
+        "doctor names.\n"
+        "  3. Ask ONE question: which of those branches they'd like.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: this exact turn came back as "
+        "\"اخترت فرع المعادي ✅ / تحب تحجز مع دكتور معيّن عند فرع "
+        "المعادي، ولا تبي أعرض لك الدكاترة المتاحين هناك؟\" - and only "
+        "after the patient answered that did the truth finally arrive. "
+        "Two wasted turns, and a ✅ on a branch nothing can be booked "
+        "at.\n\n"
+    )
+
+
 def _build_bare_entity_answer_directive(messages: list) -> str:
     """Fires when the patient's latest message is just the bare word
     ("تخصص"/"فرع"), AND the assistant's own previous message actually
@@ -4643,6 +4715,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     channel_identity_directive = _build_channel_identity_directive(state.get("channel_phone"))
     services_directive = _build_services_from_kb_directive(state["messages"])
     empty_branch_directive = _build_empty_branch_directive(state["messages"])
+    empty_branch_booking_directive = _build_empty_branch_booking_intent_directive(
+        state["messages"], state.get("session_id"),
+    )
     branches_only_directive = _build_branches_only_no_doctors_directive(state["messages"])
     empty_day_directive = _build_empty_day_recovery_directive(state["messages"])
     how_to_book_directive = _build_how_to_book_directive(state["messages"])
@@ -4737,7 +4812,8 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + bare_doctor_directive + show_all_doctors_directive
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
-        + empty_branch_directive + branches_only_directive + empty_day_directive
+        + empty_branch_directive + empty_branch_booking_directive
+        + branches_only_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
         + booking_confirmation_directive + booking_success_directive
