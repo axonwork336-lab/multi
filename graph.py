@@ -3363,7 +3363,10 @@ _BARE_DOCTOR_ANSWER_DIRECTIVE = (
     "means they want to pick BY DOCTOR - it does NOT mean \"show me "
     "everyone\".\n\n"
     "Ask exactly ONE question this turn, and do NOT call any doctor-list "
-    "tool yet:\n"
+    "tool yet - expressed in this clinic's own configured dialect (see "
+    "the LANGUAGE & DIALECT rule), or in English if the patient is "
+    "currently writing English - the Arabic below is only an "
+    "illustration of what to ask, not fixed wording to force:\n"
     "    من فضلك اكتب اسم الدكتور اللي حابب تحجز معاه\n\n"
     "  - If they then give a NAME -> treat it exactly like any other "
     "named doctor: call `match_entity_for_booking` and continue the "
@@ -3474,14 +3477,101 @@ def _build_show_all_doctors_after_ask_directive(messages: list) -> str:
 
 
 def _build_bare_entity_answer_directive(messages: list) -> str:
-    """Fires when the patient's latest message is just the category word
-    ("دكتور"/"تخصص"/"فرع"), answering a choice the assistant offered.
+    """Fires when the patient's latest message is just the bare word
+    ("تخصص"/"فرع"), AND the assistant's own previous message actually
+    offered that choice (specialty-vs-doctor, or a branch-related
+    question inside the booking flow).
 
-    `tools._is_generic_entity_word` already stops the bare word being
-    fuzzy-matched to a real entity once a tool is reached. This is the
-    other half: making sure a tool is reached at all, rather than the
-    model answering with a second question.
-    """
+    Both conditions matter: without checking the previous AI turn, this
+    used to fire on a bare "فروع" that was NOT answering any such
+    question - e.g. a patient opening cold with "فروع" as their very
+    first, standalone question ("what branches do you have"). That is a
+    general DOCTOR/BRANCH INFO question, not a choice being answered,
+    and routing it into the booking flow's `list_branches_for_specialty`
+    (which needs a specialty to work from) produced a confusing "which
+    specialty do you want to know its branches?" reply instead of just
+    showing the branches. CONFIRMED REAL PRODUCTION FAILURE: exactly
+    that - a bare "فروع" typed as an opening question triggered a
+    "جاري البحث عن الأطباء المتاحين" progress message and a specialty
+    list, when the patient never asked about specialties at all. See
+    _build_branches_info_directive for the correct handling of that
+    case."""
+
+    if not messages:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage, AIMessage as _AIMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _BARE_ENTITY_ANSWER_RE.match(text.strip()):
+        return ""
+
+    previous_ai = None
+    for msg in reversed(messages[:-1]):
+        if isinstance(msg, _AIMessage):
+            previous_ai = msg
+            break
+
+    if previous_ai is None:
+        return ""
+
+    previous_content = getattr(previous_ai, "content", "")
+    previous_text = previous_content if isinstance(previous_content, str) else str(previous_content)
+
+    if not _OFFERED_SPECIALTY_OR_DOCTOR_OR_BRANCH_CHOICE_RE.search(_norm_ar(previous_text)):
+        return ""
+
+    return _BARE_ENTITY_ANSWER_DIRECTIVE
+
+
+# Loosely matches the family of choice-questions this directive is meant
+# to be answering - "تحب تبدأ بالتخصص ولا بالدكتور؟", "تحب تحجزين في فرع
+# معيّن، ولا أعرض لك الدكاترة/الفروع المتاحين؟", and their variants.
+# Deliberately keyed to phrases that only appear when that specific
+# choice was actually offered, not to the bare category words themselves
+# (which would just recreate the false-positive this guard exists to
+# prevent).
+_OFFERED_SPECIALTY_OR_DOCTOR_OR_BRANCH_CHOICE_RE = re.compile(
+    r"بالتخصص[^\n]{0,10}بالدكتور|بالدكتور[^\n]{0,10}بالتخصص|"
+    r"فرع\s*معي.ن[^\n]{0,40}(?:اعرض|أعرض)|"
+    r"specialty[^\n]{0,15}doctor|doctor[^\n]{0,15}specialty|"
+    r"particular\s*branch[^\n]{0,40}show"
+)
+
+
+# ==========================================================
+# A STANDALONE "what branches do you have" question (NOT an answer to
+# any choice the assistant offered) - route to the general INFO flow.
+# ==========================================================
+#
+# CONFIRMED REAL PRODUCTION FAILURE, twice in one conversation: asked
+# "ايه الفروع بتاعت المستشفي", the reply was the clinic's SERVICES list
+# (from the knowledge base) - branches and services are different
+# things entirely. Asked again with the bare word "فروع", the reply
+# instead searched for doctors and showed the booking flow's SPECIALTY
+# list ("أي تخصص ترغب تعرف فروعه؟") - again not branches, and forcing a
+# specialty choice the patient never asked for. Both times, the one
+# thing that should have happened - showing the branches themselves, via
+# the DOCTOR/BRANCH INFO flow's own `match_entity_info` - never did.
+_BRANCHES_INFO_QUESTION_CUES = (
+    "فروع", "الفروع", "فروعكم", "فروعكو", "عناوين الفروع", "اماكن الفروع",
+    "أماكن الفروع", "فين الفروع", "وين الفروع",
+    "branch", "branches", "locations",
+)
+
+
+def _build_branches_info_directive(messages: list) -> str:
+    """Fires when the patient asks a standalone question about the
+    clinic's branches, that is NOT already handled as an answer to a
+    specialty/doctor/branch choice the assistant just offered (that
+    narrower case is `_build_bare_entity_answer_directive`, and takes
+    priority - see the ordering where both are assembled)."""
 
     if not messages:
         return ""
@@ -3494,11 +3584,39 @@ def _build_bare_entity_answer_directive(messages: list) -> str:
 
     content = getattr(last, "content", "")
     text = content if isinstance(content, str) else str(content)
+    normalized = _norm_ar(text).lower()
 
-    if not _BARE_ENTITY_ANSWER_RE.match(text.strip()):
+    if not any(cue in normalized for cue in _BRANCHES_INFO_QUESTION_CUES):
         return ""
 
-    return _BARE_ENTITY_ANSWER_DIRECTIVE
+    # If the bare-entity-answer directive already fired for this exact
+    # turn (a real specialty/doctor/branch choice was actually offered
+    # and answered), let THAT directive own this turn instead - don't
+    # send two conflicting instructions for the same message.
+    if _build_bare_entity_answer_directive(messages):
+        return ""
+
+    return (
+        "============================================================\n"
+        "BRANCHES QUESTION - USE `match_entity_info`, NOT SERVICES OR "
+        "SPECIALTIES\n"
+        "============================================================\n"
+        "The patient is asking about the clinic's BRANCHES (locations) - "
+        "not its services, and not which medical specialties it offers. "
+        "These are three different things, and confirmed real production "
+        "failures have answered a branches question with each of the "
+        "other two by mistake.\n\n"
+        "Call `match_entity_info(user_input=\"\", entity_type=\"branch\")` "
+        "and present its \"list\" result as a numbered list (emoji "
+        "digits), then ask if they'd like details on one of them. Do NOT "
+        "call `list_hospital_services` (that answers a SERVICES "
+        "question), and do NOT call `list_specialties` or "
+        "`list_branches_for_specialty` (those require a specialty and "
+        "belong to the BOOKING flow, not a general \"what branches do "
+        "you have\" question) - and do not ask the patient to first pick "
+        "a specialty or a doctor before you'll show them the branches "
+        "list; that information was never asked for.\n\n"
+    )
 
 
 _BRANCH_QUESTION_RE = re.compile(
@@ -3571,7 +3689,11 @@ _BRANCH_QUESTION_PHRASING_DIRECTIVE = (
     "Call `get_doctor_schedule_for_booking` NOW, with no question asked "
     "first, and show its result grouped by branch - one line per "
     "weekday/hours per branch, using only the real names/days/hours the "
-    "tool returned, e.g.:\n\n"
+    "tool returned. Structure it like this (the Arabic below is only an "
+    "illustration of shape/content - always phrase it in this clinic's "
+    "own configured dialect per the LANGUAGE & DIALECT rule, or in "
+    "English if the patient is currently writing English, never these "
+    "exact words):\n\n"
     "    مواعيد الدكتور [اسم الدكتور] في فرع [اسم الفرع الأول]:\n"
     "    • [اليوم]: من [من الساعة] لـ [إلى الساعة] — [اسم الخدمة]\n\n"
     "    وفي فرع [اسم الفرع الثاني]:\n"
@@ -3579,7 +3701,11 @@ _BRANCH_QUESTION_PHRASING_DIRECTIVE = (
     "    حابب تحجز في أنهي فرع وأنهي يوم؟\n\n"
     "If the tool result has only ONE branch, there is still no ASKING "
     "to do (since there's nothing to choose between) - but you must "
-    "still SHOW the schedule message exactly as above, e.g.:\n\n"
+    "still SHOW the schedule message exactly as above (again, in this "
+    "clinic's own configured dialect per the LANGUAGE & DIALECT rule - "
+    "or in English if the patient is currently writing English - not "
+    "this specific wording), "
+    "e.g.:\n\n"
     "    مواعيد الدكتور محمد زايد في فرع عيادات سكاي التخصصية:\n"
     "    • الاثنين: من 2:40 مساءً لـ 5:40 مساءً — جلسة تحليل سلوك تطبيقي\n\n"
     "`get_doctor_schedule_for_booking` already auto-confirms the single "
@@ -4415,6 +4541,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
             )
 
     bare_entity_directive = _build_bare_entity_answer_directive(state["messages"])
+    branches_info_directive = _build_branches_info_directive(state["messages"])
     bare_doctor_directive = _build_bare_doctor_answer_directive(state["messages"])
     show_all_doctors_directive = _build_show_all_doctors_after_ask_directive(state["messages"])
     doctor_branches_directive = _build_doctor_branches_directive(
@@ -4456,6 +4583,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + slots_directive + available_days_directive
         + resolved_day_directive + entity_list_directive
         + abandoned_booking_directive + bare_entity_directive
+        + branches_info_directive
         + bare_doctor_directive + show_all_doctors_directive
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
