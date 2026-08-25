@@ -557,6 +557,73 @@ def _entity_type_for_tool_call(messages: list, tool_message) -> Optional[str]:
     return None
 
 
+def _build_branches_only_no_doctors_directive(messages: list) -> str:
+    """Fires when `list_branches_for_specialty` has just returned AND
+    earlier in this same conversation a branch was reported empty
+    (`noDoctorsAtBranch` / `not_found_in_branch`).
+
+    That combination is exactly the "the branch you asked about has
+    nobody - here are the others" moment, and it is where the reply has
+    repeatedly turned into a roster dump. The branch list is what
+    answers the question; the doctors at each of those branches are
+    not, and they come later, once a branch is picked.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+    if getattr(last, "name", None) != "list_branches_for_specialty":
+        return ""
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    if not (data.get("branches") or []):
+        return ""
+
+    # Only in the empty-branch follow-up context - a plain "which
+    # branches have this specialty?" question is still allowed to show
+    # each branch with its own doctors (that grouping is genuinely
+    # useful there, and is what NB1d(b) asks for).
+    empty_branch_seen = False
+    for msg in messages[:-1]:
+        if getattr(msg, "type", None) != "tool":
+            continue
+        try:
+            previous = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(previous, dict):
+            continue
+        if previous.get("noDoctorsAtBranch") or str(previous.get("status") or "").lower() == "not_found_in_branch":
+            empty_branch_seen = True
+            break
+
+    if not empty_branch_seen:
+        return ""
+
+    return (
+        "============================================================\n"
+        "OFFER THE OTHER BRANCHES BY NAME ONLY - NO DOCTOR NAMES\n"
+        "============================================================\n"
+        "The branch the patient asked about has nobody available, and "
+        "you are now offering the alternatives. Show ONLY the branch "
+        "NAMES, as a short emoji-numbered list, and ask which one they "
+        "want.\n\n"
+        "Do NOT list the doctors at those branches - not one name, even "
+        "though this tool result contains them. CONFIRMED REAL "
+        "PRODUCTION FAILURE: eleven doctor names across three branches "
+        "went out in a single message to a patient who had asked about "
+        "ONE branch. It is unreadable on a phone, and it buries the only "
+        "question that matters (which branch instead?) under a roster "
+        "nobody asked for. Once they pick a branch, THAT is when its "
+        "doctors get shown.\n\n"
+    )
+
+
 def _build_entity_list_directive(messages: list) -> str:
     """
     If the LAST message is a ToolMessage from one of the list-returning
@@ -1668,18 +1735,38 @@ def _build_empty_branch_directive(messages: list) -> str:
 
     return (
         "============================================================\n"
-        "THIS BRANCH HAS NO AVAILABLE DOCTORS - DO NOT ANNOUNCE A LIST\n"
+        "THIS BRANCH HAS NO AVAILABLE DOCTORS - KEEP THE REPLY SMALL\n"
         "============================================================\n"
         f"The branch{(' (' + branch_name + ')') if branch_name else ''} "
-        "was matched, but NOBODY is available there for this booking. "
-        "There is no doctor list to show.\n\n"
-        "Do NOT write \"here are the available doctors\" or anything like "
-        "it - there are none, and saying otherwise followed by an empty "
-        "list is a confirmed real failure that dead-ended a booking. "
-        "Instead: say plainly that this branch has no available doctors "
-        "right now, then call `list_branches_for_specialty` (or "
-        "`find_available_doctors` with no branch) and offer the branches "
-        "that DO have someone. Ask ONE question after that.\n\n"
+        "was matched, but NOBODY is available there for booking. There "
+        "is no doctor list to show for it.\n\n"
+        "WHICH REPLY YOU GIVE DEPENDS ENTIRELY ON WHAT THEY ASKED:\n\n"
+        "A) They were just ASKING ABOUT THE BRANCH (its address, its "
+        "details, or they picked it from an info list) - they have NOT "
+        "said they want to book there. Then this turn is a simple info "
+        "answer:\n"
+        "  - Give the branch's ADDRESS.\n"
+        "  - Offer to tell them about the SERVICES this branch provides.\n"
+        "  - Say NOTHING about doctors, availability, or other branches. "
+        "They did not ask to book, so 'no doctors available here' is an "
+        "answer to a question nobody asked - it just makes the branch "
+        "sound broken.\n"
+        "  - Do NOT call `list_branches_for_specialty`, "
+        "`find_available_doctors`, or any other doctor lookup on this "
+        "turn.\n\n"
+        "B) They explicitly asked to BOOK at this branch. Only then:\n"
+        "  - Say plainly that this branch has no doctors available for "
+        "booking right now.\n"
+        "  - Then call `list_branches_for_specialty` and offer the other "
+        "branches BY NAME ONLY - a short numbered list of branch names.\n"
+        "  - DO NOT list the doctors at those other branches. Not one "
+        "name. CONFIRMED REAL PRODUCTION FAILURE: this produced a wall "
+        "of eleven doctor names across three branches in a single "
+        "message, when the patient had only asked about one branch - "
+        "unreadable, and it buries the actual question (which branch "
+        "instead?) under a roster they never requested. The doctors come "
+        "later, AFTER they pick a branch.\n"
+        "  - Ask ONE question: which of those branches they'd like.\n\n"
     )
 
 
@@ -4230,6 +4317,22 @@ def _tools_reported_branch_empty(state: AgentState) -> bool:
         status = str(data.get("status") or "").lower()
         if status in _EMPTY_RESULT_STATUSES:
             return True
+        # A branch reported empty by FLAG rather than by status. Both of
+        # these are a tool explicitly saying "this branch has nobody" -
+        # `noDoctorsAtBranch` from `match_entity_for_booking`, and
+        # `not_found_in_branch` from `find_available_doctors`.
+        #
+        # CONFIRMED REAL FALSE POSITIVE this fixes: the patient asked
+        # about فرع المعادي, `match_entity_for_booking` returned
+        # `noDoctorsAtBranch: true`, and the reply correctly said so
+        # while listing the OTHER branches as alternatives. Because
+        # those alternative branch names appeared anywhere in the reply
+        # text, and because this function only ever looked at `status`
+        # (so the `noDoctorsAtBranch` flag was invisible to it), the
+        # verifier concluded the reply was denying an available branch -
+        # and fired twice on a reply that was entirely truthful.
+        if data.get("noDoctorsAtBranch") or status == "not_found_in_branch":
+            return True
         if status == "found" and not any(
             data.get(key) for key in ("doctors", "days", "slots", "branches", "schedules")
         ):
@@ -4494,6 +4597,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     channel_identity_directive = _build_channel_identity_directive(state.get("channel_phone"))
     services_directive = _build_services_from_kb_directive(state["messages"])
     empty_branch_directive = _build_empty_branch_directive(state["messages"])
+    branches_only_directive = _build_branches_only_no_doctors_directive(state["messages"])
     empty_day_directive = _build_empty_day_recovery_directive(state["messages"])
     how_to_book_directive = _build_how_to_book_directive(state["messages"])
     wrong_tool_directive = _build_wrong_tool_in_booking_flow_directive(state["messages"], state.get("session_id"))
@@ -4587,7 +4691,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + bare_doctor_directive + show_all_doctors_directive
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
-        + empty_branch_directive + empty_day_directive
+        + empty_branch_directive + branches_only_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
         + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
         + booking_confirmation_directive + booking_success_directive
