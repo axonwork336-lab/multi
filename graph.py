@@ -4897,6 +4897,93 @@ _BARE_AFFIRMATION_RE = re.compile(
 )
 
 
+_BRANCH_SERVICES_OFFER_RE = re.compile(
+    r"(?:ال)?خدمات[^\n]{0,40}(?:ال)?فرع|(?:ال)?فرع[^\n]{0,40}(?:ال)?خدمات|"
+    r"services[^\n]{0,40}branch|branch[^\n]{0,40}services"
+)
+
+
+def _build_branch_services_affirmation_directive(messages: list, session_id: str) -> str:
+    """Fires when the patient answers a bare "yes" to an offer to show a
+    BRANCH's services.
+
+    WHY THIS EXISTS: the services directive keys on the PATIENT's own
+    wording ("خدمات", "services"), and a bare "اه" contains none of it -
+    so nothing fired on the one turn where the tool choice actually
+    mattered, and the model reached for `list_specialties` instead.
+
+    CONFIRMED REAL PRODUCTION FAILURE: asked "هل تحب تعرف وش الخدمات
+    المتوفرة في فرع الدقي؟", the patient said "اه", and the reply was
+    "الخدمات المتاحة في فرع الدقي هي نفس التخصصات المتوفرة في المستشفى"
+    followed by four SPECIALTIES (طب اسنان، جراحة الجسم الزجاجي
+    والشبكية، نساء و توليد، طب الباطنة). Those are booking specialties,
+    not services, and they are hospital-wide rather than that branch's -
+    two different wrong answers in one sentence. The branch's real
+    catalogue at that moment held two services (فحص النظر، كشف عيادة
+    النساء)."""
+
+    if not messages or not session_id:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage, AIMessage as _AIMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _BARE_AFFIRMATION_RE.match(_norm_ar(text)):
+        return ""
+
+    previous_ai = None
+    for msg in reversed(messages[:-1]):
+        if isinstance(msg, _AIMessage):
+            previous_ai = msg
+            break
+    if previous_ai is None:
+        return ""
+
+    previous_content = getattr(previous_ai, "content", "")
+    previous_text = previous_content if isinstance(previous_content, str) else str(previous_content)
+
+    if not _BRANCH_SERVICES_OFFER_RE.search(_norm_ar(previous_text)):
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    branch_name = (
+        session.get("info_branch_name")
+        or session.get("branch_display_name")
+        or ""
+    )
+
+    return (
+        "============================================================\n"
+        "THEY SAID YES TO SEEING THIS BRANCH'S SERVICES\n"
+        "============================================================\n"
+        "You offered to show the services at "
+        f"{branch_name or 'this branch'}, and they agreed. Call "
+        "`list_branch_services` now"
+        + (f" (branch_name=\"{branch_name}\")" if branch_name else "")
+        + " and show exactly what it returns, numbered, then ask if "
+        "they'd like details on one.\n\n"
+        "Do NOT call `list_specialties`. Specialties are the BOOKING "
+        "system's medical categories - a different list, for a different "
+        "purpose, and hospital-wide rather than per-branch. Do NOT call "
+        "`list_hospital_services` or `answer_hospital_faq` either: those "
+        "read the knowledge-base file, which has no per-branch data.\n\n"
+        "Never say a branch's services \"are the same as the hospital's "
+        "specialties\" - that is two wrong claims at once.\n"
+        "  - \"not_found\": say plainly that this branch publishes no "
+        "services right now. Do not substitute another list.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: this exact turn answered "
+        "with \"الخدمات المتاحة في فرع الدقي هي نفس التخصصات المتوفرة في "
+        "المستشفى\" and four specialty names, while the branch's real "
+        "catalogue held two actual services.\n\n"
+    )
+
+
 def _reply_asks_for_a_phone_already_known(reply_text: str, state: AgentState) -> bool:
     """True when the reply asks the patient for their phone number (or a
     booking reference in its place) immediately after they agreed to
@@ -5126,6 +5213,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     doctors_scope_directive = _build_doctors_scope_directive(
         state["messages"], state.get("session_id"),
     )
+    branch_services_yes_directive = _build_branch_services_affirmation_directive(
+        state["messages"], state.get("session_id"),
+    )
     empty_branch_booking_directive = _build_empty_branch_booking_intent_directive(
         state["messages"], state.get("session_id"),
     )
@@ -5225,6 +5315,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + review_phone_directive + selected_slot_directive + scope_directive
         + empty_branch_directive + branch_pick_directive
         + service_chosen_directive + doctors_scope_directive
+        + branch_services_yes_directive
         + empty_branch_booking_directive
         + branches_only_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
