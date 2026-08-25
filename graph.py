@@ -3628,26 +3628,121 @@ _SERVICE_CHOSEN_DIRECTIVE = (
     "restart the flow from zero.\n\n"
     "Call `find_available_doctors` with `service_name` set to the "
     "service they chose (its name, or the number they picked from the "
-    "service list). That sends the service's real id to the doctors "
+    "service list), and `branch_name` set to the branch if one is "
+    "already settled. That sends the service's real id to the doctors "
     "lookup, so only doctors who actually PROVIDE that service come "
     "back. Show them as a numbered list and ask ONE question: which "
-    "doctor.\n"
+    "doctor.\n\n"
+    "YOU DO NOT NEED A SPECIALTY. `specialty_ids` is optional - omit it "
+    "entirely. Do not call `list_specialties`, do not try to work out "
+    "which specialty the service belongs to, and above all do not tell "
+    "the patient you need one first. The service IS the filter.\n"
     "  - \"not_found\"/\"not_found_in_branch\": say plainly that nobody "
     "provides this service at this branch right now, and offer the "
     "branches that do.\n"
     "  - \"service_not_matched\": show the branch's service list again "
     "and let them pick from it - never guess.\n\n"
-    "CONFIRMED REAL PRODUCTION FAILURE: the patient was shown \"فحص "
-    "النظر\" at فرع الشيخ زايد, said \"اه\" to booking it, and the reply "
-    "was \"تحب تبدأ بالتخصص ولا بالدكتور؟\" followed by a four-item "
-    "specialty list - as if the service had never been chosen.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURES, twice on this exact step: the "
+    "patient was shown \"فحص النظر\", said \"اه\" to booking it, and got "
+    "\"تحب تبدأ بالتخصص ولا بالدكتور؟\" with a four-item specialty list; "
+    "then, with the branch settled too, \"راح أحتاج أعرف التخصص المناسب "
+    "الأول عشان أقدر أجيب لك الدكاترة المتاحين\" - a prerequisite that "
+    "does not exist, invented one step from finishing.\n\n"
 )
 
 
+_SERVICE_BOOKING_OFFER_RE = re.compile(
+    r"تحجز\s*موعد\s*ل|تحجز\s*ل|حجز\s*موعد\s*ل|book\s*(?:an\s*)?appointment\s*for"
+)
+
+
+_SHOW_DOCTORS_REQUEST_RE = re.compile(
+    r"(?:ال)?دكاتره|(?:ال)?دكاتره\s*المتاح|(?:ال)?اطباء|(?:ال)?دكتوره|"
+    r"doctors?|physicians?"
+)
+
+
+def _build_doctors_scope_directive(messages: list, session_id: str) -> str:
+    """Fires when the patient asks to see the doctors while a specific
+    branch is the one under discussion - and scopes the roster to that
+    branch.
+
+    CONFIRMED REAL PRODUCTION FAILURE: فرع الدقي was the branch being
+    discussed, the patient said "قولي كل الدكاتره المتاحه", and the
+    reply listed all EIGHT doctors in the hospital - including several
+    who do not work at الدقي at all. The lookup ran with branch_ids=None
+    because the branch had been chosen through the INFO flow, so the
+    booking session's own `branch_id` was still empty and nothing scoped
+    the query.
+
+    The rule the patient actually expects, and what this enforces:
+      - a branch IS in play -> show THAT branch's doctors;
+      - no branch in play  -> show every available doctor.
+    """
+
+    if not messages or not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+
+    branch_name = (
+        session.get("branch_display_name")
+        or session.get("info_branch_name")
+    )
+    if not branch_name:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _SHOW_DOCTORS_REQUEST_RE.search(_norm_ar(text)):
+        return ""
+
+    return (
+        "============================================================\n"
+        "DOCTORS MEANS THIS BRANCH'S DOCTORS\n"
+        "============================================================\n"
+        f"The branch under discussion is {branch_name}. When the patient "
+        "asks for the available doctors here - including \"كل الدكاترة "
+        "المتاحة\" - they mean everyone available AT THIS BRANCH, not "
+        "every doctor in the hospital.\n\n"
+        f"Call `find_available_doctors` with `branch_name=\"{branch_name}\"` "
+        "and show what it returns, numbered, in its exact order. Do not "
+        "widen the search, and do not pass `all_branches=True` - the "
+        "word \"كل\" here means \"all of them at this branch\", not "
+        "\"search the whole hospital\".\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: with فرع الدقي under "
+        "discussion, this request returned all eight hospital doctors, "
+        "several of whom do not work at الدقي - so the patient could "
+        "pick someone unreachable at the branch they had chosen.\n\n"
+        "(Only when NO branch has been chosen at all does an unscoped, "
+        "hospital-wide roster answer this question.)\n\n"
+    )
+
+
 def _build_service_chosen_directive(messages: list, session_id: str) -> str:
-    """Fires when a service has just been shown/chosen and the patient
-    is moving toward booking it - the point where the flow used to reset
-    to the specialty-vs-doctor question."""
+    """Fires when a service is what the patient is booking - the point
+    where the flow used to reset to the specialty-vs-doctor question.
+
+    Three ways a service counts as chosen, because it does not always
+    arrive through `list_branch_services`:
+      - a service list was shown and is remembered, or
+      - a service id is already on the session, or
+      - the assistant's own previous message offered to book a NAMED
+        service ("حابب تحجز موعد لفحص النظر في فرع الدقي؟") and the
+        patient agreed.
+    That last case is the confirmed real failure: the service had been
+    described from the knowledge base rather than picked off a list, so
+    nothing was remembered, the directive never fired, and the reply to
+    "اه" was "راح أحتاج أعرف التخصص المناسب الأول... تحب تبدأ بالتخصص
+    ولا بالدكتور؟" - inventing a prerequisite and restarting the flow.
+    """
 
     if not messages or not session_id:
         return ""
@@ -3657,16 +3752,27 @@ def _build_service_chosen_directive(messages: list, session_id: str) -> str:
     if session.get("doctor_id"):
         return ""
 
-    last_list = session.get("last_list") or {}
-    service_shown = last_list.get("entity_type") == "service" and last_list.get("items")
-
-    if not (service_shown or session.get("service_id")):
-        return ""
-
-    from langchain_core.messages import HumanMessage as _HumanMessage
+    from langchain_core.messages import HumanMessage as _HumanMessage, AIMessage as _AIMessage
 
     last = messages[-1]
     if not isinstance(last, _HumanMessage):
+        return ""
+
+    last_list = session.get("last_list") or {}
+    service_shown = last_list.get("entity_type") == "service" and last_list.get("items")
+
+    service_offered = False
+    if not (service_shown or session.get("service_id")):
+        for msg in reversed(messages[:-1]):
+            if not isinstance(msg, _AIMessage):
+                continue
+            previous = getattr(msg, "content", "")
+            previous = previous if isinstance(previous, str) else str(previous)
+            if previous.strip():
+                service_offered = bool(_SERVICE_BOOKING_OFFER_RE.search(_norm_ar(previous)))
+            break
+
+    if not (service_shown or session.get("service_id") or service_offered):
         return ""
 
     return _SERVICE_CHOSEN_DIRECTIVE
@@ -3762,6 +3868,8 @@ def _build_branch_pick_directive(messages: list, session_id: str) -> str:
         )
 
     session.pop("info_branch_no_doctors", None)
+    session["info_branch_id"] = chosen.get("id")
+    session["info_branch_name"] = name
     return (
         "============================================================\n"
         "THEY PICKED A BRANCH FROM THE LIST\n"
@@ -3769,18 +3877,35 @@ def _build_branch_pick_directive(messages: list, session_id: str) -> str:
         f"Their reply is a pick from the branch list you just showed: "
         f"option {position} is {name}"
         f"{(', address: ' + address) if address else ''}.\n\n"
-        f"Give the address of {name}, then ask ONE question: whether "
-        "they'd like to know about this branch's SERVICES or its "
-        "available DOCTORS. Resolve the pick from the list you already "
-        "showed - never guess, and never re-ask which branch they "
-        "meant.\n\n"
-        "If they ask for this branch's SERVICES, call "
-        "`list_branch_services` - the branch's real service catalogue "
-        "from the system. Do NOT use `list_hospital_services` or "
-        "`answer_hospital_faq` for a per-branch services question: they "
-        "read the knowledge-base file, which has no per-branch "
-        "information and returns the same generic hospital-wide list for "
-        "every branch.\n\n"
+        f"Give the address of {name}, then ask ONE question, in exactly "
+        "this shape:\n"
+        "    تحب تعرف عن الخدمات، ولا تحب تحجز موعد؟\n"
+        "Do NOT offer \"الدكاترة المتوفرين فيه\" as the alternative "
+        "here. CONFIRMED REAL PRODUCTION FAILURE: offering doctors at "
+        "this point made a bare \"اه\" ambiguous, and the reply jumped "
+        "straight to dumping a specialty list nobody had asked for. The "
+        "two real choices at this point are SERVICES or BOOKING.\n\n"
+        "  - They pick SERVICES -> call `list_branch_services` (the "
+        "branch's real catalogue). Never `list_hospital_services` or "
+        "`answer_hospital_faq` for a per-branch services question - "
+        "they have no per-branch data and return the same generic "
+        "hospital-wide list for every branch.\n"
+        f"  - They pick BOOKING -> the branch is {name}; now ask the "
+        "single specialty-vs-doctor question (\"تحب تبدأ بالتخصص ولا "
+        "بالدكتور؟\") and NOTHING else - do not call `list_specialties` "
+        "and do not print a specialty list in that same message. Many "
+        "patients already know their doctor's name; making them read a "
+        "specialty list first is a wasted turn.\n\n"
+        f"IF THEY ASK FOR DOCTORS AT ANY POINT, they mean the doctors at "
+        f"{name} - the branch they are looking at - not every doctor in "
+        "the hospital. Pass that branch through (`branch_name=\"" + name +
+        "\"` on `find_available_doctors`) so the roster is scoped to it. "
+        "CONFIRMED REAL PRODUCTION FAILURE: asked for the available "
+        "doctors while فرع الدقي was the branch under discussion, the "
+        "reply listed all eight doctors in the hospital, including ones "
+        "who do not work there at all.\n\n"
+        "Resolve the pick from the list you already showed - never "
+        "guess, and never re-ask which branch they meant.\n\n"
     )
 
 
@@ -4912,6 +5037,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     service_chosen_directive = _build_service_chosen_directive(
         state["messages"], state.get("session_id"),
     )
+    doctors_scope_directive = _build_doctors_scope_directive(
+        state["messages"], state.get("session_id"),
+    )
     empty_branch_booking_directive = _build_empty_branch_booking_intent_directive(
         state["messages"], state.get("session_id"),
     )
@@ -5010,7 +5138,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
         + empty_branch_directive + branch_pick_directive
-        + service_chosen_directive
+        + service_chosen_directive + doctors_scope_directive
         + empty_branch_booking_directive
         + branches_only_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
