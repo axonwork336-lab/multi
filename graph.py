@@ -3617,6 +3617,61 @@ _BOOKING_INTENT_RE = re.compile(
 )
 
 
+_SERVICE_CHOSEN_DIRECTIVE = (
+    "============================================================\n"
+    "A SERVICE IS ALREADY CHOSEN - FIND ITS DOCTORS, DON'T RESTART\n"
+    "============================================================\n"
+    "The patient has picked a SERVICE and said they want to book it. "
+    "That choice already tells you what they need - so do NOT ask "
+    "\"تحب تبدأ بالتخصص ولا بالدكتور؟\", and do NOT show a specialty "
+    "list. Both throw away a decision they have already made and "
+    "restart the flow from zero.\n\n"
+    "Call `find_available_doctors` with `service_name` set to the "
+    "service they chose (its name, or the number they picked from the "
+    "service list). That sends the service's real id to the doctors "
+    "lookup, so only doctors who actually PROVIDE that service come "
+    "back. Show them as a numbered list and ask ONE question: which "
+    "doctor.\n"
+    "  - \"not_found\"/\"not_found_in_branch\": say plainly that nobody "
+    "provides this service at this branch right now, and offer the "
+    "branches that do.\n"
+    "  - \"service_not_matched\": show the branch's service list again "
+    "and let them pick from it - never guess.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: the patient was shown \"فحص "
+    "النظر\" at فرع الشيخ زايد, said \"اه\" to booking it, and the reply "
+    "was \"تحب تبدأ بالتخصص ولا بالدكتور؟\" followed by a four-item "
+    "specialty list - as if the service had never been chosen.\n\n"
+)
+
+
+def _build_service_chosen_directive(messages: list, session_id: str) -> str:
+    """Fires when a service has just been shown/chosen and the patient
+    is moving toward booking it - the point where the flow used to reset
+    to the specialty-vs-doctor question."""
+
+    if not messages or not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+
+    if session.get("doctor_id"):
+        return ""
+
+    last_list = session.get("last_list") or {}
+    service_shown = last_list.get("entity_type") == "service" and last_list.get("items")
+
+    if not (service_shown or session.get("service_id")):
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    return _SERVICE_CHOSEN_DIRECTIVE
+
+
 def _build_branch_pick_directive(messages: list, session_id: str) -> str:
     """Fires when the patient's latest message is a bare number picking
     from a branch list that was just shown, and resolves it HERE, in the
@@ -4854,6 +4909,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     branch_pick_directive = _build_branch_pick_directive(
         state["messages"], state.get("session_id"),
     )
+    service_chosen_directive = _build_service_chosen_directive(
+        state["messages"], state.get("session_id"),
+    )
     empty_branch_booking_directive = _build_empty_branch_booking_intent_directive(
         state["messages"], state.get("session_id"),
     )
@@ -4952,6 +5010,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
         + empty_branch_directive + branch_pick_directive
+        + service_chosen_directive
         + empty_branch_booking_directive
         + branches_only_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
