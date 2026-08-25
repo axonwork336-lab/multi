@@ -2741,17 +2741,15 @@ def match_entity_info(
     Branch fields: name, altName, address, cityName, countryName,
     stateName, email, mobile, hasAvailableDoctors.
 
-    `hasAvailableDoctors` (branches only) is FALSE when that branch has
-    no bookable doctor right now. It is NOT a filter and NOT something
-    to announce: when listing branches, show EVERY branch returned and
-    say nothing about availability - dropping a real branch, or adding
-    "this one has no doctors", both make an honest branch list wrong.
-    Its ONLY purpose is this: NEVER offer to book at, or start a booking
-    flow for, a branch whose flag is false - not even as a friendly
-    "...or would you like to book there?". Answer whatever they actually
-    asked (address/details/services) and leave booking out of it
-    entirely. If THEY ask to book there, only then say the branch has
-    nobody available and offer the other branches by name."""
+    `hasAvailableDoctors` appears ONLY on a SINGLE matched branch (a
+    positional pick or a name match) - never on a branch LIST, so a list
+    can never be filtered or annotated by it. FALSE means that branch
+    has no bookable doctor right now. Its only purpose: never offer to
+    book at, or start a booking flow for, such a branch - not even as a
+    friendly "...or would you like to book there?". Give the address,
+    offer its SERVICES, and leave booking out of it. If THEY ask to book
+    there, only then say the branch has nobody available and offer the
+    branches that do, by name."""
 
     entity_type = (entity_type or "").strip().lower()
     if entity_type not in ("doctor", "branch"):
@@ -2792,20 +2790,28 @@ def match_entity_info(
                 for i in items
             ]
         else:
-            # WHICH BRANCHES CAN ACTUALLY BE BOOKED AT - carried on every
-            # branch row so the reply never offers to book at a branch
-            # that has nobody.
+            # WHICH BRANCHES CAN ACTUALLY BE BOOKED AT.
             #
-            # CONFIRMED REAL PRODUCTION FAILURE: this list went out with
-            # no availability information at all, so the model had no
-            # way to know فرع المعادي has zero doctors. When the patient
-            # picked it, the reply volunteered "...أو ترغب بحجز موعد
-            # فيه؟" and then "تحب تحجز في فرع المعادي عند أي دكتور؟" -
-            # twice offering a booking that cannot exist, at a branch
-            # the tools already knew was empty. Note the model answered
-            # BOTH of those turns with no tool call at all, purely from
-            # this list - which is exactly why the fact has to travel
-            # WITH the list rather than waiting for a later lookup.
+            # DELIBERATELY *NOT* RETURNED IN LIST MODE - only stored in
+            # the remembered list below, so a later positional pick can
+            # carry it. The RETURNED rows carry no availability field at
+            # all.
+            #
+            # WHY THE FIELD IS HIDDEN HERE RATHER THAN JUST DOCUMENTED:
+            # it was originally returned on every row with prose rules
+            # (in three separate places) saying "never announce this,
+            # never filter on it". CONFIRMED REAL PRODUCTION FAILURES,
+            # twice, despite those rules: first the reply appended a
+            # paragraph naming the three empty branches, then - after
+            # the rules were tightened - it appended "(لا يوجد أطباء
+            # متاحين حالياً)" to each of those three rows instead. A
+            # field visible in the tool result is a field the model will
+            # eventually surface; the only reliable fix is not to send
+            # it when it isn't needed.
+            #
+            # It IS still returned for a SINGLE branch (positional pick,
+            # name match), which is the only moment it's actually needed
+            # - deciding whether to offer a booking there.
             bookable_branch_ids = _branch_ids_with_available_doctors(state, base_url) or set()
             shaped = [
                 {
@@ -2814,10 +2820,19 @@ def match_entity_info(
                     "altName": i.get("altName"),
                     "address": i.get("address"),
                     "cityName": i.get("cityName"),
-                    "hasAvailableDoctors": bool(i.get("id") in bookable_branch_ids),
                 }
                 for i in items
             ]
+            if not shaped:
+                return {"status": "not_matched"}
+            # The remembered copy keeps the flag - it never reaches the
+            # model directly, and it's what a bare "4" resolves against.
+            remembered_with_flag = [
+                dict(row, hasAvailableDoctors=bool(row.get("id") in bookable_branch_ids))
+                for row in shaped
+            ]
+            _remember_list(state, entity_type, remembered_with_flag)
+            return {"status": "list", "items": shaped}
         if not shaped:
             return {"status": "not_matched"}
         # Remembered so a later bare number ("2") resolves by position
@@ -2957,18 +2972,19 @@ def match_entity_info(
                     "altName": b.get("altName"),
                     "address": b.get("address"),
                     "cityName": b.get("cityName"),
-                    # These are, by construction, the branches that DO
-                    # have someone - stated explicitly so the flag means
-                    # the same thing on every branch row this tool
-                    # returns, from whichever path.
-                    "hasAvailableDoctors": True,
                 }
                 for b in available_items
             ]
             # Remembered too, for the identical reason as the plain list
             # mode above - the patient is very likely to reply with a
-            # bare number to pick one of these.
-            _remember_list(state, "branch", shaped_available)
+            # bare number to pick one of these. These are, by
+            # construction, branches that DO have someone, so the
+            # remembered copy says so; the returned rows carry no
+            # availability field, same as list mode.
+            _remember_list(
+                state, "branch",
+                [dict(row, hasAvailableDoctors=True) for row in shaped_available],
+            )
             return {
                 "status": "not_matched",
                 "available_branches": shaped_available,
