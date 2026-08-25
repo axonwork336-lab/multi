@@ -2771,6 +2771,82 @@ _AVAILABILITY_TOOLS = (
 )
 
 
+_AVAILABILITY_DENIAL_RE = re.compile(
+    r"ما\s*(?:في|فيه|ظهر|لقيت|لقينا)[^.\n؟?]{0,40}مواعيد|"
+    r"مفيش[^.\n؟?]{0,40}مواعيد|"
+    r"لا\s*(?:يوجد|توجد)[^.\n؟?]{0,40}مواعيد|"
+    r"مواعيد[^.\n؟?]{0,25}(?:متاحه|متاحة)?[^.\n؟?]{0,15}حاليا?\b[^.\n؟?]{0,15}(?:عند|مع)|"
+    r"no\s+(?:available\s+)?(?:appointments?|slots?|availability)|"
+    r"(?:doesn'?t|does\s+not)\s+have\s+(?:any\s+)?(?:available\s+)?(?:appointments?|slots?)"
+)
+
+_AVAILABILITY_LOOKUP_TOOLS = (
+    "list_available_days_for_booking",
+    "get_available_slots_for_booking",
+    "resolve_available_day",
+    "get_doctor_schedule_for_booking",
+    "find_best_doctor_in_specialty",
+    "get_available_reschedule_slots",
+)
+
+
+def _reply_denies_availability_without_lookup(reply_text: str, state: AgentState) -> bool:
+    """True when the reply tells the patient a doctor has no available
+    appointments, while NO availability tool has run in this
+    conversation.
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient picked د. هشام عوض
+    from position 1, `match_entity_for_booking` confirmed him - and the
+    very next line was "لكن ما ظهر لي مواعيد متاحة حاليا عند د. هشام
+    عوض", followed by an offer to look at other doctors. No days tool
+    and no slots tool were called anywhere in that turn (both log
+    unconditionally, and neither appears in the trace). The doctor was
+    written off as unavailable on nothing at all, and the patient was
+    steered away from a booking that may well have been possible.
+
+    `_reply_invents_availability` is the mirror image of this - it
+    catches dates/times asserted with no tool behind them. Between them
+    both directions are covered: you may not invent availability, and
+    you may not invent its absence."""
+
+    if not reply_text:
+        return False
+
+    if not _AVAILABILITY_DENIAL_RE.search(_norm_ar(reply_text)):
+        return False
+
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "name", None) in _AVAILABILITY_LOOKUP_TOOLS:
+            return False
+
+    return True
+
+
+_AVAILABILITY_DENIAL_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU SAID THERE ARE NO APPOINTMENTS - BUT YOU NEVER CHECKED\n"
+    "============================================================\n"
+    "Your previous draft told the patient a doctor has no available "
+    "appointments. No availability tool has run in this conversation, "
+    "so that claim has nothing behind it - you decided it yourself.\n\n"
+    "A doctor being unavailable is a FACT, and it only ever comes from "
+    "`list_available_days_for_booking` (or `resolve_available_day` / "
+    "`get_available_slots_for_booking`). Call "
+    "`list_available_days_for_booking` NOW and answer from what it "
+    "actually returns:\n"
+    "  - days come back -> show the soonest date and ask if it suits "
+    "them.\n"
+    "  - \"not_found\" -> only THEN may you say this doctor has nothing "
+    "open, and only then offer another doctor.\n"
+    "  - \"missing_branch\" -> settle the branch first.\n\n"
+    "Do not offer other doctors or other branches in place of checking. "
+    "CONFIRMED REAL PRODUCTION FAILURE: a doctor was confirmed and the "
+    "next line was \"ما ظهر لي مواعيد متاحة حاليا عند د. [اسم]\" with no "
+    "tool call at all - the patient was pushed off a booking that was "
+    "never actually checked.\n\n"
+)
+
+
 def _reply_invents_availability(reply_text, state) -> bool:
     """True when the reply states an appointment date or times that no
     availability tool in this conversation ever returned.
@@ -3314,6 +3390,12 @@ _REPLY_VERIFIERS = (
         lambda reply, state: _PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE,
         "reply asked for a phone number (or a booking reference instead) right after "
         "the patient agreed to proceed on the channel number the service already has",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_denies_availability_without_lookup(reply, state),
+        lambda reply, state: _AVAILABILITY_DENIAL_CORRECTION_DIRECTIVE,
+        "reply said a doctor has no available appointments while no availability "
+        "tool has run in this conversation",
     ),
     (
         lambda reply, state, agent_name: _reply_denies_a_branch_the_tools_offered(reply, state),
