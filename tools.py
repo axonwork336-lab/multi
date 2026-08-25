@@ -1424,13 +1424,49 @@ def _resolve_branch_by_name(base_url: str, branch_name: str, language: str = "ar
     if state is not None:
         branch_items = _with_branch_aliases(branch_items, state)
 
-        # Narrow the candidate pool to branches that ACTUALLY have a
-        # bookable doctor right now, before fuzzy-matching against it.
+    # TWO-TIER RESOLUTION - mirrors match_entity_info's own fix for the
+    # identical underlying problem (see there for the full rationale).
+    #
+    # An EXACT/near-exact reference - the patient really did type this
+    # specific branch's name - must resolve to THAT branch, regardless
+    # of whether it currently has a doctor. Only a WEAK/guessed match
+    # should ever be restricted to branches that currently have one.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE (worse than the one this
+    # filtering was originally added to fix): the patient typed
+    # "المعادي" - a REAL, EXACTLY-NAMED branch, just one with no doctors
+    # right now - and because Maadi had been filtered out of the
+    # candidate pool BEFORE matching even started, the fuzzy match was
+    # forced to guess among the remaining (active) branches and silently
+    # locked in "الدقي" (Dokki) instead - a completely different, real
+    # branch that the patient never mentioned. `find_available_doctors`
+    # then confirmed that WRONG branch into the session with no
+    # confirmation step at all, and displayed its doctors while still
+    # labeling the reply "فرع المعادي". Filtering the pool BEFORE
+    # checking for an exact reference silently swaps one real branch for
+    # another - worse than the original bug (a typo pointing at an empty
+    # branch), because here the patient's own exact words are discarded.
+    exact_probe = _fuzzy_match(branch_name, branch_items, ["name", "altName", "formatedName", "cityName", "_configAliases"])
+
+    if exact_probe["result"] == "matched" and exact_probe.get("score", 0) >= 0.95:
+        # A confident, explicit reference - never narrowed further. Let
+        # the normal downstream availability check (in
+        # `find_available_doctors`, via `not_found_in_branch`) be the one
+        # to say honestly "this branch has nobody right now" - that is
+        # a true statement about a real branch, not a wrong branch
+        # pretending to be the right one.
+        return exact_probe["item"]
+
+    if state is not None:
+        # Not a confident/explicit reference - this is a GUESS, so it
+        # must never be allowed to land on a branch with no currently
+        # available doctor. Narrow the candidate pool to branches that
+        # ACTUALLY have a bookable doctor right now, before guessing.
         # CONFIRMED REAL PRODUCTION FAILURE: the raw text "فرع المنار"
-        # (not a real branch name) fuzzy-matched to "فرع المعادي" - a
-        # real branch that currently has zero doctors in the specialty
-        # being booked - and the patient was walked into a dead end
-        # instead of being shown a branch that actually has someone.
+        # (not a real branch name at all) fuzzy-matched to "فرع المعادي"
+        # - a real branch that currently has zero doctors - and the
+        # patient was walked into a dead end instead of being shown a
+        # branch that actually has someone.
         #
         # Falls back to the UNFILTERED list whenever the filter itself
         # can't be trusted: an API failure (`None`), or a filter that
@@ -3643,32 +3679,54 @@ def match_entity_for_booking(
         result = {"success": True, "data": {"items": candidate_branches}, "error": None}
         name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
     else:
-        # NO doctor confirmed yet - the same "which real branch did they
-        # mean" narrowing as `_resolve_branch_by_name` applies here too,
-        # for the identical reason: a branch that exists in the system
-        # but currently has zero available doctors (e.g. "فرع المعادي")
-        # must never be offered as a match or a "did you mean" suggestion
-        # just because its name is a close string match. Narrow to
-        # branches with a currently-available doctor (in this booking's
-        # specialty, when known) BEFORE fuzzy-matching against it.
+        # NO doctor confirmed yet.
+        #
+        # TWO-TIER RESOLUTION - mirrors the fix in `_resolve_branch_by_name`
+        # and `match_entity_info` for the identical underlying problem.
+        #
+        # An EXACT/near-exact reference - the patient really did type
+        # this specific branch's name - must resolve to THAT branch,
+        # regardless of whether it currently has a doctor. Narrowing the
+        # candidate pool BEFORE checking for an exact reference silently
+        # swaps one real branch for a DIFFERENT real branch when the
+        # named one has no doctors - CONFIRMED REAL PRODUCTION FAILURE:
+        # the patient typed "المعادي" (a real, exactly-named branch,
+        # just currently empty of doctors), and because Maadi had
+        # already been filtered out of the candidate pool before
+        # matching even started, the fuzzy match was forced to guess
+        # among the remaining branches and silently locked in "الدقي"
+        # (Dokki) instead - a completely different, real branch the
+        # patient never mentioned - with no confirmation step at all.
+        #
+        # Only a WEAK/guessed match (not an explicit reference) is ever
+        # restricted to branches that currently have a doctor - for the
+        # ORIGINAL reason this narrowing exists: "فرع المنار" (not a real
+        # branch at all) must never be allowed to guess its way onto a
+        # real-but-empty branch like "فرع المعادي".
         all_result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
         result = all_result
         if all_result["success"]:
-            all_items = (all_result["data"] or {}).get("items", [])
-            active_branch_ids = _branch_ids_with_available_doctors(
-                state, base_url, session.get("specialty_ids") or None,
+            raw_items = (all_result["data"] or {}).get("items", [])
+            aliased_items = _with_branch_aliases(raw_items, state)
+            exact_probe = _fuzzy_match(
+                user_input, aliased_items,
+                ["name", "altName", "formatedName", "cityName", "_configAliases"],
             )
-            if active_branch_ids:
-                narrowed_items = [b for b in all_items if b.get("id") in active_branch_ids]
-                if narrowed_items:
-                    result = {"success": True, "data": {"items": narrowed_items}, "error": None}
-                else:
-                    logger.info(
-                        "match_entity_for_booking (branch, no doctor yet): no currently-staffed "
-                        "branch to narrow to for specialty_ids=%s - falling back to the "
-                        "unfiltered branch list",
-                        session.get("specialty_ids"),
-                    )
+            if not (exact_probe["result"] == "matched" and exact_probe.get("score", 0) >= 0.95):
+                active_branch_ids = _branch_ids_with_available_doctors(
+                    state, base_url, session.get("specialty_ids") or None,
+                )
+                if active_branch_ids:
+                    narrowed_items = [b for b in raw_items if b.get("id") in active_branch_ids]
+                    if narrowed_items:
+                        result = {"success": True, "data": {"items": narrowed_items}, "error": None}
+                    else:
+                        logger.info(
+                            "match_entity_for_booking (branch, no doctor yet): no currently-staffed "
+                            "branch to narrow to for specialty_ids=%s - falling back to the "
+                            "unfiltered branch list",
+                            session.get("specialty_ids"),
+                        )
         name_keys = ["name", "altName", "formatedName", "cityName", "_configAliases"]
 
     if not result["success"]:
