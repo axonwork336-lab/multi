@@ -3597,6 +3597,7 @@ def _fetch_doctors_for_booking(
     base_url: str,
     specialty_ids: Optional[list],
     branch_ids: Optional[list],
+    service_ids: Optional[list] = None,
 ) -> dict:
     """Fetch the bookable-doctor list, defensively.
 
@@ -3629,10 +3630,14 @@ def _fetch_doctors_for_booking(
     Returns api.get_doctors' own result dict, so callers are unchanged.
     """
 
+    # `service_ids` IS PART OF THE KEY. Without it, a service-filtered
+    # result and an unfiltered one for the same branch collide, and
+    # whichever ran first is served to both.
     cache_key = (
         base_url,
         tuple(sorted(specialty_ids)) if specialty_ids else None,
         tuple(sorted(branch_ids)) if branch_ids else None,
+        tuple(sorted(service_ids)) if service_ids else None,
     )
 
     cached = _DOCTOR_LIST_CACHE.get(cache_key)
@@ -3655,6 +3660,7 @@ def _fetch_doctors_for_booking(
         base_url,
         specialty_ids=specialty_ids or None,
         branch_ids=branch_ids,
+        service_ids=service_ids or None,
         has_published_service=True,
         has_service_schedule=True,
         intersection_start=window_start,
@@ -3668,8 +3674,8 @@ def _fetch_doctors_for_booking(
         items = (result.get("data") or {}).get("items", [])
         logger.info(
             "doctor list: precise query took %.1fs -> %d items "
-            "(specialty_ids=%s branch_ids=%s)",
-            elapsed, len(items), specialty_ids, branch_ids,
+            "(specialty_ids=%s branch_ids=%s service_ids=%s)",
+            elapsed, len(items), specialty_ids, branch_ids, service_ids,
         )
         _DOCTOR_LIST_CACHE[cache_key] = (time.monotonic(), result)
         return result
@@ -3686,6 +3692,13 @@ def _fetch_doctors_for_booking(
         base_url,
         specialty_ids=specialty_ids or None,
         branch_ids=branch_ids,
+        # The service filter is kept on the fallback too. Dropping the
+        # SCHEDULE-INTERSECTION window is a deliberate, documented
+        # loosening (the slot step re-checks availability anyway);
+        # dropping the service would be a different thing entirely -
+        # doctors who do not provide what the patient asked for are not
+        # a "slightly looser list", they are wrong answers.
+        service_ids=service_ids or None,
         has_published_service=True,
         has_service_schedule=True,
         page_size=50,
@@ -3950,7 +3963,18 @@ def match_entity_for_booking(
         # doctor for a NEW BOOKING, and a doctor with no published
         # service or no schedule cannot be booked, so listing them only
         # offers the patient choices that dead-end.
-        result = _fetch_doctors_for_booking(state, base_url, session.get("specialty_ids"), branch_filter)
+        # A SERVICE ALREADY CHOSEN MUST NARROW THIS LIST TOO.
+        #
+        # `find_available_doctors` honours the session's `service_id`,
+        # but this path did not - so the same booking showed a
+        # service-filtered roster from one tool and an unfiltered,
+        # longer one from the other, for the same branch. The extra
+        # names are doctors who do not provide the service the patient
+        # picked.
+        result = _fetch_doctors_for_booking(
+            state, base_url, session.get("specialty_ids"), branch_filter,
+            service_ids=[session["service_id"]] if session.get("service_id") else None,
+        )
 
         logger.info(
             "match_entity_for_booking: doctor fetch (mode=%s) -> success=%s items=%d",
