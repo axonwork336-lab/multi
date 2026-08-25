@@ -606,6 +606,43 @@ def get_doctor_fees(
     return _post_json(url, payload, client_id=client_id, language=language)
 
 
+def get_services(
+    base_url: str,
+    branch_ids: Optional[list] = None,
+    is_published: bool = True,
+    page_size: int = 500,
+    client_id: Optional[str] = None,
+    language: Optional[str] = None,
+) -> dict:
+    """POST {base_url}/api/Services/GetList.
+
+    The clinic's real SERVICE CATALOGUE, straight from the system -
+    optionally narrowed to the branches that actually provide each
+    service via `branch_ids`, and to published services only via
+    `is_published`.
+
+    NOT the same thing as the services section of the knowledge base
+    file: that one is marketing copy describing the hospital's service
+    lines as a whole, with no per-branch information at all. When the
+    question is "what services does THIS BRANCH provide?", only this
+    endpoint can answer it - see tools.list_branch_services.
+
+    `pageNumber` must be 1 or above, not 0 - same as every other
+    paged endpoint here (see get_specialties()'s note)."""
+
+    url = f"{base_url}/api/Services/GetList"
+    payload = {
+        "pageNumber": 1,
+        "pageSize": page_size,
+        "isPublished": is_published,
+    }
+
+    if branch_ids:
+        payload["branchIds"] = branch_ids
+
+    return _post_json(url, payload, client_id=client_id, language=language)
+
+
 def get_patient_info(
     base_url: str,
     mobile_number: str,
