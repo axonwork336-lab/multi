@@ -2739,7 +2739,15 @@ def match_entity_info(
     defaultServiceName (serviceName). Fees are NOT included here - use
     `get_doctor_fees` if (and only if) the user explicitly asks a price.
     Branch fields: name, altName, address, cityName, countryName,
-    stateName, email, mobile."""
+    stateName, email, mobile, hasAvailableDoctors.
+
+    `hasAvailableDoctors` (branches only) is FALSE when that branch has
+    no bookable doctor right now. NEVER offer to book at, or start a
+    booking flow for, a branch whose flag is false - not even as a
+    friendly "...or would you like to book there?". Answer whatever
+    they actually asked (address/details/services) and leave booking
+    out of it entirely. If THEY ask to book there, only then say the
+    branch has nobody available and offer the other branches by name."""
 
     entity_type = (entity_type or "").strip().lower()
     if entity_type not in ("doctor", "branch"):
@@ -2780,6 +2788,21 @@ def match_entity_info(
                 for i in items
             ]
         else:
+            # WHICH BRANCHES CAN ACTUALLY BE BOOKED AT - carried on every
+            # branch row so the reply never offers to book at a branch
+            # that has nobody.
+            #
+            # CONFIRMED REAL PRODUCTION FAILURE: this list went out with
+            # no availability information at all, so the model had no
+            # way to know فرع المعادي has zero doctors. When the patient
+            # picked it, the reply volunteered "...أو ترغب بحجز موعد
+            # فيه؟" and then "تحب تحجز في فرع المعادي عند أي دكتور؟" -
+            # twice offering a booking that cannot exist, at a branch
+            # the tools already knew was empty. Note the model answered
+            # BOTH of those turns with no tool call at all, purely from
+            # this list - which is exactly why the fact has to travel
+            # WITH the list rather than waiting for a later lookup.
+            bookable_branch_ids = _branch_ids_with_available_doctors(state, base_url) or set()
             shaped = [
                 {
                     "id": i.get("id"),
@@ -2787,6 +2810,7 @@ def match_entity_info(
                     "altName": i.get("altName"),
                     "address": i.get("address"),
                     "cityName": i.get("cityName"),
+                    "hasAvailableDoctors": bool(i.get("id") in bookable_branch_ids),
                 }
                 for i in items
             ]
@@ -2846,6 +2870,24 @@ def match_entity_info(
             }
 
         shaped_pos = shape_fn_for_pos(chosen_raw) if chosen_raw else dict(remembered)
+
+        # Carry the availability flag through a positional pick too.
+        # The remembered row already has it (every branch list this tool
+        # writes now includes it); the freshly-shaped row does not, and
+        # a positional pick is EXACTLY the path the confirmed failure
+        # went through - the patient typed "1" for فرع المعادي and the
+        # reply then offered to book there.
+        if entity_type == "branch" and "hasAvailableDoctors" not in shaped_pos:
+            if "hasAvailableDoctors" in remembered:
+                shaped_pos["hasAvailableDoctors"] = remembered["hasAvailableDoctors"]
+            else:
+                try:
+                    shaped_pos["hasAvailableDoctors"] = bool(
+                        shaped_pos.get("id") in (_branch_ids_with_available_doctors(state, base_url) or set())
+                    )
+                except Exception:
+                    logger.exception("match_entity_info: failed to compute hasAvailableDoctors for a positional pick")
+
         return {"status": "matched", "item": shaped_pos}
 
     match_candidates = items
@@ -2911,6 +2953,11 @@ def match_entity_info(
                     "altName": b.get("altName"),
                     "address": b.get("address"),
                     "cityName": b.get("cityName"),
+                    # These are, by construction, the branches that DO
+                    # have someone - stated explicitly so the flag means
+                    # the same thing on every branch row this tool
+                    # returns, from whichever path.
+                    "hasAvailableDoctors": True,
                 }
                 for b in available_items
             ]
@@ -2939,7 +2986,7 @@ def match_entity_info(
         }
 
     def _shape_branch(i):
-        return {
+        shaped_branch = {
             "id": i.get("id"),
             "name": i.get("name") or i.get("formatedName"),
             "altName": i.get("altName"),
@@ -2950,6 +2997,16 @@ def match_entity_info(
             "email": i.get("email"),
             "mobile": i.get("mobile"),
         }
+        # Same reason as the list-mode flag above: whether this branch
+        # can be booked at travels WITH the branch, so a reply can never
+        # offer a booking at an empty one.
+        try:
+            shaped_branch["hasAvailableDoctors"] = bool(
+                i.get("id") in (_branch_ids_with_available_doctors(state, base_url) or set())
+            )
+        except Exception:
+            logger.exception("match_entity_info: failed to compute hasAvailableDoctors")
+        return shaped_branch
 
     shape_fn = _shape_doctor if entity_type == "doctor" else _shape_branch
 
