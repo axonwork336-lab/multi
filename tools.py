@@ -2432,6 +2432,13 @@ def list_hospital_services(state: Annotated[AgentState, InjectedState]) -> dict:
     Use `answer_hospital_faq` afterwards, when the user asks about ONE
     specific service in detail.
 
+    NOT FOR A SINGLE BRANCH'S SERVICES. This reads the knowledge-base
+    file, which describes the hospital's service lines as a whole and
+    carries NO per-branch information - so it returns the identical list
+    no matter which branch was asked about. For "خدمات فرع كذا" / "what
+    services does this branch have?", call `list_branch_services`, which
+    reads the real service catalogue filtered to that branch.
+
     Returns:
     {"status": "found", "services": ["...", ...]}
     {"status": "not_found"}  # no services section in this clinic's knowledge base
@@ -2453,6 +2460,117 @@ def list_hospital_services(state: Annotated[AgentState, InjectedState]) -> dict:
         return {"status": "not_found"}
 
     return {"status": "found", "services": services}
+
+
+@tool
+def list_branch_services(
+    state: Annotated[AgentState, InjectedState],
+    branch_name: str = "",
+) -> dict:
+    """List the services a SPECIFIC BRANCH provides, read from the
+    clinic's real service catalogue (the Services endpoint), filtered to
+    that branch and to published services only.
+
+    CALL THIS - not `list_hospital_services`, and not
+    `answer_hospital_faq` - whenever the question is about ONE BRANCH's
+    services ("خدمات فرع المعادي", "إيه الخدمات في الفرع ده؟", "what
+    services does this branch have?"). Those other two answer from the
+    knowledge base file, which describes the hospital's service lines as
+    a whole and carries NO per-branch information at all - so using them
+    here returns the same six generic service lines for every branch,
+    which is not an answer to the question that was asked. CONFIRMED
+    REAL PRODUCTION FAILURE: asked for فرع المعادي's services, the reply
+    listed the hospital-wide knowledge-base list verbatim.
+
+    `branch_name`: optional. Pass the patient's raw branch text when
+    they named one. Leave it empty to use the branch already confirmed
+    in this booking session, or the branch most recently shown to them.
+
+    Returns:
+    {"status": "found", "branch": {"id", "name"}, "services": [{"name", "description"}, ...]}
+    {"status": "not_found", "branch": {...}}  # this branch publishes no services
+    {"status": "branch_not_matched"}  # branch_name given but nothing matched
+    {"status": "missing_branch"}  # no branch named and none remembered - ask which branch
+    {"status": "not_configured"} / {"status": "error"}"""
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning(
+            "list_branch_services called but no doctors_base_url is configured for client_id=%s",
+            state.get("client_id"),
+        )
+        return {"status": "not_configured"}
+
+    session = _get_booking_session(state.get("session_id"))
+
+    branch_id = None
+    branch_display = None
+
+    if branch_name and branch_name.strip():
+        matched = _resolve_branch_by_name(base_url, branch_name, conversation_language(state), state=state)
+        if matched is None:
+            logger.info("list_branch_services: branch_name=%r did not match any branch", branch_name)
+            return {"status": "branch_not_matched"}
+        branch_id = matched.get("id")
+        branch_display = _arabic_preferred_name(matched)
+    else:
+        branch_id = session.get("branch_id")
+        branch_display = session.get("branch_display_name")
+
+        if not branch_id:
+            # Fall back to the branch most recently SHOWN to them - the
+            # patient routinely asks "and its services?" right after
+            # picking one from a list, with no name repeated.
+            last_list = session.get("last_list") or {}
+            if last_list.get("entity_type") == "branch":
+                items = last_list.get("items") or []
+                if len(items) == 1:
+                    branch_id = items[0].get("id")
+                    branch_display = _arabic_preferred_name(items[0]) or items[0].get("name")
+
+    if not branch_id:
+        return {"status": "missing_branch"}
+
+    result = api.get_services(
+        base_url, branch_ids=[branch_id], is_published=True,
+        language=conversation_language(state),
+    )
+
+    if not result["success"]:
+        logger.error(
+            "list_branch_services: get_services failed for branch_id=%s: status_code=%s error=%s",
+            branch_id, result.get("status_code"), result.get("error"),
+        )
+        return {"status": "error"}
+
+    language = conversation_language(state)
+    services = []
+    seen = set()
+
+    for item in (result["data"] or {}).get("items", []):
+        # The Services endpoint returns name/altName directly (unlike
+        # slot rows, which carry serviceName/serviceAltName), so
+        # `_preferred_name` is the right helper here, not `_service_name`.
+        name = _preferred_name(item, language)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        description = (
+            item.get("altDescription") if language != "en" else item.get("description")
+        ) or item.get("description") or item.get("altDescription")
+        services.append({"name": name, "description": description})
+
+    branch_info = {"id": branch_id, "name": branch_display}
+
+    logger.info(
+        "list_branch_services: branch_id=%s (%s) -> %d published service(s)",
+        branch_id, branch_display, len(services),
+    )
+
+    if not services:
+        return {"status": "not_found", "branch": branch_info}
+
+    return {"status": "found", "branch": branch_info, "services": services}
 
 
 @tool
@@ -6266,6 +6384,7 @@ ALL_TOOLS = [
     reschedule_appointment,
     answer_hospital_faq,
     list_hospital_services,
+    list_branch_services,
     match_entity_info,
     reset_booking_session,
     match_entity_for_booking,
