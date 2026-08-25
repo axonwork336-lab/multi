@@ -1874,7 +1874,7 @@ def _resolve_service_for_booking(state, service_text: str) -> Optional[dict]:
 @tool
 def find_available_doctors(
     state: Annotated[AgentState, InjectedState],
-    specialty_ids: list,
+    specialty_ids: list = None,
     days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
     branch_name: str = "",
     allow_broader_search: bool = True,
@@ -1885,6 +1885,15 @@ def find_available_doctors(
     schedule slot within the next `days_ahead` days, across one or more
     specialties. ALWAYS call `list_specialties` first to get correct ids
     - never guess or invent one.
+
+    `specialty_ids` IS OPTIONAL. Leave it out entirely when a SERVICE or
+    a BRANCH is what the patient actually chose - you do NOT need to
+    work out a specialty first, and you must not ask them for one just
+    to satisfy this parameter. CONFIRMED REAL PRODUCTION FAILURE: with a
+    service and a branch both already settled, the reply was "راح أحتاج
+    أعرف التخصص المناسب الأول عشان أقدر أجيب لك الدكاترة المتاحين. تحب
+    تبدأ بالتخصص ولا بالدكتور؟" - inventing a prerequisite that does not
+    exist and restarting a flow that was two steps from done.
 
     `branch_name`: optional. Pass the user's raw branch text when they've
     said which branch they want (e.g. "الدقي", "فرع زايد") - the branch
@@ -1969,6 +1978,10 @@ def find_available_doctors(
         return {"status": "not_configured"}
 
     session = _get_booking_session(state.get("session_id"))
+
+    # `specialty_ids` is optional - a service or a branch is enough on
+    # its own. Normalized here so every use below is safe.
+    specialty_ids = specialty_ids or []
 
     # Remember which specialties this search used, so later steps
     # (list_branches_for_specialty, "who's soonest?") reuse exactly the
@@ -2965,6 +2978,15 @@ def _note_info_branch_availability(state, branch_row: dict) -> None:
 
     session = _get_booking_session(session_id)
     name = _arabic_preferred_name(branch_row) or branch_row.get("name")
+
+    # The branch the patient is currently looking at, whether or not it
+    # has doctors. Kept SEPARATE from the booking session's own
+    # `branch_id` (which means "confirmed for a booking in progress") so
+    # browsing a branch never silently confirms it - but available so a
+    # later "show me the doctors" is scoped to the branch they are
+    # actually looking at, instead of the whole hospital.
+    session["info_branch_id"] = branch_row.get("id")
+    session["info_branch_name"] = name
 
     if branch_row.get("hasAvailableDoctors") is False:
         session["info_branch_no_doctors"] = name
