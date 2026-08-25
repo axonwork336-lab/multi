@@ -1260,8 +1260,35 @@ def _build_show_soonest_day_directive(messages: list, session_id: str) -> str:
 
     from langchain_core.messages import HumanMessage as _HumanMessage
 
-    if not isinstance(messages[-1], _HumanMessage):
-        return ""
+    last = messages[-1]
+
+    if not isinstance(last, _HumanMessage):
+        # ALSO FIRE ON THE TOOL TURN THAT JUST CONFIRMED THE DOCTOR.
+        #
+        # The confirmation arrives as a ToolMessage, not a human one -
+        # the patient typed "1", `match_entity_for_booking` resolved it,
+        # and the model is now composing the reply with that tool result
+        # as the last message. Requiring a HumanMessage meant this
+        # directive sat inert on precisely the turn it was written for.
+        #
+        # CONFIRMED REAL PRODUCTION FAILURE: with فرع الدقي ALREADY
+        # confirmed and د. محمد زايد just resolved from position 1, the
+        # reply was "اخترت د. محمد زايد ✅ / تحب تحجز في فرع معيّن، ولا
+        # أعرض لك كل الفروع المتاحة عند د. محمد زايد؟" - asking which
+        # branch when the branch had been settled several turns earlier,
+        # instead of showing his available days.
+        if getattr(last, "name", None) != "match_entity_for_booking":
+            return ""
+        try:
+            _confirm_data = json.loads(last.content)
+        except (ValueError, TypeError):
+            return ""
+        if not (isinstance(_confirm_data, dict) and _confirm_data.get("matched")
+                and not _confirm_data.get("needsConfirmation")):
+            return ""
+        _session_now = tools._BOOKING_SESSIONS.get(session_id) or {}
+        if not (_session_now.get("doctor_id") and _session_now.get("branch_id")):
+            return ""
 
     session = tools._BOOKING_SESSIONS.get(session_id) or {}
     doctor_confirmed = bool(session.get("doctor_id"))
@@ -1306,6 +1333,17 @@ def _build_show_soonest_day_directive(messages: list, session_id: str) -> str:
         + "A doctor has been settled for this booking. Your ONLY next "
         "action is to call `list_available_days_for_booking` and SHOW the "
         "soonest date it returns, then ask whether that date suits them.\n\n"
+        "IF A BRANCH IS ALREADY CONFIRMED, THE BRANCH QUESTION IS OVER. "
+        "Do not ask \"تحب تحجز في فرع معيّن، ولا أعرض لك كل الفروع "
+        "المتاحة عند د. [اسم]؟\", and do not offer that doctor's other "
+        "branches - the patient chose a branch earlier and has not asked "
+        "to change it. Confirm the doctor in one short line and show the "
+        "days in that SAME message. CONFIRMED REAL PRODUCTION FAILURE: "
+        "with فرع الدقي settled several turns earlier and د. محمد زايد "
+        "just picked from the list, the reply was \"اخترت د. محمد زايد "
+        "✅ / تحب تحجز في فرع معيّن، ولا أعرض لك كل الفروع المتاحة عند "
+        "د. محمد زايد؟\" - re-opening a question that was already "
+        "answered, one step from showing real dates.\n\n"
         "You are NOT allowed to ask \"which day would you prefer?\", to "
         "suggest example days, or to name any weekday before that tool "
         "has returned. The patient does not know when this doctor works "
