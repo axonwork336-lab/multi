@@ -3717,6 +3717,22 @@ def _build_doctors_scope_directive(messages: list, session_id: str) -> str:
         "widen the search, and do not pass `all_branches=True` - the "
         "word \"كل\" here means \"all of them at this branch\", not "
         "\"search the whole hospital\".\n\n"
+        "HOW TO WRITE IT:\n"
+        f"  - Head the list with the branch: \"الدكاترة المتاحين في "
+        f"{branch_name}:\". NEVER write \"في كل الفروع\" - the list is "
+        "scoped to ONE branch, so saying \"all branches\" is simply "
+        "false.\n"
+        f"  - Do NOT repeat \"في {branch_name}\" after every single "
+        "doctor's name. The branch is already in the heading; adding it "
+        "to all eight lines is noise.\n"
+        "  - Do not narrate what you are doing (\"بوريك...\", \"خليني "
+        "أعرض لك...\"). Just show the list, then ask ONE question: "
+        "which doctor.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: the reply opened \"بوريك "
+        "الدكاترة المتاحين الحين في كل الفروع:\" and then repeated \"في "
+        "فرع الدقي\" on every line - narrating, mislabelling a "
+        "single-branch list as hospital-wide, and repeating the branch "
+        "four times over.\n\n"
         "CONFIRMED REAL PRODUCTION FAILURE: with فرع الدقي under "
         "discussion, this request returned all eight hospital doctors, "
         "several of whom do not work at الدقي - so the patient could "
@@ -3934,6 +3950,22 @@ def _build_empty_branch_booking_intent_directive(messages: list, session_id: str
     session = tools._BOOKING_SESSIONS.get(session_id) or {}
     branch_name = session.get("info_branch_no_doctors")
     if not branch_name:
+        return ""
+
+    # THE NOTE MUST STILL BE ABOUT THE BRANCH IN PLAY.
+    #
+    # A branch confirmed for the booking (or browsed since) supersedes
+    # the note entirely. Without this check the note survived the
+    # patient moving on, and a DIFFERENT branch inherited a claim that
+    # was never about it. CONFIRMED REAL PRODUCTION FAILURE: فرع المعادي
+    # was noted empty, the patient moved to فرع الدقي, four real doctors
+    # came back for الدقي in that same turn, and the reply still
+    # announced that الدقي had none.
+    current_branch = (
+        session.get("branch_display_name")
+        or session.get("info_branch_name")
+    )
+    if current_branch and _norm_ar(current_branch) != _norm_ar(branch_name):
         return ""
 
     from langchain_core.messages import HumanMessage as _HumanMessage
