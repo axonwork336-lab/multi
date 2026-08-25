@@ -2687,6 +2687,18 @@ def match_entity_info(
     {"status": "not_configured"}  # no doctors_base_url set up for this client
     {"status": "error"}
 
+    NUMBERED SELECTION: after this tool returns a "list" (or a
+    "not_matched" with `available_branches`), a later bare number reply
+    ("2", "٢", "رقم 2") resolves by POSITION against that exact list -
+    pass it straight through as `user_input`, don't fuzzy-match a digit
+    against names yourself. Extra statuses only for that case:
+    {"status": "out_of_range", "list_size": N}  # number bigger than the
+        list you showed - say how many there are, ask them to pick
+        within it. Never say the doctor/branch "doesn't exist".
+    {"status": "no_list_shown"}  # a number was given but nothing was
+        listed for this entity_type yet in this conversation - show the
+        list first (user_input="").
+
     Doctor fields: formatedName, altName, degreeName, specialtyName,
     defaultServiceName (serviceName). Fees are NOT included here - use
     `get_doctor_fees` if (and only if) the user explicitly asks a price.
@@ -2723,6 +2735,7 @@ def match_entity_info(
         if entity_type == "doctor":
             shaped = [
                 {
+                    "id": i.get("id"),
                     "formatedName": i.get("formatedName") or i.get("name"),
                     "altName": i.get("altName"),
                     "specialtyName": i.get("specialtyName"),
@@ -2733,6 +2746,7 @@ def match_entity_info(
         else:
             shaped = [
                 {
+                    "id": i.get("id"),
                     "name": i.get("name") or i.get("formatedName"),
                     "altName": i.get("altName"),
                     "address": i.get("address"),
@@ -2742,7 +2756,61 @@ def match_entity_info(
             ]
         if not shaped:
             return {"status": "not_matched"}
+        # Remembered so a later bare number ("2") resolves by position
+        # against this EXACT list - this tool was missing this entirely,
+        # even though every other listing tool in the file writes it.
+        # CONFIRMED REAL PRODUCTION FAILURE: shown a numbered branch
+        # list, the patient replied "1", and the reply was "هل تقصد فرع
+        # عيادات سكاي التخصصية؟" - fuzzy-matching the digit "1" against
+        # branch names (which of course fails) instead of just taking
+        # the first item of the list it had JUST shown.
+        _remember_list(state, entity_type, shaped)
         return {"status": "list", "items": shaped}
+
+    # Positional pick ("6", "٦", "رقم 6") -> resolve against the list the
+    # user was ACTUALLY shown, from whichever call produced it (list mode
+    # here, or the `available_branches` fallback below) - never fuzzy-
+    # match a bare digit against names, which always fails.
+    position = _extract_selection_number(user_input)
+    if position is not None:
+        session = _get_booking_session(state.get("session_id"))
+        last_list = session.get("last_list")
+
+        if not (last_list and last_list.get("entity_type") == entity_type):
+            return {"status": "no_list_shown"}
+
+        list_items = last_list.get("items") or []
+        if not (1 <= position <= len(list_items)):
+            return {"status": "out_of_range", "list_size": len(list_items)}
+
+        remembered = list_items[position - 1]
+        chosen_id = remembered.get("id")
+        chosen_raw = next((i for i in items if i.get("id") == chosen_id), None) if chosen_id else None
+
+        if entity_type == "doctor":
+            shape_fn_for_pos = lambda i: {
+                "id": i.get("id"),
+                "formatedName": i.get("formatedName") or i.get("name"),
+                "altName": i.get("altName"),
+                "degreeName": i.get("degreeName"),
+                "specialtyName": i.get("specialtyName"),
+                "serviceName": i.get("defaultServiceName") or i.get("serviceName"),
+            }
+        else:
+            shape_fn_for_pos = lambda i: {
+                "id": i.get("id"),
+                "name": i.get("name") or i.get("formatedName"),
+                "altName": i.get("altName"),
+                "address": i.get("address"),
+                "cityName": i.get("cityName"),
+                "countryName": i.get("countryName"),
+                "stateName": i.get("stateName"),
+                "email": i.get("email"),
+                "mobile": i.get("mobile"),
+            }
+
+        shaped_pos = shape_fn_for_pos(chosen_raw) if chosen_raw else dict(remembered)
+        return {"status": "matched", "item": shaped_pos}
 
     match_candidates = items
 
@@ -2800,22 +2868,29 @@ def match_entity_info(
                 [b for b in items if b.get("id") in available_branch_ids]
                 if available_branch_ids else items
             )
+            shaped_available = [
+                {
+                    "id": b.get("id"),
+                    "name": b.get("name") or b.get("formatedName"),
+                    "altName": b.get("altName"),
+                    "address": b.get("address"),
+                    "cityName": b.get("cityName"),
+                }
+                for b in available_items
+            ]
+            # Remembered too, for the identical reason as the plain list
+            # mode above - the patient is very likely to reply with a
+            # bare number to pick one of these.
+            _remember_list(state, "branch", shaped_available)
             return {
                 "status": "not_matched",
-                "available_branches": [
-                    {
-                        "name": b.get("name") or b.get("formatedName"),
-                        "altName": b.get("altName"),
-                        "address": b.get("address"),
-                        "cityName": b.get("cityName"),
-                    }
-                    for b in available_items
-                ],
+                "available_branches": shaped_available,
             }
         return {"status": "not_matched"}
 
     def _shape_doctor(i):
         return {
+            "id": i.get("id"),
             "formatedName": i.get("formatedName") or i.get("name"),
             "altName": i.get("altName"),
             "degreeName": i.get("degreeName"),
@@ -2829,6 +2904,7 @@ def match_entity_info(
 
     def _shape_branch(i):
         return {
+            "id": i.get("id"),
             "name": i.get("name") or i.get("formatedName"),
             "altName": i.get("altName"),
             "address": i.get("address"),
@@ -2860,7 +2936,11 @@ def match_entity_info(
             return {"status": "possible_match", "item": shape_fn(match_result["item"])}
         return {"status": "matched", "item": shape_fn(match_result["item"])}
 
-    return {"status": "ambiguous", "candidates": [shape_fn(i) for i in match_result["items"]]}
+    ambiguous_candidates = [shape_fn(i) for i in match_result["items"]]
+    # Remembered too - a follow-up bare number ("2") should pick between
+    # exactly these candidates, not require the patient to retype a name.
+    _remember_list(state, entity_type, ambiguous_candidates)
+    return {"status": "ambiguous", "candidates": ambiguous_candidates}
 
 
 # ==========================================================
