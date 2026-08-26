@@ -42,7 +42,7 @@ import sys
 import logging
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 from langchain_core.messages import AIMessage, SystemMessage, trim_messages
 from langchain_openai import ChatOpenAI
@@ -3295,6 +3295,31 @@ def _medical_reply_missing_not_a_diagnosis(reply_text: str, state: AgentState) -
     if not _SPECIALTY_OFFER_RE.search(folded):
         return False
 
+    # ONLY WHILE STILL ROUTING - NOT ONCE A DOCTOR IS BEING CONFIRMED.
+    #
+    # The clause belongs to the guidance step, where a symptom is being
+    # mapped to a specialty. Once the patient has picked a doctor from a
+    # list, the reply confirming that choice is a booking step, and
+    # attaching "this isn't a diagnosis" to it is noise.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: after the patient chose "1"
+    # from a real doctor list, the reply "الدكتور المتاح عندنا حاليًا في
+    # تخصص باطنة عام هو د. رانيا عبد الرحمن، دكتور استشاري - تحب أحجز
+    # لك موعد عندها؟" was rejected for missing the clause. It then
+    # retried in a loop that made roughly a hundred model calls over two
+    # minutes and never produced a reply at all.
+    session_id = state.get("session_id")
+    if session_id:
+        session = tools._BOOKING_SESSIONS.get(session_id) or {}
+        if session.get("doctor_id"):
+            return False
+        last_list = session.get("last_list") or {}
+        if last_list.get("entity_type") == "doctor" and last_list.get("items"):
+            # A doctor list has been shown, so we are past routing and
+            # into choosing. Naming a doctor here is a selection, not a
+            # symptom-to-specialty suggestion.
+            return False
+
     return not _NOT_A_DIAGNOSIS_RE.search(folded)
 
 
@@ -4139,6 +4164,54 @@ def _apply_output_contract(
 # special case in the old hand-written version (the branch check, which
 # needed the offending names interpolated into its directive) is what
 # had caused that block to drift away from the other five.
+
+# HOW MANY TIMES ONE TURN MAY BE SENT BACK FOR TOOLS BY A VERIFIER.
+#
+# A verifier that rejects a reply and gets tool_calls back re-enters the
+# agent, where the same verifier can reject again - an unbounded cycle
+# whenever the check is one the model cannot satisfy. Two attempts is
+# plenty for a genuine "go fetch the real data" correction; beyond that
+# the verifier is the thing that is wrong, and the patient must still
+# get an answer.
+_MAX_VERIFIER_TOOL_RETRIES = 2
+
+# {session_id: (human_message_count, retries_used)} - the count resets
+# automatically on the next patient message, so this is per-turn without
+# needing to thread extra state through the graph.
+_VERIFIER_TOOL_RETRIES: Dict[str, tuple] = {}
+
+
+def _verifier_tool_retries_exhausted(state: AgentState) -> bool:
+    """True when this turn has already been sent back for tools by a
+    verifier as many times as allowed. Records the attempt as a side
+    effect, so each call consumes one."""
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return False
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    turn_key = sum(
+        1 for m in (state.get("messages") or []) if isinstance(m, _HumanMessage)
+    )
+
+    recorded_turn, used = _VERIFIER_TOOL_RETRIES.get(session_id, (None, 0))
+    if recorded_turn != turn_key:
+        used = 0
+
+    if used >= _MAX_VERIFIER_TOOL_RETRIES:
+        return True
+
+    _VERIFIER_TOOL_RETRIES[session_id] = (turn_key, used + 1)
+
+    # Keep this from growing without bound in a long-lived process.
+    if len(_VERIFIER_TOOL_RETRIES) > 5000:
+        for stale in list(_VERIFIER_TOOL_RETRIES)[:1000]:
+            _VERIFIER_TOOL_RETRIES.pop(stale, None)
+
+    return False
+
 
 _REPLY_VERIFIERS = (
     (
@@ -6661,6 +6734,29 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                 # It chose to go and fetch the real data instead of
                 # rewriting from memory - much better. Let the normal
                 # tools loop run and send nothing this pass.
+                #
+                # BUT THIS PATH CAN LOOP. Returning here sends us back
+                # through the tools node and into this agent again, so
+                # the same verifier can fire, retry, ask for tools, and
+                # return once more - forever, if the check is one the
+                # model cannot satisfy.
+                #
+                # CONFIRMED REAL PRODUCTION FAILURE: a false-positive
+                # "not a diagnosis" check on a doctor-selection reply
+                # spun this loop for roughly a hundred model calls over
+                # two minutes, and the patient received NOTHING - the
+                # turn simply never ended. A verifier being wrong should
+                # cost one wasted call, never the whole conversation.
+                if _verifier_tool_retries_exhausted(state):
+                    logger.error(
+                        "agent[%s]: verifier '%s' has already sent this turn back for "
+                        "tools %d time(s) - accepting the reply as-is rather than "
+                        "looping. THIS MEANS THE VERIFIER IS PROBABLY WRONG HERE; the "
+                        "reply is being delivered unmodified.",
+                        agent_name, description, _MAX_VERIFIER_TOOL_RETRIES,
+                    )
+                    break
+
                 updates["messages"] = [retry]
                 updates["target_language"] = target_language
                 return updates
