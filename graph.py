@@ -4940,6 +4940,19 @@ _BARE_NEGATION_RE = re.compile(
 )
 
 
+# A refusal that also says WHAT is refused - "لا مش مناسب التلات دا".
+# NOTE: no \b between the tokens. Arabic letters are all "word"
+# characters, so \b never matches between "لا" and "مش" and the pattern
+# silently fails - which is exactly how the confirmed failure below got
+# through a first version of this regex.
+_LEADING_REFUSAL_RE = re.compile(
+    r"^\s*(?:لا|لأ|مش|مو|ما)[\s،,]*"
+    r"(?:لا|مش|مو|ما)?[\s،,]*"
+    r"(?:مناسب|يناسب|عاوز|عايز|عاوزه|عايزه|ابي|ابغى|اريد|ينفع|تمام|كويس|حلو|"
+    r"no|not)"
+)
+
+
 def _build_negation_directive(messages: list) -> str:
     """Fires when the patient's whole message is a refusal ("لا", "مش
     مناسب", "no").
@@ -4965,7 +4978,21 @@ def _build_negation_directive(messages: list) -> str:
     content = getattr(last, "content", "")
     text = content if isinstance(content, str) else str(content)
 
-    if not _BARE_NEGATION_RE.match(_norm_ar(text)):
+    folded = _norm_ar(text)
+
+    # A refusal does not have to be bare. "لا مش مناسب التلات دا" is a
+    # refusal that also names WHAT is being refused, and it is more
+    # common than a plain "لا" - people say what didn't work.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: "لا مش مناسب التلات دا" did not
+    # match the bare pattern, so nothing fired, and the alternatives
+    # offered back still included Tuesday - the very day just rejected.
+    refuses = bool(
+        _BARE_NEGATION_RE.match(folded)
+        or _LEADING_REFUSAL_RE.match(folded)
+    )
+
+    if not refuses:
         return ""
 
     previous_ai = None
@@ -4995,6 +5022,14 @@ def _build_negation_directive(messages: list) -> str:
         "  - Offered a DAY or a TIME and they said no -> show the OTHER "
         "days/times that are actually available (call the tool again "
         "with the next offset), never the same one reworded.\n"
+        "    THE REFUSED DAY MUST NOT APPEAR IN THAT LIST AT ALL. If "
+        "they named it (\"مش مناسب التلات\"), leave it out of the "
+        "alternatives entirely - re-offering it as one of the options "
+        "ignores what they just told you, and they can pick it back by "
+        "accident. CONFIRMED REAL PRODUCTION FAILURE: a patient "
+        "rejected Tuesday and the very next message offered \"1️⃣ "
+        "الأحد 2️⃣ الاثنين 3️⃣ الثلاثاء\" - the rejected day still "
+        "on the menu.\n"
         "  - Offered a DOCTOR and they said no -> offer the other "
         "available doctors, not that doctor's schedule.\n"
         "  - Offered a BRANCH and they said no -> the other branches.\n"
@@ -5129,6 +5164,78 @@ def _build_service_chosen_directive(messages: list, session_id: str) -> str:
         return ""
 
     return _SERVICE_CHOSEN_DIRECTIVE
+
+
+def _build_day_pick_directive(messages: list, session_id: str) -> str:
+    """Resolves a bare number that is picking a DAY from the list just
+    shown, and states the answer in the system prompt.
+
+    WHY: a positional pick is routinely answered with no tool call at
+    all, so nothing verifies which option the number refers to. Days
+    were also the one list this project never remembered, which left the
+    model matching a digit against dates from memory.
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient said Tuesday didn't
+    suit them, was shown "1️⃣ الأحد 30/08 2️⃣ الاثنين 31/08 3️⃣ الثلاثاء
+    01/09", replied "1" - and was booked onto الثلاثاء 01/09/2026: the
+    third option, and the exact day they had just rejected."""
+
+    if not messages or not session_id:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    position = tools._extract_selection_number(text)
+    if position is None:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    last_list = session.get("last_list") or {}
+
+    if last_list.get("entity_type") != "day":
+        return ""
+
+    items = last_list.get("items") or []
+    if not (1 <= position <= len(items)):
+        return (
+            "============================================================\n"
+            "THAT NUMBER IS OUTSIDE THE DAY LIST YOU SHOWED\n"
+            "============================================================\n"
+            f"You showed {len(items)} day(s); they replied \"{position}\". "
+            "Say how many options there are and ask them to pick within "
+            "it. Do NOT guess a day, and do NOT tell them the day "
+            "doesn't exist - the number came from your own list.\n\n"
+        )
+
+    chosen = items[position - 1]
+    chosen_date = chosen.get("date") or ""
+    weekday = chosen.get("weekday_display") or chosen.get("weekday_name") or ""
+    display = chosen.get("date_display") or chosen_date
+
+    return (
+        "============================================================\n"
+        "WHICH DAY THEY PICKED - RESOLVED, DO NOT RE-DERIVE IT\n"
+        "============================================================\n"
+        f"Their reply is a pick from the day list you just showed. "
+        f"Option {position} is:\n"
+        f"    weekday : {weekday}\n"
+        f"    date    : {display}  (ISO {chosen_date})\n\n"
+        "That is the ONLY day this booking may continue with. Do not "
+        "read the date off an earlier message, do not re-count the "
+        "list, and do not substitute a different option - pass THIS "
+        "date to the next tool and name THIS weekday in your reply.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: a patient who had just "
+        "rejected Tuesday picked option 1 (Sunday) and was confirmed "
+        "onto Tuesday - option 3 - because the number was matched from "
+        "memory instead of from the list.\n\n"
+    )
 
 
 def _build_branch_pick_directive(messages: list, session_id: str) -> str:
@@ -6677,6 +6784,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     branch_pick_directive = _build_branch_pick_directive(
         state["messages"], state.get("session_id"),
     )
+    day_pick_directive = _build_day_pick_directive(
+        state["messages"], state.get("session_id"),
+    )
     service_chosen_directive = _build_service_chosen_directive(
         state["messages"], state.get("session_id"),
     )
@@ -6787,7 +6897,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + bare_doctor_directive + show_all_doctors_directive
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
-        + empty_branch_directive + branch_pick_directive
+        + empty_branch_directive + branch_pick_directive + day_pick_directive
         + negation_directive
         + service_chosen_directive + service_named_directive
         + doctors_scope_directive
