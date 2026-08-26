@@ -5896,4 +5896,4 @@ if _RUNNING_UNDER_LANGGRAPH_API:
     logger.info("Running under the LangGraph API server - using its built-in persistence, not MemorySaver")
     graph = builder.compile()
 else:
-    graph = builder.compile(checkpointer=checkpointer
+    graph = builder.compile(checkpointer=checkpointer)
