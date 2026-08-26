@@ -49,6 +49,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
+from openai import APIConnectionError as _OpenAIAPIConnectionError
+from openai import APITimeoutError as _OpenAIAPITimeoutError
 
 import agents
 import config
@@ -89,6 +91,60 @@ _AGENT_LLMS = {
     name: _llm.bind_tools(agents.tools_for(name))
     for name in agents.AGENT_NAMES
 }
+
+
+# ==========================================================
+# LLM call resilience - the OpenAI request timing out (or a dropped
+# connection) used to crash the WHOLE turn with no reply sent at all.
+# ==========================================================
+#
+# CONFIRMED REAL PRODUCTION FAILURE (from the actual stack trace):
+# openai.APITimeoutError raised straight out of `_llm_for(...).invoke(...)`,
+# with no try/except anywhere between here and main.py. That is worse
+# than the "empty reply" case main.send_message_with_signals already
+# guards against - an empty reply still reaches that guard and gets
+# turned into the clinic's own failure message; a raised exception never
+# reaches it at all, because the turn never returns. The patient gets
+# nothing, and (depending on how the HTTP layer above main.py handles an
+# unhandled exception) the caller may not even see a clean error.
+#
+# One retry is attempted first - a slow or dropped request is often
+# just that, slow - and only on a SECOND failure is a fallback reply
+# returned instead of raising, so the graph ends this turn normally
+# (exactly like any other no-tool-call reply) rather than crashing it.
+
+_LLM_TIMEOUT_FALLBACK_TEXT = {
+    "ar": "عذرًا، حصل تأخير مؤقت في الرد. ممكن تبعت رسالتك تاني؟ 🌷",
+    "en": "Sorry, there was a temporary delay on our end. Could you please resend your last message?",
+}
+
+
+def _invoke_llm_resilient(llm, messages, *, agent_name: str, target_language: str, context: str):
+    """`llm.invoke(messages)`, but a request timeout / connection drop is
+    retried once and, if it fails again, converted into a graceful
+    fallback AIMessage instead of propagating and crashing the turn.
+
+    `context` is a short label for the logs only (which of the two call
+    sites this was - the main turn or a verifier's correction retry)."""
+
+    last_exc = None
+    for attempt in (1, 2):
+        try:
+            return llm.invoke(messages)
+        except (_OpenAIAPITimeoutError, _OpenAIAPIConnectionError) as exc:
+            last_exc = exc
+            logger.warning(
+                "agent[%s]: %s - LLM call failed on attempt %d/2 (%s: %s)",
+                agent_name, context, attempt, type(exc).__name__, exc,
+            )
+
+    logger.error(
+        "agent[%s]: %s - LLM call failed twice in a row (%s) - returning a "
+        "fallback reply instead of letting this crash the whole turn",
+        agent_name, context, type(last_exc).__name__ if last_exc else "?",
+    )
+    fallback_text = _LLM_TIMEOUT_FALLBACK_TEXT.get(target_language) or _LLM_TIMEOUT_FALLBACK_TEXT["ar"]
+    return AIMessage(content=fallback_text)
 
 
 def _llm_for(agent_name: str):
@@ -806,14 +862,27 @@ def _build_resolved_day_directive(messages: list, session_id: str) -> str:
     doctor_name = session.get("doctor_display_name") or ""
     branch_name = session.get("branch_display_name") or ""
 
+    first_time = data.get("first_time_display") or ""
+    last_time = data.get("last_time_display") or ""
+
     # Same label order as everywhere else in this project, per the
-    # response contract: doctor -> branch -> day -> date.
+    # response contract: doctor -> branch -> day -> date -> time range.
     lines = []
     if doctor_name:
         lines.append(f"👨\u200d⚕️ الطبيب: {doctor_name}")
     if branch_name:
         lines.append(f"📍 الفرع: {branch_name}")
     lines.append(f"📅 اليوم: {weekday} {date_display}".rstrip())
+    # The DAY's overall available-time RANGE, not one narrow slot in it.
+    # CONFIRMED REAL PRODUCTION CONFUSION this line fixes: without it,
+    # the model would grab the single nearest open SLOT's own
+    # start/end (e.g. "11:00 - 11:30") and present that 30-minute
+    # window as if it were the whole day's offer, instead of the day's
+    # actual availability ("11:00 صباحًا - 3:00 مساءً"). Omitted
+    # entirely (rather than shown blank) when either time is missing,
+    # so an old/short-circuited result never prints a dangling "من  إلى".
+    if first_time and last_time:
+        lines.append(f"⏰ الأوقات المتاحة: من {first_time} إلى {last_time}")
 
     block = "\n".join(lines)
 
@@ -823,11 +892,19 @@ def _build_resolved_day_directive(messages: list, session_id: str) -> str:
         "ENTIRE reply must be the exact text between the START/END "
         "markers below, copied verbatim (translate the LABELS only if "
         "the conversation is in another language - keep the emoji, the "
-        "date and the names unchanged either way), followed by exactly "
-        "ONE question asking whether they'd like to see the available "
-        "times on that day. The START/END marker lines themselves are "
-        "NOT part of the text to copy - never include them, or any line "
-        "of dashes/equals-signs, in your actual reply.\n\n"
+        "date, the time range and the names unchanged either way), "
+        "followed by exactly ONE question asking whether that day/time "
+        "range works for them. The START/END marker lines themselves "
+        "are NOT part of the text to copy - never include them, or any "
+        "line of dashes/equals-signs, in your actual reply.\n\n"
+        "NEVER replace the time-range line below with one single "
+        "specific appointment time (e.g. a slot's own start-end such as "
+        "\"11:00 - 11:30\") - that is one bookable option among many, "
+        "not the day's availability, and presenting it as the whole "
+        "offer is misleading. The range in the block below (day's "
+        "earliest to latest open time) is what belongs here; the "
+        "individual bookable times are shown only in the NEXT step, "
+        "after they confirm this day works.\n\n"
         "Never write the result's `date` field (the ISO \"YYYY-MM-DD\" "
         "form) anywhere in your reply - it is a machine value. The block "
         "below already contains the date in the form the patient should "
@@ -835,7 +912,7 @@ def _build_resolved_day_directive(messages: list, session_id: str) -> str:
         "When they say yes, your ONLY next action is to call "
         "`get_available_slots_for_booking` with this result's own "
         "`from_date`/`to_date`, copied verbatim - never a date you "
-        "worked out yourself.\n\n"
+        "worked out yourself - and then show every time it returns.\n\n"
         "[BEGIN-EXACT-TEXT]\n"
         f"{block}\n"
         "[END-EXACT-TEXT]\n\n"
@@ -7003,7 +7080,10 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     # constraint. Sending the LLM an empty turn would be worse than
     # sending it the untrimmed history, so fall back rather than trim.
     history = trimmed_history if trimmed_history else safe_messages
-    response = _llm_for(agent_name).invoke([system_message] + history)
+    response = _invoke_llm_resilient(
+        _llm_for(agent_name), [system_message] + history,
+        agent_name=agent_name, target_language=target_language, context="main turn",
+    )
 
     updates: dict = {}
 
@@ -7084,9 +7164,24 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
 
             directive = correction_directive(normalized, state)
 
-            retry = _llm_for(agent_name).invoke(
-                [SystemMessage(content=directive + system_content)] + history
-            )
+            try:
+                retry = _llm_for(agent_name).invoke(
+                    [SystemMessage(content=directive + system_content)] + history
+                )
+            except (_OpenAIAPITimeoutError, _OpenAIAPIConnectionError) as exc:
+                # Unlike the main turn's call, there is already a usable
+                # (if unverified) reply sitting in `normalized` - a
+                # timeout here should cost this one verifier's
+                # correction, not the whole turn. Log it and move on to
+                # the next verifier (or out of the loop) with the
+                # original reply intact, rather than overwriting a
+                # perfectly fine draft with a generic apology.
+                logger.warning(
+                    "agent[%s]: verifier correction call failed (%s: %s) - keeping the "
+                    "original, unverified reply for check '%s' instead of retrying further",
+                    agent_name, type(exc).__name__, exc, description,
+                )
+                continue
 
             if getattr(retry, "tool_calls", None):
                 # It chose to go and fetch the real data instead of
