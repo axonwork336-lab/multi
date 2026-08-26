@@ -284,6 +284,49 @@ def to_riyadh(utc_string: Optional[str], timezone_name: str = DEFAULT_TIMEZONE) 
     return local_dt.isoformat()
 
 
+def to_local_wallclock(value: Optional[str], timezone_name: str = DEFAULT_TIMEZONE) -> Optional[str]:
+    """For WORKING-HOURS rows (a doctor's weekly rota), not instants.
+
+    A rota row says "this doctor sits in clinic from 11:00 to 15:00 on
+    Tuesdays". That is a WALL-CLOCK time at the branch - it is not an
+    instant on a timeline, and there is nothing to convert. The
+    Doctors/GetDoctorSchedule endpoint echoes back the same wall-clock
+    the clinic's admin typed in, with NO timezone offset attached.
+
+    `to_riyadh` assumes a naive value is UTC and shifts it into the
+    client's zone. That is right for SLOTS (Doctors/GetDoctorScheduleSlots
+    returns real instants, confirmed carrying an explicit "+00:00"), and
+    wrong for rota rows.
+
+    CONFIRMED REAL PRODUCTION FAILURE: د. فارس الشارخ's rota at Al Manar
+    reads 11:00-15:00 in the admin UI, and the patient was shown
+    "من 2:00 مساءً لـ 6:00 مساءً" - the naive 11:00 was read as UTC and
+    pushed +3 into Asia/Riyadh. Every working-hours line in the product
+    was three hours late, and the slot list underneath inherited the
+    same window.
+
+    Behaviour: a value that DOES carry a timezone is still converted
+    normally (it is a real instant, so the offset is meaningful). Only
+    naive values are left exactly as they are, because they are already
+    local."""
+
+    if not value:
+        return None
+
+    cleaned = value.replace("Z", "+00:00")
+
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        # Unparseable - hand it back untouched rather than guessing.
+        return value
+
+    if dt.tzinfo is not None:
+        return to_riyadh(value, timezone_name)
+
+    return dt.isoformat()
+
+
 _ARABIC_WEEKDAY_NAMES = [
     "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد",
 ]
@@ -1894,6 +1937,88 @@ def _resolve_service_for_booking(state, service_text: str) -> Optional[dict]:
     return None
 
 
+_SPECIALTY_STOPWORDS = {"طب", "جراحه", "امراض", "علاج", "قسم", "عام", "عامه", "استشارات"}
+
+
+def _expand_specialty_ids(state, base_url: str, specialty_ids: list) -> list:
+    """Add SIBLING specialties whose names share a real medical stem
+    with the ones chosen.
+
+    WHY: clinics routinely register the same field twice under slightly
+    different names - "طب الباطنة" and "باطنه عام", "طب وجراحة العيون"
+    and "جراحة الجسم الزجاجي والشبكية" - and the doctors are split
+    across them. Searching only the id whose name matched the patient's
+    wording most literally silently hides everyone registered under the
+    other one.
+
+    CONFIRMED REAL PRODUCTION FAILURE: an internal-medicine search
+    returned only د. فارس الشارخ (طب الباطنة), while د. رانيا عبد
+    الرحمن (باطنه عام) - shown correctly in an earlier turn of the same
+    session - was missing. The patient had no way to know she existed.
+
+    This is a DATA-DRIVEN expansion, not a guess: a sibling is added
+    only when it shares a meaningful word with a chosen specialty, after
+    dropping generic words ("طب", "عام", "جراحة"...) that would
+    otherwise link unrelated fields. Never narrows, and returns the
+    input unchanged on any failure."""
+
+    if not specialty_ids:
+        return specialty_ids
+
+    try:
+        result = api.get_specialties(base_url, language=conversation_language(state))
+        if not result["success"]:
+            return specialty_ids
+
+        items = (result["data"] or {}).get("items", [])
+        by_id = {i.get("id"): i for i in items if i.get("id")}
+
+        def _tokens(item):
+            words = set()
+            for key in ("name", "altName"):
+                value = item.get(key)
+                if not value:
+                    continue
+                for word in _normalize_arabic(str(value)).split():
+                    # Strip the definite article. Without this "الباطنه"
+                    # and "باطنه" are different tokens, and the two
+                    # registrations this whole helper exists to link -
+                    # "طب الباطنة" and "باطنه عام" - never match.
+                    if word.startswith("ال") and len(word) > 4:
+                        word = word[2:]
+                    if len(word) >= 4 and word not in _SPECIALTY_STOPWORDS:
+                        words.add(word)
+            return words
+
+        chosen_tokens = set()
+        for sid in specialty_ids:
+            if sid in by_id:
+                chosen_tokens |= _tokens(by_id[sid])
+
+        if not chosen_tokens:
+            return specialty_ids
+
+        expanded = list(specialty_ids)
+        added = []
+        for sid, item in by_id.items():
+            if sid in expanded:
+                continue
+            if _tokens(item) & chosen_tokens:
+                expanded.append(sid)
+                added.append(_preferred_name(item, conversation_language(state)))
+
+        if added:
+            logger.info(
+                "_expand_specialty_ids: added sibling specialty/ies %s to %s",
+                added, specialty_ids,
+            )
+        return expanded
+
+    except Exception:
+        logger.exception("_expand_specialty_ids: failed - using the original ids")
+        return specialty_ids
+
+
 @tool
 def find_available_doctors(
     state: Annotated[AgentState, InjectedState],
@@ -2005,6 +2130,12 @@ def find_available_doctors(
     # `specialty_ids` is optional - a service or a branch is enough on
     # its own. Normalized here so every use below is safe.
     specialty_ids = specialty_ids or []
+
+    # Pull in sibling specialties registered under a near-identical name
+    # ("طب الباطنة" / "باطنه عام"), so doctors filed under the other one
+    # are not silently invisible. See _expand_specialty_ids.
+    if specialty_ids:
+        specialty_ids = _expand_specialty_ids(state, base_url, specialty_ids)
 
     # Remember which specialties this search used, so later steps
     # (list_branches_for_specialty, "who's soonest?") reuse exactly the
@@ -2368,8 +2499,8 @@ def get_doctor_schedule(
     schedules = [
         {
             "recurringDaysNames": item.get("recurringDaysNames"),
-            "fromDateTime": to_riyadh(item.get("fromDateTime"), timezone_name),
-            "toDateTime": to_riyadh(item.get("toDateTime"), timezone_name),
+            "fromDateTime": to_local_wallclock(item.get("fromDateTime"), timezone_name),
+            "toDateTime": to_local_wallclock(item.get("toDateTime"), timezone_name),
             "branchName": item.get("branchName"),
             "doctorName": item.get("doctorName"),
         }
@@ -6017,8 +6148,8 @@ def get_doctor_schedule_for_booking(
     schedules = [
         {
             "recurringDaysNames": item.get("recurringDaysNames"),
-            "fromDateTime": to_riyadh(item.get("fromDateTime"), timezone_name),
-            "toDateTime": to_riyadh(item.get("toDateTime"), timezone_name),
+            "fromDateTime": to_local_wallclock(item.get("fromDateTime"), timezone_name),
+            "toDateTime": to_local_wallclock(item.get("toDateTime"), timezone_name),
             "branchName": branch_display_name if (branch_display_name and item.get("branchId") == session.get("branch_id")) else item.get("branchName"),
             "branchId": item.get("branchId"),
             "doctorName": doctor_display_name or item.get("doctorName"),
