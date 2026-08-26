@@ -65,6 +65,49 @@ logger = logging.getLogger(__name__)
 
 
 # ==========================================================
+# Hard guard for request_human_handoff - complaint word alone is not
+# consent to be transferred.
+# ==========================================================
+#
+# WHY THIS EXISTS AS CODE, NOT JUST PROSE: the tool's own docstring
+# below already explains, in detail, with a "confirmed real production
+# failure" example, that a bare "شكوي" is a topic, not a request for a
+# human. That prose was already in place and the LLM still called this
+# tool with patient_agreed=True on exactly that input, reason logged as
+# "patient asked for staff" - the same failure the docstring describes,
+# happening again on the same wording. A second occurrence of an
+# already-documented failure means the instruction alone cannot be
+# trusted to hold on every turn, so the check is enforced here instead
+# of only being asked for.
+_COMPLAINT_ROOTS_FOR_HANDOFF_GUARD = ("شكو", "اشتك", "complaint")
+
+# Words that show the patient is SEPARATELY, explicitly asking for a
+# person - as opposed to just naming "complaint" as the topic. If any of
+# these appear alongside a complaint word, the guard steps aside and
+# lets the model's own call stand (e.g. "الشكوى معقدة عايز اتكلم مع حد").
+_EXPLICIT_HUMAN_REQUEST_ROOTS = (
+    "موظف", "خدمة العملاء", "خدمه العملاء", "ممثل خدمة", "اتكلم مع حد",
+    "أتكلم مع حد", "كلمني حد", "كلميني حد", "حد يرد", "شخص حقيقي",
+    "human", "representative", "agent", "someone", "speak to a person",
+    "talk to a person",
+)
+
+
+def _latest_human_text_for_handoff_guard(state: AgentState) -> str:
+    """The most recent HumanMessage's raw text, or "" if none is found.
+    Deliberately tolerant of whatever message objects `state["messages"]`
+    holds - only ever used to decide whether to BLOCK a handoff, never
+    to allow one, so a missed/garbled message just means the guard has
+    nothing to catch and the model's own decision goes through."""
+
+    for msg in reversed(state.get("messages") or []):
+        if getattr(msg, "type", None) == "human":
+            content = getattr(msg, "content", "")
+            return content if isinstance(content, str) else str(content or "")
+    return ""
+
+
+# ==========================================================
 # Pure data helpers (unchanged in spirit from the old tools.py - these
 # are data transforms, not user-facing text, so they stay)
 # ==========================================================
@@ -6886,6 +6929,18 @@ def request_human_handoff(
     immediately, with the reason logged as "patient frustrated,
     requested human agent" when no such request had been made.
 
+    WANTING TO FILE A COMPLAINT IS ALSO NOT AGREEMENT. "شكوى"/"شكوي"/"عاوزه
+    اعمل شكوه"/"I have a complaint" states a TOPIC, not a request for a
+    person - filing a complaint has its own flow (ask what happened,
+    which doctor/branch if relevant, then call `send_complaint_email`)
+    and stays with you unless the patient separately, explicitly asks
+    for a human. Confirmed real production failure: the patient typed
+    "شكوي" alone and was immediately transferred with
+    reason="patient asked for staff" - they had said nothing of the
+    kind, and never got the chance to actually describe the complaint
+    at all. The word "complaint"/"شكوى" appearing anywhere in the
+    message is never, by itself, grounds to call this tool.
+
     Pass `patient_agreed=False` if you are unsure whether they actually
     agreed - the handoff is then NOT raised, and you should ask them
     instead. Never set it True to describe a handoff you are about to
@@ -6903,7 +6958,33 @@ def request_human_handoff(
 
     Returns {"status": "handoff_requested"} when raised, or
     {"status": "not_requested", "reason": "patient_has_not_agreed"} when
-    `patient_agreed` was False - in which case ask them first."""
+    `patient_agreed` was False - in which case ask them first.
+
+    HARD GUARD (enforced here, not left to this docstring alone - see
+    the module-level comment above `_COMPLAINT_ROOTS_FOR_HANDOFF_GUARD`):
+    if the patient's own latest message names a complaint ("شكوى"/
+    "اشتكي"/"complaint" or similar) and does NOT also separately name a
+    person/staff/representative, the call is downgraded to
+    "not_requested" regardless of what `patient_agreed` was passed as."""
+
+    latest_text = _latest_human_text_for_handoff_guard(state)
+    has_complaint_word = any(root in latest_text for root in _COMPLAINT_ROOTS_FOR_HANDOFF_GUARD)
+    has_explicit_human_request = any(root in latest_text for root in _EXPLICIT_HUMAN_REQUEST_ROOTS)
+
+    if patient_agreed and has_complaint_word and not has_explicit_human_request:
+        logger.warning(
+            "request_human_handoff: BLOCKED BY HARD GUARD - patient's latest message %r "
+            "names a complaint with no separate, explicit request for a person. Overriding "
+            "patient_agreed=True -> not_requested instead of raising a handoff, to stop this "
+            "from repeating the confirmed production failure (a bare 'شكوي' was previously "
+            "transferred with reason='patient asked for staff'). session_id=%s client_id=%s "
+            "original_reason=%r",
+            latest_text, state.get("session_id"), state.get("client_id"), reason,
+        )
+        return {
+            "status": "not_requested",
+            "reason": "complaint_word_without_explicit_human_request",
+        }
 
     if not patient_agreed:
         # Fail closed: an unconfirmed handoff silently drops rather than
