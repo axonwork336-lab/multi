@@ -472,6 +472,50 @@ def _last_ai_text(messages: List) -> str:
     return ""
 
 
+_POSITIONAL_PICK_RE = re.compile(r"^\s*(?:رقم\s*)?([1-9]\d?|[١-٩]\d?)\s*[.!؟?،,]*\s*$")
+
+
+def _picks_from_a_doctor_list(messages: List, text: str) -> bool:
+    """True when the patient is choosing a doctor from a numbered list
+    the assistant just showed.
+
+    WHY THIS MATTERS FOR ROUTING: the `medical` agent can SHOW doctors
+    (it has `find_available_doctors`) but has no booking tools at all -
+    no `match_entity_for_booking`, no schedule, no slots. So the moment
+    the patient picks one, that agent physically cannot take the next
+    step.
+
+    CONFIRMED REAL PRODUCTION FAILURE: medical guidance listed two
+    doctors, the patient replied "1", the router's default rule kept
+    them in `medical`, and the turn span the agent->tools cycle until it
+    hit the step ceiling - the patient got the technical-failure message
+    after picking a doctor that existed and was available.
+    """
+
+    if not _POSITIONAL_PICK_RE.match(text.strip()):
+        return False
+
+    # Only when the previous assistant message actually presented a
+    # numbered list of doctors - a number answering something else
+    # (a day, a time, a branch) is not a doctor pick.
+    for msg in reversed(messages or []):
+        content = getattr(msg, "content", "")
+        content = content if isinstance(content, str) else str(content)
+        if getattr(msg, "type", None) == "human" or not content.strip():
+            continue
+        if getattr(msg, "type", None) != "ai":
+            continue
+        lowered = content
+        looks_like_doctor_list = (
+            ("د." in lowered or "دكتور" in lowered or "الأطباء" in lowered
+             or "الاطباء" in lowered or "الدكاتره" in lowered or "الدكاترة" in lowered)
+            and re.search(r"[1-9]\uFE0F?\u20E3", lowered)
+        )
+        return bool(looks_like_doctor_list)
+
+    return False
+
+
 def _affirms_previous_booking_offer(messages: List, text: str) -> bool:
     if not _BARE_AFFIRMATION_RE.match(normalize(text)):
         return False
@@ -522,6 +566,13 @@ def route_turn(messages: List, active_agent: Optional[str] = None) -> Tuple[str,
 
     if active_agent != "booking" and _affirms_previous_booking_offer(messages, text):
         return "booking", "bare affirmation answering the assistant's own booking offer"
+
+    # Picking a doctor out of a list is a BOOKING action, wherever the
+    # list was shown. `medical` can display doctors but owns none of the
+    # booking tools, so leaving the patient there strands the turn - see
+    # _picks_from_a_doctor_list.
+    if active_agent == "medical" and _picks_from_a_doctor_list(messages, text):
+        return "booking", "picked a doctor from the list - booking owns the next step"
 
     scores = score_message(text)
     candidate, score = _best(scores)
