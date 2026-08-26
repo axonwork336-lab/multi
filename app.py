@@ -15,7 +15,7 @@ beyond request/response shaping and error handling.
 
 import logging
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -165,10 +165,30 @@ def chat(req: ChatRequest) -> ChatResponse:
             branch_name=None,
         )
     except Exception:
+        # ANY failure still owes the patient a message.
+        #
+        # A 500 here is silence on their phone: they wrote in, nothing
+        # came back, and they have no idea whether to wait or retry.
+        # CONFIRMED REAL PRODUCTION FAILURE: a malformed conversation
+        # (an assistant tool_call left without its tool response by an
+        # earlier aborted turn) returned 500 on EVERY subsequent
+        # message, and the session was silently dead from the patient's
+        # side. The underlying cause is fixed separately - this makes
+        # sure the next one of its kind is visible as a reply rather
+        # than as nothing at all.
         logger.exception(
             "Graph invocation failed for session_id=%s client_id=%s", req.session_id, req.client_id
         )
-        raise HTTPException(status_code=500, detail="internal_error: failed to process message")
+        templates = config.get_messages(req.client_id, client_row_override=resolved_config)
+        return ChatResponse(
+            reply=(
+                templates.get("msg_On_failure")
+                or "حدث خطأ تقني 😕. تحب تحاول مرة ثانية؟"
+            ),
+            escalate=False,
+            location=False,
+            branch_name=None,
+        )
 
     logger.info("session_id=%s reply=%r escalate=%s location=%s branch_name=%r",
                 req.session_id, result["reply"], result["escalate"], result["location"], result["branch_name"])
