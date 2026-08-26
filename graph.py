@@ -2848,6 +2848,80 @@ _BOOKING_OFFER_RE = re.compile(
 )
 
 
+_GENERIC_BRANCH_QUESTION_RE = re.compile(
+    r"اي\s*فرع\s*(?:تفضل|تحب|تبي|ترغب)|"
+    r"في\s*انهي\s*فرع|"
+    r"(?:الفروع|فروع)\s*(?:ال)?متاح|"
+    r"which\s*branch\s*(?:would|do)\s*you"
+)
+
+
+def _reply_asks_generic_branch_after_doctor(reply_text: str, state: AgentState) -> bool:
+    """True when a doctor is settled and the reply asks a bare "which
+    branch?" without having shown that doctor's own schedule.
+
+    Once a doctor is chosen, the branches that matter are HERS. A
+    generic branch list is a different question with a wrong answer
+    attached: it offers branches she may not work at, and it hides the
+    days and hours that would have let the patient just pick.
+
+    CONFIRMED REAL PRODUCTION FAILURE: after "اخترت دكتورة رانيا عبد
+    الرحمن ✅" the reply asked "أبشر، أي فرع تفضل تحجز فيه؟" and then
+    listed "1️⃣ Al Nozha — 1 طبيب / 2️⃣ Al Manar — 1 طبيب" - the
+    clinic's branches with headcounts, while that doctor works at only
+    one of them.
+
+    Suppressed once `get_doctor_schedule_for_booking` has actually run,
+    since its own output legitimately names branches and asks which
+    one."""
+
+    if not reply_text:
+        return False
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return False
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    if not session.get("doctor_id"):
+        return False
+
+    if session.get("branch_id"):
+        # Branch already settled - nothing to ask, and any branch
+        # wording here is incidental.
+        return False
+
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "name", None) == "get_doctor_schedule_for_booking":
+            return False
+
+    return bool(_GENERIC_BRANCH_QUESTION_RE.search(_norm_ar(reply_text)))
+
+
+_DOCTOR_SCHEDULE_INSTEAD_OF_BRANCHES_CORRECTION = (
+    "============================================================\n"
+    "SHOW THIS DOCTOR'S SCHEDULE - NOT A LIST OF CLINIC BRANCHES\n"
+    "============================================================\n"
+    "Your previous draft asked which branch the patient wants, and/or "
+    "listed the clinic's branches. A doctor is already chosen, so the "
+    "only branches that exist for this booking are HERS - a general "
+    "branch list offers places she may not work at all.\n\n"
+    "Call `get_doctor_schedule_for_booking` and show what it returns, "
+    "grouped by branch, with the real days and hours at each:\n"
+    "    مواعيد [الدكتور] في فرع [الفرع الأول]:\n"
+    "    • [اليوم]: من [من] لـ [إلى] — [اسم الخدمة]\n"
+    "    وفي فرع [الفرع الثاني]:\n"
+    "    • [اليوم]: من [من] لـ [إلى] — [اسم الخدمة]\n"
+    "    حابب تحجز في أنهي فرع وأنهي يوم؟\n\n"
+    "If she works at only ONE branch, there is nothing to ask: show "
+    "that branch's days and ask about the DAY directly (\"تحب أشوف لك "
+    "المواعيد المتاحة ليوم [اليوم]؟\").\n\n"
+    "Keep the confirmation line as it was and replace everything after "
+    "it. Never print branch headcounts (\"— 1 طبيب\") in place of the "
+    "doctor's actual schedule.\n\n"
+)
+
+
 def _reply_offers_booking_at_empty_branch(reply_text: str, state: AgentState) -> bool:
     """True when a reply offers to book at the branch the tools have
     already established has no bookable doctor.
@@ -3595,6 +3669,12 @@ _REPLY_VERIFIERS = (
         lambda reply, state: _PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE,
         "reply asked for a phone number (or a booking reference instead) right after "
         "the patient agreed to proceed on the channel number the service already has",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_asks_generic_branch_after_doctor(reply, state),
+        lambda reply, state: _DOCTOR_SCHEDULE_INSTEAD_OF_BRANCHES_CORRECTION,
+        "reply asked a generic 'which branch?' after a doctor was settled, instead of "
+        "showing that doctor's own schedule",
     ),
     (
         lambda reply, state, agent_name: _reply_offers_booking_at_empty_branch(reply, state),
@@ -4711,7 +4791,18 @@ def _build_branch_question_directive(messages: list, session_id: str, agent_name
     product decision to remove that extra turn - see
     _BRANCH_QUESTION_PHRASING_DIRECTIVE."""
 
-    if agent_name not in ("booking", "concierge") or not session_id:
+    # "medical" IS INCLUDED ON PURPOSE. The medical-guidance flow hands
+    # over into booking without changing agent: symptom -> specialty ->
+    # doctor list -> the patient picks one, all inside `medical`. Gating
+    # this to booking/concierge meant the directive was silent on
+    # exactly that path.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: after "اخترت دكتورة رانيا عبد
+    # الرحمن ✅" the reply asked "أي فرع تفضل تحجز فيه؟" and then
+    # printed a generic branch list ("Al Nozha — 1 طبيب", "Al Manar — 1
+    # طبيب") - branches of the CLINIC, not of that doctor, offering a
+    # branch she does not work at.
+    if agent_name not in ("booking", "concierge", "medical") or not session_id:
         return ""
 
     session = tools._BOOKING_SESSIONS.get(session_id) or {}
