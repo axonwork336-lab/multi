@@ -4871,11 +4871,19 @@ def resolve_available_day(
     Returns:
     {"status": "found", "date": "YYYY-MM-DD", "weekday_name": "Thursday",
      "date_display": "25/08/2026", "weekday_display": "الثلاثاء",
+     "first_time_display": "11:00 صباحًا", "last_time_display": "3:00 مساءً",
      "from_date": ..., "to_date": ...}
         # SHOW `weekday_display` and `date_display` to the patient -
         # never `date`, which is a machine value in ISO format and reads
         # as a raw timestamp inside a sentence. Pass `from_date`/
         # `to_date` VERBATIM into `get_available_slots_for_booking`.
+        # `first_time_display`/`last_time_display` are the EARLIEST and
+        # LATEST open slot start times on that day - present them as a
+        # RANGE ("من 11:00 صباحًا إلى 3:00 مساءً"), never as one specific
+        # appointment time. The DAY itself, not one slot in it, is what
+        # you're offering at this step; the individual bookable times
+        # only come after the patient confirms the day, via
+        # `get_available_slots_for_booking`.
     {"status": "fully_booked", "weekday_name": "Thursday", "weekday_display": "الخميس"}
         # The doctor DOES work that weekday here, but every slot is
         # taken. Say exactly that - "الخميس محجوز بالكامل حاليًا" - and
@@ -5058,6 +5066,24 @@ def resolve_available_day(
     english_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][target_weekday]
     logger.info("resolve_available_day: found date=%s (weekday=%s) from %d candidate(s)", chosen_date.isoformat(), english_name, len(candidates))
 
+    # The EARLIEST and LATEST open slot start times on chosen_date, so
+    # the day can be offered as a RANGE ("من 11:00 صباحًا إلى 3:00
+    # مساءً") instead of the model latching onto the single nearest slot
+    # and presenting a 30-minute window as if that were the only option.
+    # No extra API call needed - `candidates` already holds every open
+    # slot on this weekday across the whole window (it's how chosen_date
+    # itself was picked), so this is just a filter over data already in
+    # hand.
+    #
+    # CONFIRMED REAL PRODUCTION CONFUSION this fixes: the patient was
+    # told the nearest appointment was "من 11:00 إلى 11:30" - the
+    # nearest SLOT's own start/end, not the day's actual availability
+    # (11:00 صباحًا to 3:00 مساءً) - which reads as if that one narrow
+    # window were the whole offer.
+    same_day_candidates = [dt for dt in candidates if dt.date() == chosen_date]
+    first_time_dt = same_day_candidates[0] if same_day_candidates else chosen_dt
+    last_time_dt = same_day_candidates[-1] if same_day_candidates else chosen_dt
+
     day_start = datetime.combine(chosen_date, datetime.min.time(), tzinfo=chosen_dt.tzinfo)
     day_end = datetime.combine(chosen_date, datetime.max.time().replace(microsecond=0), tzinfo=chosen_dt.tzinfo)
 
@@ -5084,6 +5110,8 @@ def resolve_available_day(
         "weekday_name": english_name,
         "date_display": _display_date(chosen_dt.isoformat()),
         "weekday_display": _display_weekday(chosen_dt.isoformat(), language),
+        "first_time_display": _display_time_12h(first_time_dt.isoformat(), language),
+        "last_time_display": _display_time_12h(last_time_dt.isoformat(), language),
         "from_date": day_start.isoformat(),
         "to_date": day_end.isoformat(),
     }
