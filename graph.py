@@ -2872,6 +2872,62 @@ _SPECIALTY_OFFER_RE = re.compile(
 )
 
 
+_SPECIALTY_CHOICE_QUESTION_RE = re.compile(
+    r"(?:وش|اي|ايه|انهي)\s*(?:ال)?تخصص|"
+    r"(?:ال)?تخصص\s*(?:اللي|الذي)\s*(?:تفضل|تحب|تبي|ترغب)|"
+    r"which\s*specialt"
+)
+
+
+def _medical_reply_asks_which_specialty(reply_text: str, state: AgentState) -> bool:
+    """True when a medical-guidance reply asks the patient to pick a
+    specialty.
+
+    They described a symptom - working out the specialty is the help
+    they came for, and handing the question back is the one thing this
+    flow must not do. It is especially wrong between near-identical
+    entries ("طب الباطنة" vs "باطنه عام"), where the distinction is a
+    registration detail on our side and means nothing to a patient in
+    pain.
+
+    CONFIRMED REAL PRODUCTION FAILURE: after a correct guidance reply
+    the patient said "اه" - agreeing to be booked - and received "وش
+    التخصص اللي تفضله من تخصصات الطب الباطنة المتوفرة؟ 1️⃣ طب الباطنة
+    2️⃣ باطنه عام" instead of the doctor list.
+
+    This complements `_reply_dumps_specialty_catalogue`, which catches
+    the whole catalogue being printed; this catches the narrower "pick
+    one of these two" question."""
+
+    if not reply_text:
+        return False
+
+    return bool(_SPECIALTY_CHOICE_QUESTION_RE.search(_norm_ar(reply_text)))
+
+
+_SPECIALTY_CHOICE_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "DON'T ASK WHICH SPECIALTY - SHOW THE DOCTORS\n"
+    "============================================================\n"
+    "Your previous draft asked the patient to choose a specialty. They "
+    "described a symptom; working out the specialty is exactly the help "
+    "they came for, so handing the question back leaves them stuck. "
+    "Between near-identical entries like \"طب الباطنة\" and \"باطنه "
+    "عام\" it is worse still - to them those are the same thing, and "
+    "the difference is a registration detail on our side.\n\n"
+    "Call `find_available_doctors` with EVERY plausibly matching "
+    "specialty id at once - all of them, not one - and show the doctors "
+    "that come back as a numbered list, then ask ONE question: which "
+    "doctor. The specialty may appear as a label beside each name "
+    "(\"رانيا عبد الرحمن — استشاري · باطنه عام\"), which is useful; it "
+    "is never a choice they must make first.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: the patient said \"اه\" to being "
+    "booked in and got \"وش التخصص اللي تفضله من تخصصات الطب الباطنة "
+    "المتوفرة؟ 1️⃣ طب الباطنة 2️⃣ باطنه عام\" - a second triage question "
+    "where the doctor list should have been.\n\n"
+)
+
+
 def _medical_reply_missing_not_a_diagnosis(reply_text: str, state: AgentState) -> bool:
     """True when a medical-guidance reply steers the patient toward a
     specialty or a doctor without saying this isn't a diagnosis.
