@@ -25,7 +25,7 @@ from typing import Dict
 
 from langchain_core.messages import HumanMessage
 
-from config import POST_SUCCESS_TIMEOUT_SECONDS, SESSION_TIMEOUT_SECONDS, THREAD_ID_PREFIX, configure_logging, get_messages
+from config import GRAPH_RECURSION_LIMIT, POST_SUCCESS_TIMEOUT_SECONDS, SESSION_TIMEOUT_SECONDS, THREAD_ID_PREFIX, configure_logging, get_messages
 from graph import graph
 
 import progress
@@ -184,7 +184,25 @@ def _config_for(session_id: str) -> dict:
     generation = _generation.get(session_id, 0)
     thread_id = f"{THREAD_ID_PREFIX}:{session_id}:{generation}" if generation else f"{THREAD_ID_PREFIX}:{session_id}"
 
-    return {"configurable": {"thread_id": thread_id}}
+    # AN EXPLICIT CEILING ON GRAPH STEPS PER TURN.
+    #
+    # Nothing in this project set `recursion_limit`, so the agent->tools
+    # ->agent cycle relied entirely on the model choosing to stop. When
+    # it doesn't, the turn never ends and the patient gets NOTHING -
+    # confirmed twice in production, once for roughly a hundred model
+    # calls over two minutes.
+    #
+    # A normal turn uses a handful of steps; the deepest legitimate
+    # flows (resolve entity -> schedule -> days -> slots, with a
+    # verifier correction on top) stay well inside this. Hitting it
+    # means something is looping, and LangGraph then raises
+    # GraphRecursionError - which main.py's existing error handling
+    # turns into the client's configured failure message. A wrong
+    # answer is bad; no answer at all is worse.
+    return {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": GRAPH_RECURSION_LIMIT,
+    }
 
 
 def _cancellation_just_succeeded(messages: list) -> bool:
