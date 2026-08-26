@@ -119,6 +119,14 @@ _TOOL_GROUPS: Dict[str, tuple] = {
         "list_branches_for_specialty",
     ),
 
+    # Looking for WHICH BRANCHES can book a service the patient has
+    # already chosen. Worth its own wording: at that moment the service
+    # is the shared context, and naming it confirms the assistant is
+    # still working on the thing they picked rather than starting over.
+    "searching_service_branches": (
+        "find_branches_offering_service",
+    ),
+
     # Looking for which DAYS a doctor has anything open.
     "searching_slots": (
         "list_available_days_for_booking",
@@ -295,6 +303,7 @@ _GROUP_PRIORITY = (
     "sending_otp",
     "searching_times",
     "searching_slots",
+    "searching_service_branches",
     "searching_branches",
     "searching_specialty_doctors",
     "searching_doctors",
@@ -327,6 +336,8 @@ _DEFAULT_MESSAGES: Dict[str, Dict[str, str]] = {
                            "en": "One moment please - checking the available doctors in this specialty… 🩺"},
     "searching_branches": {"ar": "لحظة من فضلك، جاري البحث عن الفروع المتاحة… 🏥",
                            "en": "One moment please - looking up the available branches… 🏥"},
+    "searching_service_branches": {"ar": "لحظة من فضلك، جاري البحث عن الفروع المتاح بها الخدمة… 🏥",
+                           "en": "One moment please - looking up the branches offering this service… 🏥"},
     "searching_slots":    {"ar": "لحظة من فضلك، جاري البحث عن المواعيد المتاحة… 🗓️",
                            "en": "One moment please - checking the available days… 🗓️"},
     "searching_times":    {"ar": "لحظة من فضلك، جاري البحث عن الأوقات المتاحة… 🕐",
