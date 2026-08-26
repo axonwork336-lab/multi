@@ -5865,6 +5865,20 @@ def list_available_days_for_booking(
 
     shown_through = offset + consumed
 
+    # REMEMBER THE DAYS, exactly as they are about to be shown.
+    #
+    # Every other list this project displays is remembered so a bare
+    # number resolves by POSITION - doctors, branches, services, slots.
+    # Days were the one omission, so "1" had nothing to resolve against
+    # and the model matched it from memory instead.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: the patient rejected Tuesday,
+    # was shown "1️⃣ الأحد 30/08 2️⃣ الاثنين 31/08 3️⃣ الثلاثاء 01/09",
+    # replied "1" - and the booking was confirmed for الثلاثاء
+    # 01/09/2026, the third option and the very day they had just
+    # turned down.
+    _remember_list(state, "day", days)
+
     return {
         "status": "found",
         "days": days,
