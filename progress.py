@@ -100,7 +100,13 @@ _TOOL_GROUPS: Dict[str, tuple] = {
     # silent (see _SILENT_RESOLVER_TOOLS), but a tenant may still
     # override this wording via msg_progress_searching_specialties, and
     # _list_mode_alias can still select it.
-    "searching_specialties": (),
+    "searching_specialties": (
+        # Announced only when the patient actually asked for the
+        # specialty list (the booking flow) - it is silenced in medical
+        # guidance, where it is an internal step. See the
+        # `list_specialties` handling in schedule().
+        "list_specialties",
+    ),
 
     # A doctor search NARROWED TO A SPECIALTY, which is what the patient
     # has just agreed to when they say "اه" to "تحب أشوف لك الدكاترة في
@@ -584,6 +590,7 @@ def schedule(
     templates: Optional[dict] = None,
     answering_a_list: bool = False,
     tool_args: Optional[dict] = None,
+    agent_name: Optional[str] = None,
 ) -> None:
     """Arm the interim message for a tool phase that is about to start.
 
@@ -596,6 +603,13 @@ def schedule(
     `tool_args`: {tool_name: arguments}, used only to tell a dual-mode
     resolver's LIST mode (a real roster fetch, worth announcing) from
     its RESOLVE mode (instant) - see _is_list_mode.
+
+    `agent_name`: which flow is running. The SAME tool can be worth
+    describing differently depending on why it was called - looking up
+    times inside a reschedule is "moving your appointment", not
+    "checking the available times" - so this narrows the wording where
+    it genuinely changes what the patient is waiting for. Optional and
+    additive: omit it and every existing behaviour is unchanged.
 
     Never raises: a failure here must not be able to break a turn that
     would otherwise have answered the patient perfectly well.
@@ -617,6 +631,22 @@ def schedule(
         }
         if answering_a_list:
             silent |= _LIST_LOOKUP_TOOLS
+
+        # `list_specialties` IS SILENT ONLY IN MEDICAL GUIDANCE.
+        #
+        # There, the patient described a symptom and is waiting to be
+        # told which doctor to see; the specialty lookup is the
+        # assistant's own reasoning and announcing it narrates a step
+        # nobody asked about (see _SILENT_RESOLVER_TOOLS).
+        #
+        # In the BOOKING flow it is the opposite: the patient answered
+        # "تخصص" to "تحب تبدأ بالتخصص ولا بالدكتور؟", so the specialty
+        # list is precisely what they asked for and are now waiting on.
+        # CONFIRMED: that turn showed "جاري البحث عن الأطباء المتاحين"
+        # and then produced a list of SPECIALTIES - describing the wrong
+        # thing entirely.
+        if agent_name in ("booking", "concierge") and "list_specialties" in names:
+            silent.discard("list_specialties")
 
         if all(name in silent for name in names):
             # Nothing worth announcing yet - see _SILENT_RESOLVER_TOOLS.
@@ -652,6 +682,21 @@ def schedule(
             for name in announceable
         ):
             groups_override = "searching_specialty_doctors"
+
+        # INSIDE A RESCHEDULE, THE PATIENT IS WAITING ON ONE THING.
+        #
+        # Every slot/time lookup in that flow exists to move an existing
+        # appointment, so describing the mechanics ("جاري البحث عن
+        # الأوقات المتاحة") tells them about a step rather than about
+        # their request. CONFIRMED: during a reschedule the interim line
+        # read "جاري البحث عن الأوقات المتاحة" immediately before the
+        # old-vs-new appointment review - the patient is moving a
+        # booking, and that is what the line should say.
+        if agent_name == "reschedule" and any(
+            _GROUP_FOR_TOOL.get(name) in ("searching_slots", "searching_times")
+            for name in announceable
+        ):
+            groups_override = "rescheduling"
 
         text = (
             _message_for_group(groups_override, language, templates)
