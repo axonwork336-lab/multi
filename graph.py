@@ -2766,26 +2766,7 @@ def _reply_dumps_times_without_offering_soonest(reply_text: str, state: AgentSta
     identical step in another flow did it correctly.
 
     Fires only when the patient's own last message was a DAY choice, so
-    a time list they explicitly asked for is untouched.
-
-    EXEMPTION - does NOT fire when the most recent tool call was
-    `get_available_slots_for_booking` returning "found": that result is
-    handled by `_build_slots_numbered_list_directive`, which FORCES the
-    exact same full numbered list verbatim as the only acceptable reply
-    for that turn. Without this exemption the two directives contradict
-    each other on the identical trigger (patient names a weekday ->
-    resolve_available_day/get_available_slots_for_booking run in the
-    same turn -> full list comes back): the model is first ordered to
-    print the whole list, then this check immediately rejects that same
-    list and forces it back down to a single "soonest" offer instead.
-
-    CONFIRMED REAL PRODUCTION FAILURE (the mirror-image one this
-    exemption fixes): patient said "الثلاثاء", got the correct 7-slot
-    numbered list, which this check then overrode into "أقرب موعد
-    متاح ... من 11:00 إلى 11:30 - هل يناسبك؟". The patient replied
-    "مناسب" believing they were confirming the single time shown, when
-    in fact 7 times were available and the intended next step was to
-    show all of them, not silently narrow to the first."""
+    a time list they explicitly asked for is untouched."""
 
     if not reply_text:
         return False
@@ -2795,18 +2776,6 @@ def _reply_dumps_times_without_offering_soonest(reply_text: str, state: AgentSta
 
     if _SOONEST_OFFER_RE.search(_norm_ar(reply_text)):
         return False
-
-    last_tool_msg = next(
-        (m for m in reversed(state.get("messages") or []) if getattr(m, "type", None) == "tool"),
-        None,
-    )
-    if getattr(last_tool_msg, "name", None) == "get_available_slots_for_booking":
-        try:
-            tool_data = json.loads(last_tool_msg.content)
-        except (ValueError, TypeError):
-            tool_data = None
-        if isinstance(tool_data, dict) and tool_data.get("status") == "found":
-            return False
 
     from langchain_core.messages import HumanMessage as _HumanMessage
 
