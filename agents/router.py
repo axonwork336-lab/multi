@@ -214,7 +214,16 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
     ],
 
     "complaint": [
-        (10, r"(?:عندي|اقدم|أقدم|ابغى\s*اقدم|عايز\s*اقدم|حاب\s*اقدم|اريد\s*تقديم|بدي\s*قدم)\s*"
+        # "اعمل"/"أعمل"/"هعمل" added to the verb list. Confirmed real
+        # production failure: "عاوزه اعمل شكوه" ("I want to make a
+        # complaint") scored only 6 (fell through to the bare-keyword
+        # rule below) because "اعمل" wasn't one of the recognised verbs -
+        # 6 sits under _SWITCH_THRESHOLD (8), so this message could not
+        # interrupt an active booking flow the session was already in,
+        # and the patient's stated complaint intent was silently ignored
+        # in favour of "still owns this flow".
+        (10, r"(?:عندي|اقدم|أقدم|ابغى\s*اقدم|عايز\s*اقدم|حاب\s*اقدم|اريد\s*تقديم|بدي\s*قدم|"
+             r"اعمل|أعمل|هعمل|عاوز(?:ه)?\s*اعمل|عايز(?:ه)?\s*اعمل)\s*"
              r"\w*\s*(?:شكوى|شكويه|شكوه|شكاوي|اقتراح|مقترح|ملاحظه|ملاحظة)"),
         (10, r"\b(?:file|submit|make|raise|lodge|register)\s+(?:an?\s+)?"
              r"(?:complaint|grievance|suggestion|feedback)\b"),
@@ -231,9 +240,24 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         (9, r"(?:وصف|كتب|اداني|اعطاني)\w*\s*(?:لي|لى)?\s*دواء\s*(?:غلط|خطأ|خطا)"),
         (9, r"(?:غلط|خطأ|خطا)\s*(?:طبي|في\s*العلاج|في\s*التشخيص|في\s*الدواء|في\s*الوصفه)"),
         (9, r"(?:الدكتور|الطبيب|دكتور|طبيب)\w{0,10}\s*غلط\w*"),
-        (6, r"(?:^|\s)(?:شكوى|شكويه|شكوه|شكاوي|اشتكي|أشتكي|هشتكي|هاشتكي|حاشتكي|"
+        # BARE "شكوى"/"شكوي"/"شكوه" etc. RAISED FROM 6 TO 8.
+        #
+        # Same reasoning as the bare "احجز" imperative fix in the
+        # "booking" cue list above: a patient who types the word
+        # "complaint" on its own, with no other verb attached, has
+        # still stated an unambiguous topic - there is no other plausible
+        # reading of "شكوي" sent by itself. Leaving this at 6 (below
+        # _SWITCH_THRESHOLD=8) meant it could never interrupt an active
+        # flow on its own. CONFIRMED REAL PRODUCTION FAILURE: this
+        # message, sent while "booking" already owned the conversation,
+        # scored 6, stayed on "booking" ("booking still owns this
+        # flow"), and the specialist that then ran had no dedicated
+        # complaint-flow prompt shaping its reply. Weighted to 8 so a
+        # standalone complaint word can now switch specialists on its
+        # own, exactly like a standalone "احجز" can for booking.
+        (8, r"(?:^|\s)(?:شكوى|شكويه|شكوه|شكاوي|اشتكي|أشتكي|هشتكي|هاشتكي|حاشتكي|"
              r"بشتكي\s*من|اقتراح|مقترح)(?:\s|$)"),
-        (6, r"\b(?:complaint|complain|grievance|suggestion)\b"),
+        (8, r"\b(?:complaint|complain|grievance|suggestion)\b"),
         (3, r"(?:خدمه\s*سيئه|معامله\s*سيئه|مستاء|مستاءه|زعلان\s*من|غير\s*راضي)"),
         (3, r"\b(?:poor|bad|terrible|awful)\s+(?:service|treatment|experience)\b"),
         (3, r"\bunhappy\s+with\b"),
