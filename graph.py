@@ -607,7 +607,7 @@ def _build_branches_only_no_doctors_directive(messages: list) -> str:
 
     return (
         "============================================================\n"
-        "OFFER THE OTHER BRANCHES BY NAME ONLY - NO DOCTOR NAMES\n"
+        "OFFER THE OTHER BRANCHES WITHOUT LISTING THEIR DOCTORS\n"
         "============================================================\n"
         "The branch the patient asked about has nobody available, and "
         "you are now offering the alternatives. Show ONLY the branch "
@@ -1796,7 +1796,7 @@ def _build_empty_branch_directive(messages: list) -> str:
         "  - Say plainly that this branch has no doctors available for "
         "booking right now.\n"
         "  - Then call `list_branches_for_specialty` and offer the other "
-        "branches BY NAME ONLY - a short numbered list of branch names.\n"
+        "branches as a short numbered list - names (and addresses if you have them). What must NOT appear is the DOCTORS at those branches.\n"
         "  - DO NOT list the doctors at those other branches. Not one "
         "name. CONFIRMED REAL PRODUCTION FAILURE: this produced a wall "
         "of eleven doctor names across three branches in a single "
@@ -2885,6 +2885,82 @@ _MEDICAL_OFFER_PATTERN_RE = re.compile(
 )
 
 
+def _medical_reply_names_two_specialties(reply_text: str, state: AgentState) -> bool:
+    """True when a medical-guidance reply tells the patient to see one
+    specialty and then offers an appointment in a DIFFERENT one.
+
+    That contradiction is mechanically checkable even though "is this
+    specialty relevant?" is not, and it is a reliable symptom of the
+    underlying failure: the model knows which specialty the symptom
+    needs, finds the clinic doesn't have it, and offers the nearest
+    available one anyway - leaving both in the same message.
+
+    CONFIRMED REAL PRODUCTION FAILURE: "عيني وجعاني وبتدمع" produced
+    "راجع دكتور طب الأطفال أو استشاري عيون فورًا" followed by "عندنا في
+    مستشفى ميدتاون دكاترة في طب الأطفال متاحين - تحب أحجز لك موعد عند
+    واحد منهم؟" - advising an eye consultant while offering a
+    paediatrician, for an adult's eye complaint."""
+
+    if not reply_text:
+        return False
+
+    folded = _norm_ar(reply_text)
+
+    if not _SPECIALTY_OFFER_RE.search(folded):
+        return False
+
+    specialty_names = set()
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "name", None) != "list_specialties":
+            continue
+        try:
+            data = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for item in data.get("specialties") or data.get("items") or []:
+            if isinstance(item, dict):
+                for key in ("name", "altName"):
+                    value = item.get(key)
+                    if value:
+                        normalized = _norm_ar(str(value))
+                        if len(normalized) >= 4:
+                            specialty_names.add(normalized)
+
+    if not specialty_names:
+        return False
+
+    mentioned = {name for name in specialty_names if name in folded}
+
+    # Two or more DIFFERENT registered specialties named in a single
+    # guidance reply. One is the answer; two means the reply could not
+    # decide, and the patient is the one left holding the ambiguity.
+    return len(mentioned) >= 2
+
+
+_TWO_SPECIALTIES_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOUR REPLY NAMES TWO DIFFERENT SPECIALTIES - PICK ONE\n"
+    "============================================================\n"
+    "Your previous draft points the patient at one specialty and offers "
+    "an appointment in another. That is incoherent from their side: "
+    "they cannot tell which doctor they are actually being sent to.\n\n"
+    "Decide which specialty the SYMPTOM they described actually needs, "
+    "and use that one in BOTH the advice line and the offer line.\n\n"
+    "If this clinic does not have that specialty registered, do NOT "
+    "substitute the nearest available one. Say plainly that there is no "
+    "doctor for this here at the moment, keep the comfort advice and "
+    "the red flags, and offer to connect them with a staff member "
+    "instead. An honest \"not here\" is worth far more than a confident "
+    "wrong referral.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: eye pain with watering was "
+    "answered with \"راجع دكتور طب الأطفال أو استشاري عيون فورًا\" and "
+    "then an offer of طب الأطفال doctors - a paediatrician offered for "
+    "an adult's eye, because ophthalmology was not in the list.\n\n"
+)
+
+
 def _in_medical_guidance_handoff(state: AgentState) -> bool:
     """True when the assistant's last message was a medical-guidance
     offer ("...عندنا دكاترة باطنة متاحين، تحب أحجزلك؟") - i.e. the
@@ -3836,6 +3912,15 @@ _REPLY_VERIFIERS = (
     (
         lambda reply, state, agent_name: (
             (agent_name == "medical" or _in_medical_guidance_handoff(state))
+            and _medical_reply_names_two_specialties(reply, state)
+        ),
+        lambda reply, state: _TWO_SPECIALTIES_CORRECTION_DIRECTIVE,
+        "medical-guidance reply advised one specialty and offered an appointment "
+        "in a different one",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            (agent_name == "medical" or _in_medical_guidance_handoff(state))
             and _medical_reply_asks_which_specialty(reply, state)
         ),
         lambda reply, state: _SPECIALTY_CHOICE_CORRECTION_DIRECTIVE,
@@ -4693,7 +4778,7 @@ def _build_empty_branch_booking_intent_directive(messages: list, session_id: str
         "and ONE question: تحب أعرض لك الفروع اللي فيها حجز؟\n"
         "  4. Only if they say yes, call `find_branches_offering_service` "
         "(when a service is in play) or `list_branches_for_specialty` and "
-        "list those branches BY NAME ONLY, no doctor names.\n\n"
+        "list those branches - names, and addresses if you have them - but no doctor names.\n\n"
         "Do not collapse steps 1-2. CONFIRMED REAL REGRESSION: this turn "
         "previously replied with the address, the branch's one service, "
         "and then the honest question - and a later change reduced it to "
@@ -4841,7 +4926,19 @@ def _build_branches_info_directive(messages: list) -> str:
         "other two by mistake.\n\n"
         "Call `match_entity_info(user_input=\"\", entity_type=\"branch\")` "
         "and present its \"list\" result as a numbered list (emoji "
-        "digits), then ask if they'd like details on one of them. Do NOT "
+        "digits), WITH EACH BRANCH'S ADDRESS beside its name:\n"
+        "    1\ufe0f\u20e3 فرع المعادي - 133 شارع 9 المعادي\n"
+        "    2\ufe0f\u20e3 فرع الدقي - 9 شارع الإمام الغزالي، الدقي\n"
+        "The address is the useful half of the answer - \"which branches "
+        "do you have\" is nearly always \"which one is near me\". A bare "
+        "list of names makes them ask again. CONFIRMED REAL REGRESSION: "
+        "this list previously carried each address and was reduced to "
+        "names only (\"Emergency / Al Manar / Al Nozha\"), because a "
+        "\"BY NAME ONLY\" rule written for a DIFFERENT case - offering "
+        "alternative branches after an empty one - was applied here too. "
+        "That rule is about not listing DOCTORS at those branches; it "
+        "never meant dropping addresses from this list.\n\n"
+        "Then ask if they'd like details on one of them. Do NOT "
         "call `list_hospital_services` (that answers a SERVICES "
         "question), and do NOT call `list_specialties` or "
         "`list_branches_for_specialty` (those require a specialty and "
