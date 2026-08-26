@@ -3279,7 +3279,7 @@ def match_entity_info(
             shaped = [
                 {
                     "id": i.get("id"),
-                    "formatedName": i.get("formatedName") or i.get("name"),
+                    "formatedName": _arabic_preferred_name(i) or i.get("formatedName"),
                     "altName": i.get("altName"),
                     "specialtyName": i.get("specialtyName"),
                     "degreeName": i.get("degreeName"),
@@ -3310,10 +3310,20 @@ def match_entity_info(
             # name match), which is the only moment it's actually needed
             # - deciding whether to offer a booking there.
             bookable_branch_ids = _branch_ids_with_available_doctors(state, base_url) or set()
+            # ARABIC NAME FIRST. `_arabic_preferred_name` exists exactly
+            # for this: `altName` is the Arabic form across every
+            # endpoint in this API, and putting the English `name` in
+            # the "name" field means that is what gets printed.
+            #
+            # CONFIRMED REAL PRODUCTION FAILURE: the branch list went
+            # out as "Emergency / Al Manar / Al Nozha" inside an
+            # otherwise fully Arabic reply, because this list shaped
+            # `name` from the English field while every other branch
+            # path in this file uses the helper.
             shaped = [
                 {
                     "id": i.get("id"),
-                    "name": i.get("name") or i.get("formatedName"),
+                    "name": _arabic_preferred_name(i) or i.get("name"),
                     "altName": i.get("altName"),
                     "address": i.get("address"),
                     "cityName": i.get("cityName"),
@@ -3366,7 +3376,7 @@ def match_entity_info(
         if entity_type == "doctor":
             shape_fn_for_pos = lambda i: {
                 "id": i.get("id"),
-                "formatedName": i.get("formatedName") or i.get("name"),
+                "formatedName": _arabic_preferred_name(i) or i.get("formatedName"),
                 "altName": i.get("altName"),
                 "degreeName": i.get("degreeName"),
                 "specialtyName": i.get("specialtyName"),
@@ -3375,7 +3385,7 @@ def match_entity_info(
         else:
             shape_fn_for_pos = lambda i: {
                 "id": i.get("id"),
-                "name": i.get("name") or i.get("formatedName"),
+                "name": _arabic_preferred_name(i) or i.get("name"),
                 "altName": i.get("altName"),
                 "address": i.get("address"),
                 "cityName": i.get("cityName"),
@@ -3479,7 +3489,7 @@ def match_entity_info(
             shaped_available = [
                 {
                     "id": b.get("id"),
-                    "name": b.get("name") or b.get("formatedName"),
+                    "name": _arabic_preferred_name(b) or b.get("name"),
                     "altName": b.get("altName"),
                     "address": b.get("address"),
                     "cityName": b.get("cityName"),
@@ -3505,7 +3515,7 @@ def match_entity_info(
     def _shape_doctor(i):
         return {
             "id": i.get("id"),
-            "formatedName": i.get("formatedName") or i.get("name"),
+            "formatedName": _arabic_preferred_name(i) or i.get("formatedName"),
             "altName": i.get("altName"),
             "degreeName": i.get("degreeName"),
             "specialtyName": i.get("specialtyName"),
@@ -3519,7 +3529,7 @@ def match_entity_info(
     def _shape_branch(i):
         shaped_branch = {
             "id": i.get("id"),
-            "name": i.get("name") or i.get("formatedName"),
+            "name": _arabic_preferred_name(i) or i.get("name"),
             "altName": i.get("altName"),
             "address": i.get("address"),
             "cityName": i.get("cityName"),
@@ -4353,6 +4363,8 @@ def match_entity_for_booking(
         # Same bilingual-name bridge as match_entity_info above.
         items = _with_branch_aliases(items, state)
 
+    _lang = conversation_language(state)
+
     def _shape(i):
         if entity_type == "doctor":
             return {
@@ -4365,10 +4377,14 @@ def match_entity_for_booking(
                 "name": i.get("altName") or i.get("formatedName") or i.get("name"),
                 "formatedName": i.get("formatedName") or i.get("name"),
                 "altName": i.get("altName"),
-                "degreeName": i.get("degreeName"),
-                "specialtyName": i.get("specialtyName"),
+                # Specialty/degree/branch in the CONVERSATION's language
+                # too - the same reason the name is. Leaving these on the
+                # English fields is how "استشاري · Internal Medicine" or
+                # an English branch name ends up inside an Arabic reply.
+                "degreeName": i.get("degreeAltName") if (_lang != "en" and i.get("degreeAltName")) else i.get("degreeName"),
+                "specialtyName": i.get("specialtyAltName") if (_lang != "en" and i.get("specialtyAltName")) else i.get("specialtyName"),
                 "branchId": i.get("branchId"),
-                "branchName": i.get("branchName"),
+                "branchName": i.get("branchAltName") if (_lang != "en" and i.get("branchAltName")) else i.get("branchName"),
             }
         return {
             "id": i.get("id"),
