@@ -2680,6 +2680,111 @@ def _known_branch_text(state: AgentState) -> str:
     return _norm_ar(" | ".join(str(p) for p in parts))
 
 
+_DOCTOR_MENTION_RE = re.compile(
+    r"(?:^|\n)\s*(?:[1-9]\uFE0F?\u20E3|[1-9][\.\)])\s*(?:د\.?|الدكتور[هة]?|دكتور[هة]?)?\s*"
+    r"([^\n—\-·(]{3,40})"
+)
+
+
+def _doctor_names_from_tools(state: AgentState) -> set:
+    """Every doctor name any tool result in this conversation returned."""
+
+    names = set()
+
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "type", None) != "tool":
+            continue
+        try:
+            data = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+
+        def _collect(node):
+            if isinstance(node, dict):
+                for key in ("name", "formatedName", "altName", "doctorName"):
+                    value = node.get(key)
+                    if value:
+                        names.add(_norm_ar(str(value)))
+                for value in node.values():
+                    _collect(value)
+            elif isinstance(node, list):
+                for value in node:
+                    _collect(value)
+
+        _collect(data)
+
+    return {n for n in names if n}
+
+
+def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
+    """Doctor names presented in a numbered list that no tool result in
+    this conversation ever returned.
+
+    WHY THIS EXISTS: a doctor roster is the single most dangerous thing
+    to invent - the patient picks a name, and everything downstream
+    (schedule, slots, the booking itself) is built on a person who may
+    not work here.
+
+    CONFIRMED REAL PRODUCTION FAILURE: "الدكاترة المتاحين في تخصص طب
+    الباطنة عندنا الآن: 1️⃣ د. طه مبروك 2️⃣ د. سارة عبد الله 3️⃣ د.
+    محمود سليمان" went out with NO tool call at all in that turn - no
+    `find_available_doctors`, no `_remember_list`, nothing. The names
+    were recalled from earlier in the conversation and presented as a
+    current, specialty-filtered roster.
+
+    Only fires when the reply presents an actual numbered LIST of
+    people and at least one entry matches nothing the tools returned -
+    prose that merely mentions a doctor already discussed is left
+    alone."""
+
+    if not reply_text:
+        return []
+
+    known = _doctor_names_from_tools(state)
+    if not known:
+        # No doctor data at all this conversation. A numbered list of
+        # people here is unbacked by definition, but staying silent is
+        # safer than guessing what the list is - other guards cover the
+        # no-tool-call case.
+        return []
+
+    invented = []
+    for match in _DOCTOR_MENTION_RE.finditer(reply_text):
+        candidate = _norm_ar(match.group(1))
+        if not candidate or len(candidate) < 5:
+            continue
+        # Substring either way: tool results carry titles and suffixes
+        # the reply trims ("د. طه مبروك" vs "طه مبروك — استشاري").
+        if any(candidate in k or k in candidate for k in known):
+            continue
+        invented.append(match.group(1).strip())
+
+    return invented
+
+
+_INVENTED_DOCTORS_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "THOSE DOCTORS DID NOT COME FROM A TOOL - DO NOT LIST THEM\n"
+    "============================================================\n"
+    "Your previous draft presented a list of doctors that no tool "
+    "result in this conversation returned. Some or all of those names "
+    "were written from memory.\n\n"
+    "A doctor roster is never something to recall or reconstruct. The "
+    "patient picks a name from it, and the schedule, the slots and the "
+    "booking are all built on that person - so an invented name sends "
+    "them to someone who may not work here, or may not be available at "
+    "all.\n\n"
+    "Call `find_available_doctors` (or `match_entity_for_booking` in "
+    "list mode) NOW and show ONLY the names it returns, in its exact "
+    "order. If it returns nobody, say that plainly instead of listing "
+    "anyone.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: a three-name specialty roster "
+    "went out with no tool call in that turn at all - the names were "
+    "carried over from earlier in the conversation and presented as a "
+    "current, specialty-filtered list.\n\n"
+)
+
+
 def _find_invented_branches(reply_text: str, state: AgentState) -> list:
     """Branch names the reply mentions that this conversation was never
     actually given. Empty list means nothing to flag."""
@@ -4161,6 +4266,11 @@ _REPLY_VERIFIERS = (
         "reply confirmed a doctor then offered the doctor roster again in the same message",
     ),
     (
+        lambda reply, state, agent_name: bool(_find_invented_doctors(reply, state)),
+        lambda reply, state: _INVENTED_DOCTORS_CORRECTION_DIRECTIVE,
+        "reply listed doctor(s) that appear in no tool result in this conversation",
+    ),
+    (
         lambda reply, state, agent_name: bool(_find_invented_branches(reply, state)),
         lambda reply, state: _BRANCH_CORRECTION_DIRECTIVE.format(
             names=", ".join(_find_invented_branches(reply, state))
@@ -4607,6 +4717,86 @@ _SERVICE_WORDED_REQUEST_RE = re.compile(
     r"جلسات|خدم[هة]|الخدم[هة]|"
     r"session|consultation|checkup|check-up|screening|programme|program|service"
 )
+
+
+_BARE_NEGATION_RE = re.compile(
+    r"^\s*(?:لا|لأ|لاء|ﻻ|مش|مو|ما|لا\s*شكرا|لا\s*مش|مش\s*عاوز[هة]?|مش\s*عايز[هة]?|"
+    r"ما\s*ابي|ما\s*ابغى|ما\s*اريد|مو\s*مناسب|مش\s*مناسب|غير\s*مناسب|"
+    r"no|nope|nah|not\s*this|doesn'?t\s*work)"
+    r"\s*[.!؟?،,]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _build_negation_directive(messages: list) -> str:
+    """Fires when the patient's whole message is a refusal ("لا", "مش
+    مناسب", "no").
+
+    A bare "no" is an answer, and it is answering whatever was just
+    offered. The reply must move AWAY from that thing - it must never
+    carry on as though the answer had been yes.
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient replied "لا", and the
+    next message was "أقرب موعد متاح عند رانيا عبد الرحمن في Al Nozha:
+    الثلاثاء 01/09/2026 ... هل يناسبك هذا اليوم؟" - the refusal was
+    swallowed and the same doctor was pushed forward regardless."""
+
+    if not messages:
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage, AIMessage as _AIMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+
+    if not _BARE_NEGATION_RE.match(_norm_ar(text)):
+        return ""
+
+    previous_ai = None
+    for msg in reversed(messages[:-1]):
+        if isinstance(msg, _AIMessage):
+            previous_content = getattr(msg, "content", "")
+            previous_text = (
+                previous_content if isinstance(previous_content, str) else str(previous_content)
+            )
+            if previous_text.strip():
+                previous_ai = previous_text.strip()
+                break
+
+    if not previous_ai:
+        return ""
+
+    return (
+        "============================================================\n"
+        "THEY SAID NO - DO NOT CARRY ON AS IF THEY SAID YES\n"
+        "============================================================\n"
+        "The patient's entire message is a refusal. It answers the "
+        "question you just asked, which was:\n"
+        f"    \"{previous_ai[:300]}\"\n\n"
+        "Whatever that question offered - this doctor, this day, this "
+        "time, this branch - they have declined it. Your reply must "
+        "move AWAY from it:\n"
+        "  - Offered a DAY or a TIME and they said no -> show the OTHER "
+        "days/times that are actually available (call the tool again "
+        "with the next offset), never the same one reworded.\n"
+        "  - Offered a DOCTOR and they said no -> offer the other "
+        "available doctors, not that doctor's schedule.\n"
+        "  - Offered a BRANCH and they said no -> the other branches.\n"
+        "  - Asked whether to continue at all and they said no -> stop "
+        "warmly and ask if there's anything else, without pushing.\n\n"
+        "Do NOT re-present the same thing with different wording, and "
+        "do NOT advance to the next step of the flow for the thing they "
+        "just refused. If nothing else is available, say that plainly "
+        "instead of quietly re-offering what they turned down.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: the patient replied \"لا\" "
+        "and the very next message was \"أقرب موعد متاح عند رانيا عبد "
+        "الرحمن ... هل يناسبك هذا اليوم؟\" - the refusal was ignored "
+        "and the same doctor pushed forward anyway.\n\n"
+    )
 
 
 def _build_service_named_directive(messages: list, session_id: str) -> str:
@@ -6208,6 +6398,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     service_named_directive = _build_service_named_directive(
         state["messages"], state.get("session_id"),
     )
+    negation_directive = _build_negation_directive(state["messages"])
     doctors_scope_directive = _build_doctors_scope_directive(
         state["messages"], state.get("session_id"),
     )
@@ -6312,6 +6503,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
         + empty_branch_directive + branch_pick_directive
+        + negation_directive
         + service_chosen_directive + service_named_directive
         + doctors_scope_directive
         + branch_services_yes_directive
