@@ -6537,6 +6537,79 @@ def _selected_slot_correction_directive(reply_text: str, state: AgentState) -> s
     )
 
 
+def _drop_orphaned_tool_calls(messages: list) -> list:
+    """Remove AI messages whose tool_calls never received a matching
+    ToolMessage, plus any ToolMessage with no matching call.
+
+    WHY: OpenAI rejects a conversation where an assistant message with
+    `tool_calls` is not followed by a response for every tool_call_id -
+    with a 400, not a soft failure. And a turn can end mid-pair for
+    reasons that have nothing to do with the model: the graph hitting
+    its step ceiling, a crash between the agent and the tools node, a
+    process restart. The half-pair is then PERSISTED by the
+    checkpointer, so every later turn on that thread replays it and
+    gets the same 400 forever.
+
+    CONFIRMED REAL PRODUCTION FAILURE: after a turn ended without
+    completing its tool calls, the next message returned
+    "openai.BadRequestError ... tool_call_ids did not have response
+    messages: call_N1c0Tp9HPZv9NF09d6zNrnV2" as an HTTP 500. The
+    session was permanently unusable - every subsequent message failed
+    the same way, because the bad pair never went away on its own.
+
+    Dropping the orphan loses one incomplete step; keeping it loses the
+    entire conversation."""
+
+    messages = list(messages or [])
+
+    responded_ids = {
+        getattr(m, "tool_call_id", None)
+        for m in messages
+        if getattr(m, "type", None) == "tool"
+    }
+    responded_ids.discard(None)
+
+    called_ids = set()
+    for m in messages:
+        for call in (getattr(m, "tool_calls", None) or []):
+            call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+            if call_id:
+                called_ids.add(call_id)
+
+    cleaned = []
+    dropped = 0
+
+    for m in messages:
+        calls = getattr(m, "tool_calls", None) or []
+        if calls:
+            ids = [
+                (c.get("id") if isinstance(c, dict) else getattr(c, "id", None))
+                for c in calls
+            ]
+            if any(cid and cid not in responded_ids for cid in ids):
+                dropped += 1
+                continue
+
+        if getattr(m, "type", None) == "tool":
+            tool_call_id = getattr(m, "tool_call_id", None)
+            if tool_call_id and tool_call_id not in called_ids:
+                dropped += 1
+                continue
+
+        cleaned.append(m)
+
+    if dropped:
+        logger.warning(
+            "_drop_orphaned_tool_calls: removed %d message(s) with unmatched tool calls - "
+            "a previous turn ended mid-pair (step ceiling, crash or restart). Without this "
+            "the provider rejects the whole conversation with a 400 and the session is "
+            "permanently stuck.",
+            dropped,
+        )
+
+    return cleaned
+
+
 def _run_agent(state: AgentState, agent_name: str) -> dict:
     """The body every specialist runs. Calls the LLM with that
     specialist's SCOPED system prompt + the full chat history, and
@@ -6769,8 +6842,13 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     # ToolMessage pair and leave a dangling, invalid tool call behind.
     # The checkpointer still keeps the untrimmed full history for the
     # thread - this only shrinks what's sent on THIS call.
+    # Strip any half-finished tool-call pair BEFORE trimming, so a turn
+    # that ended mid-pair can't poison every later turn on this thread
+    # with a provider 400 - see _drop_orphaned_tool_calls.
+    safe_messages = _drop_orphaned_tool_calls(state["messages"])
+
     trimmed_history = trim_messages(
-        state["messages"],
+        safe_messages,
         strategy="last",
         token_counter=len,  # count messages, not real tokens - simple cap
         max_tokens=config.MAX_HISTORY_MESSAGES,
@@ -6783,7 +6861,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     # return an empty list rather than violate the start_on="human"
     # constraint. Sending the LLM an empty turn would be worse than
     # sending it the untrimmed history, so fall back rather than trim.
-    history = trimmed_history if trimmed_history else state["messages"]
+    history = trimmed_history if trimmed_history else safe_messages
     response = _llm_for(agent_name).invoke([system_message] + history)
 
     updates: dict = {}
