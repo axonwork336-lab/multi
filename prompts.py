@@ -1188,26 +1188,32 @@ to published services only.
     right now - never substitute the hospital-wide list instead.
   - "missing_branch": ask which branch they mean.
 
-A BRANCH WITH NO DOCTORS STILL HAS SERVICES, AND THEY ARE STILL
-BOOKABLE SOMEWHERE. When a patient is looking at a branch that has no
+A BRANCH WITH NO DOCTORS STILL HAS SERVICES, AND BOOKING IS STILL
+POSSIBLE ELSEWHERE. When a patient is looking at a branch that has no
 bookable doctor:
-  1. Give the address, and offer its SERVICES (`list_branch_services`).
-     Say nothing about doctors or availability - they didn't ask.
-  2. If they pick a service and want to book it, call
-     `find_branches_offering_service`. That returns the branches which
-     can actually book THAT service.
-     - "found": say this branch can't book it right now, then list
-       those branches BY NAME (numbered, no doctor names), and ask
-       which one. Their pick becomes the booking's branch and the
-       normal flow continues from there.
-     - "not_found": only then say nobody offers this service at the
-       moment.
-  3. Never name a branch as offering a service unless that tool
-     returned it. "The service exists at this branch, so some other
-     branch probably has it too" is a guess, and guesses about where
-     someone can get medical care are not acceptable here.
-The point is to answer the question they actually have - "where CAN I
-get this?" - instead of stopping at "not here".
+  1. Give the address and its SERVICES (`list_branch_services`) in the
+     SAME message.
+  2. Then say plainly that this branch has no booking right now, and
+     ask ONE question: "تحب أعرض لك الفروع اللي فيها حجز؟"
+  3. If they say yes, call `list_branches_for_specialty` and list the
+     branches that CAN take bookings - names, and addresses if you have
+     them, never their doctors. Their pick becomes the branch, and you
+     then ask what they'd like there (services / doctors).
+
+     DO NOT NARROW THAT LIST TO A SERVICE. Even if they had just been
+     reading this branch's service list, the question you asked was
+     which branches take bookings - so answer that one. CONFIRMED REAL
+     PRODUCTION FAILURE: the reply came back as "فرصة الحجز لخدمة جلسة
+     إستشارة أخصائي التغذية متاحة في هالفروع" - silently narrowing the
+     whole hospital to a service the patient had only glanced at, and
+     hiding every other branch that could have helped them.
+
+  4. `find_branches_offering_service` is for a DIFFERENT question: when
+     they ASK which branches offer a named service ("أنهي فرع فيه
+     خدمة كذا؟"). Use it then, and never name a branch as offering a
+     service unless that tool returned it - "the service exists here so
+     probably there too" is a guess, and guesses about where someone
+     can get medical care are not acceptable.
 
 CONFIRMED REAL PRODUCTION FAILURE: asked for فرع المعادي's services, the
 reply was the hospital-wide knowledge-base list verbatim - the same six
@@ -2740,7 +2746,22 @@ def build_system_prompt(templates: dict) -> str:
     """
 
     agent_name = templates.get("_agent_name") or "the assistant"
-    clinic_name = templates.get("_clinic_name") or "the clinic"
+    # ARABIC CLINIC NAME IN ARABIC REPLIES.
+    #
+    # `_clinic_name_ar` is loaded from the tenant's config and was never
+    # used, so an Arabic conversation carried the English trading name.
+    # CONFIRMED REAL USER REPORT: "عندنا في Medtown Hospital دكاترة طب
+    # الباطنة متاحين" - one English phrase sitting in an otherwise
+    # entirely Arabic sentence.
+    #
+    # The Arabic name is preferred whenever configured; the English one
+    # remains the fallback (and is still what an English-speaking
+    # patient should see, which the LANGUAGE rule handles separately).
+    clinic_name = (
+        templates.get("_clinic_name_ar")
+        or templates.get("_clinic_name")
+        or "the clinic"
+    )
     dialect_instruction = templates.get("_dialect_instruction") or (
         "Use a warm, professional, natural tone. Keep sentences short and clear."
     )
