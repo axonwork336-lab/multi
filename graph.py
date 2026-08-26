@@ -2885,6 +2885,104 @@ _MEDICAL_OFFER_PATTERN_RE = re.compile(
 )
 
 
+_ORGAN_SPECIALTY_EXPECTATIONS = (
+    # (symptom words in the PATIENT's own message,
+    #  specialty words that would genuinely treat it)
+    #
+    # Deliberately small and only for body parts where the mapping is
+    # not a judgement call. This is a floor, not a diagnosis engine: it
+    # exists to stop a clearly-wrong referral, not to choose the right
+    # one.
+    (("عين", "عيون", "عيني", "نظر", "الرؤيه", "eye", "vision"),
+     ("عيون", "عين", "رمد", "بصريات", "شبكيه", "الجسم الزجاجي", "ophthal", "eye", "retina")),
+    (("سن", "سنه", "ضرس", "اسنان", "لثه", "tooth", "teeth", "dental"),
+     ("اسنان", "فم", "لثه", "dental", "dent")),
+    (("جلد", "بشره", "طفح", "حكه", "skin", "rash"),
+     ("جلدي", "جلديه", "بشره", "derma", "skin")),
+    (("اذن", "ودن", "سمع", "ear", "hearing"),
+     ("انف", "اذن", "حنجره", "سمع", "ent", "otolar", "ear")),
+    (("عظم", "عظام", "كسر", "مفصل", "ركبه", "bone", "fracture", "joint"),
+     ("عظام", "عظم", "مفاصل", "ortho", "bone", "roomat", "روماتيزم")),
+)
+
+
+def _medical_reply_offers_unrelated_specialty(reply_text: str, state: AgentState) -> bool:
+    """True when the patient named a clearly organ-specific symptom and
+    the reply offers a specialty that plainly does not treat it.
+
+    Judging clinical relevance in general is not something code can do,
+    and this does not try to. It covers only a handful of body parts
+    where the mapping is not a matter of opinion - an eye complaint
+    needs eyes, a tooth needs dentistry - and fires only when the
+    offered specialty matches NONE of the plausible ones.
+
+    CONFIRMED REAL PRODUCTION FAILURES, the same root cause twice: the
+    clinic has no ophthalmology registered, and "عيني وجعاني وبتدمع"
+    was answered first with an offer of طب الأطفال, then - after the
+    contradiction guard forced internal consistency - with طب الباطنة
+    in both lines. Consistent, and still an eye complaint routed to
+    internal medicine. The correct answer in both cases was that this
+    clinic has no eye doctor right now.
+
+    The right response to this firing is NOT to find a different
+    specialty - it is to say plainly that the clinic doesn't have one."""
+
+    if not reply_text:
+        return False
+
+    folded = _norm_ar(reply_text)
+
+    if not _SPECIALTY_OFFER_RE.search(folded):
+        return False
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    patient_text = " ".join(
+        _norm_ar(str(getattr(m, "content", "")))
+        for m in (state.get("messages") or [])
+        if isinstance(m, _HumanMessage)
+    )
+
+    if not patient_text:
+        return False
+
+    for symptom_words, ok_specialty_words in _ORGAN_SPECIALTY_EXPECTATIONS:
+        if not any(w in patient_text for w in symptom_words):
+            continue
+        # The symptom is in play. If the reply names ANY specialty that
+        # could treat it, that's fine.
+        if any(w in folded for w in ok_specialty_words):
+            return False
+        return True
+
+    return False
+
+
+_UNRELATED_SPECIALTY_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "THAT SPECIALTY DOES NOT TREAT WHAT THEY DESCRIBED\n"
+    "============================================================\n"
+    "The patient named a symptom in a specific part of the body, and "
+    "your previous draft offers them a doctor in a specialty that does "
+    "not treat it. Booking that appointment would cost them a trip and "
+    "leave them still needing the right doctor.\n\n"
+    "DO NOT SWAP IN ANOTHER SPECIALTY FROM THE LIST. If the fitting "
+    "specialty is not registered at this clinic, that is the honest "
+    "answer and you should give it:\n"
+    "  1. Keep the warm line, the comfort measures, and the red flags.\n"
+    "  2. Say plainly that this clinic doesn't currently have a doctor "
+    "for this - e.g. \"للأسف ما عندنا دكتور عيون حاليًا في المستشفى\".\n"
+    "  3. Offer to connect them with a staff member, or to help with "
+    "something else.\n"
+    "Do not offer any doctor here for this complaint.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: \"عيني وجعاني وبتدمع\" (eye pain "
+    "with watering) was answered with an offer of طب الأطفال, and then "
+    "on a retry with طب الباطنة - because this clinic has no "
+    "ophthalmology and the reply would not say so. An honest \"not "
+    "here\" is worth more than a confident wrong referral.\n\n"
+)
+
+
 def _medical_reply_names_two_specialties(reply_text: str, state: AgentState) -> bool:
     """True when a medical-guidance reply tells the patient to see one
     specialty and then offers an appointment in a DIFFERENT one.
@@ -3912,6 +4010,15 @@ _REPLY_VERIFIERS = (
     (
         lambda reply, state, agent_name: (
             (agent_name == "medical" or _in_medical_guidance_handoff(state))
+            and _medical_reply_offers_unrelated_specialty(reply, state)
+        ),
+        lambda reply, state: _UNRELATED_SPECIALTY_CORRECTION_DIRECTIVE,
+        "medical-guidance reply offered a specialty that does not treat the "
+        "body part the patient named",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            (agent_name == "medical" or _in_medical_guidance_handoff(state))
             and _medical_reply_names_two_specialties(reply, state)
         ),
         lambda reply, state: _TWO_SPECIALTIES_CORRECTION_DIRECTIVE,
@@ -4776,9 +4883,14 @@ def _build_empty_branch_booking_intent_directive(messages: list, session_id: str
         "nothing at all about the place they asked about.\n"
         "  3. Then, plainly, that this branch has no booking right now, "
         "and ONE question: تحب أعرض لك الفروع اللي فيها حجز؟\n"
-        "  4. Only if they say yes, call `find_branches_offering_service` "
-        "(when a service is in play) or `list_branches_for_specialty` and "
-        "list those branches - names, and addresses if you have them - but no doctor names.\n\n"
+        "  4. Only if they say yes, call `list_branches_for_specialty` "
+        "and list the branches that CAN take bookings - names, and "
+        "addresses if you have them, but no doctor names. Do NOT narrow "
+        "that list to whatever service they were last looking at: the "
+        "question you asked was which branches take bookings, so answer "
+        "that. They pick a branch first; what they want there comes "
+        "after. `find_branches_offering_service` is only for when they "
+        "ASK directly which branches offer a named service.\n\n"
         "Do not collapse steps 1-2. CONFIRMED REAL REGRESSION: this turn "
         "previously replied with the address, the branch's one service, "
         "and then the honest question - and a later change reduced it to "
