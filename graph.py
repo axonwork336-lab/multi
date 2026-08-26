@@ -2893,16 +2893,21 @@ _ORGAN_SPECIALTY_EXPECTATIONS = (
     # not a judgement call. This is a floor, not a diagnosis engine: it
     # exists to stop a clearly-wrong referral, not to choose the right
     # one.
+    # NOTE the specialty side deliberately does NOT contain the bare
+    # organ word ("عين"). CONFIRMED REAL PRODUCTION FAILURE: it did, and
+    # the advice line "وما تفرك عينك" satisfied the check - so an eye
+    # complaint offered طب الباطنة and this guard stayed silent. The
+    # specialty side must only ever hold words that name a SPECIALTY.
     (("عين", "عيون", "عيني", "نظر", "الرؤيه", "eye", "vision"),
-     ("عيون", "عين", "رمد", "بصريات", "شبكيه", "الجسم الزجاجي", "ophthal", "eye", "retina")),
-    (("سن", "سنه", "ضرس", "اسنان", "لثه", "tooth", "teeth", "dental"),
-     ("اسنان", "فم", "لثه", "dental", "dent")),
+     ("عيون", "رمد", "بصريات", "شبكيه", "الجسم الزجاجي", "ophthal", "retina")),
+    (("ضرس", "اسنان", "سناني", "لثه", "tooth", "teeth", "dental"),
+     ("اسنان", "فم وفكين", "dental", "dent")),
     (("جلد", "بشره", "طفح", "حكه", "skin", "rash"),
-     ("جلدي", "جلديه", "بشره", "derma", "skin")),
-    (("اذن", "ودن", "سمع", "ear", "hearing"),
-     ("انف", "اذن", "حنجره", "سمع", "ent", "otolar", "ear")),
+     ("جلدي", "جلديه", "derma")),
+    (("ودن", "سمعي", "طنين", "hearing"),
+     ("انف واذن", "حنجره", "otolar")),
     (("عظم", "عظام", "كسر", "مفصل", "ركبه", "bone", "fracture", "joint"),
-     ("عظام", "عظم", "مفاصل", "ortho", "bone", "roomat", "روماتيزم")),
+     ("عظام", "مفاصل", "ortho", "روماتيزم")),
 )
 
 
@@ -3285,6 +3290,21 @@ def _reply_offers_booking_at_empty_branch(reply_text: str, state: AgentState) ->
     session = tools._BOOKING_SESSIONS.get(session_id) or {}
     empty_branch = session.get("info_branch_no_doctors")
     if not empty_branch:
+        return False
+
+    # THE REPLY MUST ACTUALLY BE ABOUT THAT BRANCH.
+    #
+    # The note survives on the session after the patient moves on, so
+    # without this the guard fires on any later reply that happens to
+    # offer a booking - including ones with no branch in play at all.
+    #
+    # CONFIRMED REAL FALSE POSITIVE: the patient browsed فرع الطوارئ
+    # (empty), said "لا مش عاوزه", then described eye pain. The medical
+    # reply offered an appointment - nothing to do with any branch - and
+    # this guard blocked it twice because the stale note was still
+    # there, burning two LLM calls on a reply that was never wrong.
+    branch_mentioned = _norm_ar(empty_branch) in _norm_ar(reply_text)
+    if not branch_mentioned:
         return False
 
     # Only while that empty branch is still the one in play - once a
@@ -4555,6 +4575,84 @@ def _build_doctors_scope_directive(messages: list, session_id: str) -> str:
         "pick someone unreachable at the branch they had chosen.\n\n"
         "(Only when NO branch has been chosen at all does an unscoped, "
         "hospital-wide roster answer this question.)\n\n"
+    )
+
+
+_SERVICE_WORDED_REQUEST_RE = re.compile(
+    # "خدمة" itself counts: patients often name the service by saying
+    # the word - "خدمه اخصائي تغذيه" - and leaving it out meant a
+    # repeat of the request went unrecognised a second time.
+    r"جلس[هة]|استشار[هة]|إستشار[هة]|كشف|فحص|برنامج|تحليل|اشع[هة]|أشع[هة]|"
+    r"جلسات|خدم[هة]|الخدم[هة]|"
+    r"session|consultation|checkup|check-up|screening|programme|program|service"
+)
+
+
+def _build_service_named_directive(messages: list, session_id: str) -> str:
+    """Fires when the patient's booking request names a SERVICE rather
+    than a specialty or a doctor ("عاوزة احجز جلسة أخصائي تغذية").
+
+    A service is a complete answer to "what do you want booked" - more
+    specific than a specialty, in fact - so the specialty-vs-doctor
+    question does not apply. Treating it as a nameless booking request
+    throws the information away and asks them to start again in terms
+    they did not choose.
+
+    CONFIRMED REAL PRODUCTION FAILURE: "عاوزه احجز جلسه اخصائي تغذيه"
+    was answered with "نكمل الحجز على نفس رقم الواتساب ده؟", then "تحب
+    تبدأ بالتخصص ولا بالدكتور؟", and when the patient repeated "خدمه
+    اخصائي تغذيه" it still came back with "وش التخصص اللي حابة تحجزين
+    فيه؟" - three turns, the service named twice, never once acted on.
+    """
+
+    if not messages or not session_id:
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    if session.get("doctor_id") or session.get("service_id"):
+        return ""
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last = messages[-1]
+    if not isinstance(last, _HumanMessage):
+        return ""
+
+    content = getattr(last, "content", "")
+    text = content if isinstance(content, str) else str(content)
+    folded = _norm_ar(text)
+
+    if not _SERVICE_WORDED_REQUEST_RE.search(folded):
+        return ""
+
+    return (
+        "============================================================\n"
+        "THEY NAMED A SERVICE - BOOK THAT, DON'T ASK FOR A SPECIALTY\n"
+        "============================================================\n"
+        "The patient's message names a SERVICE (a جلسة / استشارة / فحص / "
+        "كشف / برنامج), not a specialty and not a doctor. That is "
+        "already a complete answer to what they want booked - more "
+        "specific than a specialty, not less.\n\n"
+        "So do NOT ask \"تحب تبدأ بالتخصص ولا بالدكتور؟\", and do NOT "
+        "ask \"وش التخصص اللي تحب تحجز فيه؟\". They told you. Asking "
+        "again makes them restate it in words they did not choose.\n\n"
+        "Call `find_available_doctors` with `service_name` set to what "
+        "they said (leave `specialty_ids` out entirely - a service does "
+        "not need one) and show the doctors who provide it, numbered, "
+        "then ask ONE question: which doctor.\n"
+        "  - If a branch is already settled, pass `branch_name` too.\n"
+        "  - \"not_found\"/\"not_found_in_branch\": nobody provides it at "
+        "that branch - use `find_branches_offering_service` to say where "
+        "it IS available.\n"
+        "  - \"service_not_matched\": you could not resolve what they "
+        "named. Only then ask them to clarify - and do it by showing "
+        "real services to pick from, never by falling back to the "
+        "specialty question.\n\n"
+        "CONFIRMED REAL PRODUCTION FAILURE: \"عاوزه احجز جلسه اخصائي "
+        "تغذيه\" got \"نكمل الحجز على نفس رقم الواتساب ده؟\" -> \"تحب "
+        "تبدأ بالتخصص ولا بالدكتور؟\" -> and after the patient repeated "
+        "\"خدمه اخصائي تغذيه\", still \"وش التخصص اللي حابة تحجزين "
+        "فيه؟\". The service was named twice and acted on zero times.\n\n"
     )
 
 
@@ -6086,6 +6184,9 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     service_chosen_directive = _build_service_chosen_directive(
         state["messages"], state.get("session_id"),
     )
+    service_named_directive = _build_service_named_directive(
+        state["messages"], state.get("session_id"),
+    )
     doctors_scope_directive = _build_doctors_scope_directive(
         state["messages"], state.get("session_id"),
     )
@@ -6190,7 +6291,8 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + doctor_branches_directive + branch_question_directive
         + review_phone_directive + selected_slot_directive + scope_directive
         + empty_branch_directive + branch_pick_directive
-        + service_chosen_directive + doctors_scope_directive
+        + service_chosen_directive + service_named_directive
+        + doctors_scope_directive
         + branch_services_yes_directive
         + empty_branch_booking_directive
         + branches_only_directive + empty_day_directive
@@ -6497,6 +6599,26 @@ def route_to_specialist(state: AgentState) -> str:
     concierge, which has the full prompt and every tool."""
 
     chosen = state.get("active_agent")
+
+    # LEAVING FOR MEDICAL GUIDANCE CLEARS THE BRANCH CONTEXT.
+    #
+    # `info_branch_*` describes a branch the patient was browsing. Once
+    # they start describing a symptom instead, that branch is no longer
+    # what the conversation is about, and leaving the note behind makes
+    # later guards reason about a branch nobody mentioned.
+    #
+    # CONFIRMED REAL FALSE POSITIVE: after browsing an empty فرع
+    # الطوارئ, "عيني وجعاني وبتدمع" produced a perfectly good medical
+    # reply that was rejected twice as "offering a booking at a branch
+    # with no doctors" - the branch was simply stale session state.
+    if chosen == "medical":
+        session_id = state.get("session_id")
+        if session_id:
+            session = tools._BOOKING_SESSIONS.get(session_id)
+            if session:
+                for key in ("info_branch_no_doctors", "info_branch_id", "info_branch_name"):
+                    session.pop(key, None)
+
     if chosen not in agents.AGENT_NAMES:
         return _node_name(agents.CONCIERGE)
     return _node_name(chosen)
