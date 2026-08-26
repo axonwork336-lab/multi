@@ -2837,6 +2837,148 @@ _MEDICATION_CORRECTION_DIRECTIVE = (
 )
 
 
+_NUMBERED_LIST_ITEM_RE = re.compile(r"[1-9]\uFE0F?\u20E3|^\s*[1-9][\.\)]\s", re.MULTILINE)
+
+
+_BOOKING_OFFER_RE = re.compile(
+    r"تحب\s*(?:ت)?حجز|ترغب\s*(?:في\s*)?(?:ت)?حجز|تبي\s*(?:ت)?حجز|"
+    r"احجز\s*لك|اساعدك\s*ب?حجز|نكمل\s*(?:ال)?حجز|"
+    r"اكتب\s*اسم\s*(?:ال)?دكتور|"
+    r"(?:would you like|want)\s*to\s*book|shall\s*i\s*book"
+)
+
+
+def _reply_offers_booking_at_empty_branch(reply_text: str, state: AgentState) -> bool:
+    """True when a reply offers to book at the branch the tools have
+    already established has no bookable doctor.
+
+    Prompt rules for this have been written three times and have leaked
+    each time, and the cost falls entirely on the patient: they say yes
+    to an appointment that cannot exist and only discover it several
+    turns later.
+
+    CONFIRMED REAL PRODUCTION FAILURE: at فرع الطوارئ (zero doctors) the
+    sequence ran address -> "تحب تعرف عن الخدمات؟" -> services -> "هل
+    ترغب تحجز موعد في هذا الفرع؟" -> "نكمل الحجز على نفس رقم الواتساب
+    ده؟" -> "من فضلك اكتب اسم الدكتور اللي حابب تحجز معاه في فرع
+    الطوارئ؟" - four turns walking someone into a booking at a branch
+    with nobody in it."""
+
+    if not reply_text:
+        return False
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return False
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    empty_branch = session.get("info_branch_no_doctors")
+    if not empty_branch:
+        return False
+
+    # Only while that empty branch is still the one in play - once a
+    # different branch is confirmed, offering a booking is correct.
+    current = session.get("branch_display_name") or session.get("info_branch_name")
+    if current and _norm_ar(current) != _norm_ar(empty_branch):
+        return False
+
+    return bool(_BOOKING_OFFER_RE.search(_norm_ar(reply_text)))
+
+
+_EMPTY_BRANCH_BOOKING_OFFER_CORRECTION = (
+    "============================================================\n"
+    "YOU OFFERED A BOOKING AT A BRANCH WITH NO DOCTORS - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft offered to book an appointment (or asked for a "
+    "doctor's name, or asked to continue a booking) at a branch the "
+    "tools have already established has NO bookable doctor. If they say "
+    "yes, there is nothing to give them - the offer cannot be kept.\n\n"
+    "Rewrite it. Keep the useful parts - the address, the services - "
+    "and replace the booking offer with an honest, useful question "
+    "instead:\n"
+    "    الفرع ده مفيهوش حجز حاليًا، تحب أعرض لك الفروع اللي فيها حجز؟\n\n"
+    "Phrase it in this clinic's own dialect. If they then say yes, call "
+    "`find_branches_offering_service` (when a service is in play) or "
+    "`list_branches_for_specialty`, and list those branches by name.\n\n"
+    "Do not ask for a doctor's name, do not ask to confirm a phone "
+    "number for the booking, and do not start the booking flow for this "
+    "branch in any other form.\n\n"
+)
+
+
+def _reply_dumps_specialty_catalogue(reply_text: str, state: AgentState) -> bool:
+    """True when a MEDICAL-GUIDANCE reply prints the specialty catalogue
+    as a numbered list for the patient to pick from.
+
+    `list_specialties` is a catalogue for the ASSISTANT to match
+    against, not an answer for the patient. Someone who has just
+    described a symptom cannot be asked to work out which specialty it
+    belongs to - that needs the medical knowledge they came here
+    without, and it is the one thing they asked for help with.
+
+    CONFIRMED REAL PRODUCTION FAILURE: "بطني وجعاني وعندي ترجيع" was
+    answered with the right specialty named in prose AND then all seven
+    registered specialties printed underneath ("1️⃣ طب الأطفال 2️⃣
+    جراحة العظام 3️⃣ أمراض القلب..."), including several with no
+    possible bearing on stomach pain. The prompt rule against this
+    already existed and did not hold, so it is enforced here too.
+
+    Deliberately scoped to replies that BOTH print three or more
+    numbered items AND name specialties the tools returned - a doctor
+    list or a branch list is numbered too, and those are legitimate."""
+
+    if not reply_text:
+        return False
+
+    if len(_NUMBERED_LIST_ITEM_RE.findall(reply_text)) < 3:
+        return False
+
+    specialty_names = set()
+    for msg in state.get("messages", []) or []:
+        if getattr(msg, "name", None) != "list_specialties":
+            continue
+        try:
+            data = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for item in data.get("specialties") or data.get("items") or []:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("altName")
+                if name:
+                    specialty_names.add(_norm_ar(str(name)))
+
+    if not specialty_names:
+        return False
+
+    folded = _norm_ar(reply_text)
+    matched = sum(1 for name in specialty_names if name and name in folded)
+
+    return matched >= 3
+
+
+_SPECIALTY_CATALOGUE_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU PRINTED THE SPECIALTY CATALOGUE - REMOVE IT\n"
+    "============================================================\n"
+    "Your previous draft listed the clinic's specialties for the patient "
+    "to choose from. That list is for YOU to match against, not for "
+    "them. They described a symptom - working out which specialty it "
+    "belongs to is exactly the help they came for, and several entries "
+    "in that list have no bearing on what they told you.\n\n"
+    "Rewrite it WITHOUT the list. Name only the ONE fitting specialty in "
+    "ordinary prose, say plainly that this clinic has doctors in it, and "
+    "ask ONE question - whether they'd like an appointment. Keep the "
+    "warmth, the comfort advice, and the 'this isn't a diagnosis' note "
+    "exactly as they were.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: \"بطني وجعاني وعندي ترجيع\" was "
+    "answered with the correct specialty in prose and then all seven "
+    "registered specialties printed underneath, asking the patient to "
+    "pick - including طب الأطفال and جراحة العظام.\n\n"
+)
+
+
 def _reply_recommends_medication(reply_text: str, state: AgentState) -> bool:
     """True when a reply names or suggests a medicine.
 
@@ -3455,6 +3597,18 @@ _REPLY_VERIFIERS = (
         "the patient agreed to proceed on the channel number the service already has",
     ),
     (
+        lambda reply, state, agent_name: _reply_offers_booking_at_empty_branch(reply, state),
+        lambda reply, state: _EMPTY_BRANCH_BOOKING_OFFER_CORRECTION,
+        "reply offered a booking at a branch the tools reported has no doctors",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            agent_name == "medical" and _reply_dumps_specialty_catalogue(reply, state)
+        ),
+        lambda reply, state: _SPECIALTY_CATALOGUE_CORRECTION_DIRECTIVE,
+        "medical-guidance reply printed the specialty catalogue for the patient to pick from",
+    ),
+    (
         lambda reply, state, agent_name: _reply_recommends_medication(reply, state),
         lambda reply, state: _MEDICATION_CORRECTION_DIRECTIVE,
         "reply named or suggested a medication",
@@ -4066,30 +4220,44 @@ def _build_branch_pick_directive(messages: list, session_id: str) -> str:
             f"Their reply is a pick from the branch list you just showed: "
             f"option {position} is {name}"
             f"{(', address: ' + address) if address else ''}.\n\n"
-            "This branch has NO doctor available for booking right now. "
-            "So this reply is exactly two things and nothing else:\n"
-            f"  1. Give the address of {name}.\n"
-            "  2. Ask ONE question: whether they'd like to know about "
-            "the SERVICES this branch provides.\n\n"
-            "If they say yes, call `list_branch_services` - the branch's "
-            "REAL service catalogue from the system. Do NOT answer that "
-            "with `list_hospital_services` or `answer_hospital_faq`: "
-            "those read the knowledge-base file, which describes the "
-            "hospital's service lines as a whole and has no per-branch "
-            "information, so they return the same generic list for every "
+            "DO THE WHOLE THING IN ONE MESSAGE. They picked a branch to "
+            "find out about it - so tell them about it now. Call "
+            "`list_branch_services` in THIS turn and reply with:\n"
+            f"  1. The address of {name}.\n"
+            "  2. Its services, numbered, straight from that tool.\n\n"
+            "Do NOT ask \"تحب تعرف عن الخدمات المتوفرة في هذا الفرع؟\" "
+            "and wait for a yes. That is a turn spent asking permission "
+            "to answer the question they already asked. CONFIRMED REAL "
+            "PRODUCTION FAILURE: picking a branch produced the address "
+            "plus that question, and the services only arrived a turn "
+            "later.\n\n"
+            "Use `list_branch_services` for this - NOT "
+            "`list_hospital_services` and NOT `answer_hospital_faq`. "
+            "Those read the knowledge-base file, which has no per-branch "
+            "information and returns the same generic list for every "
             "branch. CONFIRMED REAL PRODUCTION FAILURE: asked for فرع "
             "المعادي's services, the reply was the hospital-wide "
             "knowledge-base list verbatim.\n\n"
-            "Do NOT offer to book, do NOT ask if they want an "
-            "appointment there, and do NOT mention doctors or "
-            "availability at all. They asked about a branch, not about "
-            "booking - volunteering \"there are no doctors here\" answers "
-            "a question nobody asked and makes a real branch sound "
-            "broken.\n\n"
-            "CONFIRMED REAL PRODUCTION FAILURE: this exact turn replied "
-            "\"...تحب تعرف عن خدمات الفرع أو تحب أساعدك بحجز موعد فيه؟\" "
-            "- inviting a booking that cannot happen. Only if THEY ask "
-            "to book does the branch's emptiness get mentioned.\n\n"
+            "THIS BRANCH CANNOT BE BOOKED AT. Never offer an "
+            "appointment here - not \"هل ترغب تحجز موعد في هذا الفرع؟\", "
+            "not a doctor question, not anything that starts a booking "
+            "for it. There is no doctor to book, so every such offer is "
+            "a promise you cannot keep.\n\n"
+            "End the message with ONE question that is honest and "
+            "actually useful - the branch can't take bookings, so point "
+            "at the ones that can:\n"
+            f"    الفرع ده مفيهوش حجز حاليًا، تحب أعرض لك الفروع اللي "
+            "فيها حجز؟\n"
+            "If they say yes, call `find_branches_offering_service` (when "
+            "a service is in play) or `list_branches_for_specialty`, and "
+            "list those branches BY NAME.\n\n"
+            "CONFIRMED REAL PRODUCTION FAILURE, the exact sequence this "
+            "replaces: address + \"تحب تعرف عن الخدمات؟\" -> services + "
+            "\"هل ترغب تحجز موعد في هذا الفرع أو تحتاج تعرف عن فروع "
+            "ثانية؟\" -> \"نكمل الحجز على نفس رقم الواتساب ده؟\" -> "
+            "\"من فضلك اكتب اسم الدكتور اللي حابب تحجز معاه في فرع "
+            "الطوارئ؟\" - four turns walking a patient into a booking at "
+            "a branch that has no doctors at all.\n\n"
         )
 
     session.pop("info_branch_no_doctors", None)
@@ -4102,25 +4270,29 @@ def _build_branch_pick_directive(messages: list, session_id: str) -> str:
         f"Their reply is a pick from the branch list you just showed: "
         f"option {position} is {name}"
         f"{(', address: ' + address) if address else ''}.\n\n"
-        f"Give the address of {name}, then ask ONE question, in exactly "
-        "this shape:\n"
-        "    تحب تعرف عن الخدمات، ولا تحب تحجز موعد؟\n"
-        "Do NOT offer \"الدكاترة المتوفرين فيه\" as the alternative "
-        "here. CONFIRMED REAL PRODUCTION FAILURE: offering doctors at "
-        "this point made a bare \"اه\" ambiguous, and the reply jumped "
-        "straight to dumping a specialty list nobody had asked for. The "
-        "two real choices at this point are SERVICES or BOOKING.\n\n"
-        "  - They pick SERVICES -> call `list_branch_services` (the "
-        "branch's real catalogue). Never `list_hospital_services` or "
-        "`answer_hospital_faq` for a per-branch services question - "
-        "they have no per-branch data and return the same generic "
-        "hospital-wide list for every branch.\n"
-        f"  - They pick BOOKING -> the branch is {name}; now ask the "
-        "single specialty-vs-doctor question (\"تحب تبدأ بالتخصص ولا "
-        "بالدكتور؟\") and NOTHING else - do not call `list_specialties` "
-        "and do not print a specialty list in that same message. Many "
-        "patients already know their doctor's name; making them read a "
-        "specialty list first is a wasted turn.\n\n"
+        "DO THE WHOLE THING IN ONE MESSAGE. They picked this branch to "
+        "find out about it, so answer that now rather than asking "
+        "permission to. Call `list_branch_services` in THIS turn and "
+        "reply with:\n"
+        f"  1. The address of {name}.\n"
+        "  2. Its services, numbered, straight from that tool.\n"
+        "  3. ONE question: تحب تحجز موعد في الفرع ده؟\n\n"
+        "Do NOT ask \"تحب تعرف عن الخدمات؟\" and wait for a yes - that "
+        "spends a turn asking to answer a question they already asked. "
+        "And do NOT offer \"الدكاترة المتوفرين فيه\" as an option: it "
+        "makes a bare \"اه\" ambiguous, and that ambiguity is what "
+        "previously sent the reply into dumping a specialty list nobody "
+        "had asked for.\n\n"
+        "  - Use `list_branch_services` for the services. Never "
+        "`list_hospital_services` or `answer_hospital_faq` for a "
+        "per-branch services question - they have no per-branch data and "
+        "return the same generic hospital-wide list for every branch.\n"
+        f"  - They say YES to booking -> the branch is {name}; now ask "
+        "the single specialty-vs-doctor question (\"تحب تبدأ بالتخصص "
+        "ولا بالدكتور؟\") and NOTHING else - do not call "
+        "`list_specialties` and do not print a specialty list in that "
+        "same message. Many patients already know their doctor's name; "
+        "making them read a specialty list first is a wasted turn.\n\n"
         f"IF THEY ASK FOR DOCTORS AT ANY POINT, they mean the doctors at "
         f"{name} - the branch they are looking at - not every doctor in "
         "the hospital. Pass that branch through (`branch_name=\"" + name +
