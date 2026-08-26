@@ -1805,6 +1805,14 @@ def _build_empty_branch_directive(messages: list) -> str:
         "instead?) under a roster they never requested. The doctors come "
         "later, AFTER they pick a branch.\n"
         "  - Ask ONE question: which of those branches they'd like.\n\n"
+        "IF A SERVICE IS WHAT THEY'RE AFTER, ANSWER WITH WHERE IT'S "
+        "AVAILABLE. When the patient has picked one of this branch's "
+        "services and wants to book it, use "
+        "`find_branches_offering_service` instead - it returns the "
+        "branches that can actually book THAT service. Say this branch "
+        "can't book it right now, list those branches by name, and ask "
+        "which one. That answers the question they actually have "
+        "(\"where can I get this?\") rather than just closing the door.\n\n"
     )
 
 
@@ -2790,6 +2798,61 @@ _AVAILABILITY_LOOKUP_TOOLS = (
 )
 
 
+_MEDICATION_MENTION_RE = re.compile(
+    # Arabic transliterations of drug names vary a lot in practice, so
+    # these are deliberately loose. The confirmed production failure
+    # spelled it "البارستامول" (no ي) - a stricter pattern missed it
+    # entirely, which is exactly the failure mode to avoid here.
+    r"بنادول|باندول|بار[اي]?س?ي?تامول|باراس?ي?تامول|بروفين|بروفن|"
+    r"اي?بوبروفين|إيبوبروفين|اسبرين|أسبرين|فولتارين|كتافلام|"
+    r"اوجمنتين|أوجمنتين|زيرتك|كلاريتين|"
+    r"مضاد\s*حيوي|خافض[^\n]{0,10}حرار|ادوي[هة][^\n]{0,15}حرار|"
+    r"مسكن|حبوب[^\n]{0,10}مسكن|دوا\b|دواء|علاج\s*من\s*(?:ال)?صيدلي|"
+    r"paracetamol|acetaminophen|panadol|ibuprofen|advil|tylenol|aspirin|"
+    r"antibiotic|antihistamine|painkiller|analgesic|fever\s*reducer"
+)
+
+_MEDICATION_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOUR DRAFT NAMED A MEDICATION - REMOVE IT COMPLETELY\n"
+    "============================================================\n"
+    "Your previous draft named or suggested a medicine. You are a "
+    "booking assistant, not a clinician: you cannot examine anyone and "
+    "you do not know their history, allergies, weight, or what else "
+    "they take. Medication advice over chat can genuinely hurt "
+    "someone - especially a child.\n\n"
+    "Rewrite the message with the medication REMOVED. Do not swap it "
+    "for a different drug, a 'safe' dose, a drug class, or a vague "
+    "\"something from the pharmacy\" - remove the idea entirely.\n\n"
+    "What you may offer instead: ordinary non-medical comfort measures "
+    "(rest, fluids, a quiet dark room, monitoring, warmth), a warm "
+    "wish, and then the actual help you can give - the right specialty "
+    "and a real appointment. If they asked what to take, say kindly "
+    "that you can't advise on medication and the doctor will decide "
+    "that after seeing them.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: a parent described a two-day "
+    "fever in their child and the reply recommended fever-reducing "
+    "medication \"مثل البارستامول\" adjusted \"لعمره ووزنه\" - naming a "
+    "drug and giving dosing guidance for a child.\n\n"
+)
+
+
+def _reply_recommends_medication(reply_text: str, state: AgentState) -> bool:
+    """True when a reply names or suggests a medicine.
+
+    Prompt rules alone have not held here, and the downside is real
+    harm rather than an awkward turn, so this is enforced in code as
+    well. Deliberately matches the drug NAME or class wherever it
+    appears - there is no context in this product where a booking
+    assistant should be putting a medication name in front of a
+    patient."""
+
+    if not reply_text:
+        return False
+
+    return bool(_MEDICATION_MENTION_RE.search(_norm_ar(reply_text)))
+
+
 def _reply_denies_availability_without_lookup(reply_text: str, state: AgentState) -> bool:
     """True when the reply tells the patient a doctor has no available
     appointments, while NO availability tool has run in this
@@ -3392,6 +3455,11 @@ _REPLY_VERIFIERS = (
         "the patient agreed to proceed on the channel number the service already has",
     ),
     (
+        lambda reply, state, agent_name: _reply_recommends_medication(reply, state),
+        lambda reply, state: _MEDICATION_CORRECTION_DIRECTIVE,
+        "reply named or suggested a medication",
+    ),
+    (
         lambda reply, state, agent_name: _reply_denies_availability_without_lookup(reply, state),
         lambda reply, state: _AVAILABILITY_DENIAL_CORRECTION_DIRECTIVE,
         "reply said a doctor has no available appointments while no availability "
@@ -3754,6 +3822,19 @@ _SERVICE_CHOSEN_DIRECTIVE = (
     "\"تحب تبدأ بالتخصص ولا بالدكتور؟\", and do NOT show a specialty "
     "list. Both throw away a decision they have already made and "
     "restart the flow from zero.\n\n"
+    "IF THE BRANCH THEY ARE LOOKING AT HAS NO BOOKABLE DOCTOR, the "
+    "service is still bookable elsewhere - do not dead-end them. Call "
+    "`find_branches_offering_service` and answer with WHERE they can "
+    "get it:\n"
+    "  - \"found\": say plainly that this branch can't book it right "
+    "now, then list the branches that CAN, by name, emoji-numbered "
+    "(no doctor names yet), and ask which one they'd like. Once they "
+    "pick, that branch becomes the booking's branch and you continue "
+    "normally.\n"
+    "  - \"not_found\": only then say nobody offers this service right "
+    "now, and offer to help with something else.\n"
+    "Never announce a branch as offering the service unless this tool "
+    "returned it - that fact is never yours to infer.\n\n"
     "Call `find_available_doctors` with `service_name` set to the "
     "service they chose (its name, or the number they picked from the "
     "service list), and `branch_name` set to the branch if one is "
@@ -5502,6 +5583,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                 for call in response.tool_calls
                 if isinstance(call, dict)
             },
+            agent_name=agent_name,
         )
 
     # ONE QUESTION PER MESSAGE - enforced here, not just asked for in the
@@ -5814,4 +5896,4 @@ if _RUNNING_UNDER_LANGGRAPH_API:
     logger.info("Running under the LangGraph API server - using its built-in persistence, not MemorySaver")
     graph = builder.compile()
 else:
-    graph = builder.compile(checkpointer=checkpointer)
+    graph = builder.compile(checkpointer=checkpointer
