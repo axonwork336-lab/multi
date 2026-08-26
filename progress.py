@@ -625,6 +625,22 @@ def schedule(
 
         args_by_tool = tool_args or {}
 
+        # NO INTERIM MESSAGE WHILE SOMEONE IS DESCRIBING A SYMPTOM.
+        #
+        # In the medical-guidance flow the patient has just told us they
+        # are unwell ("بطني وجعاني وعندي ترجيع"). A mechanical "لحظة من
+        # فضلك، جاري البحث عن الأطباء المتاحين… 🔎" lands as the FIRST
+        # thing they get back - before any acknowledgement that they are
+        # in pain - and reads like a system status line rather than a
+        # person responding. The warm reply is worth waiting a moment
+        # for; a spinner in front of it is worse than silence.
+        #
+        # This is deliberately the whole flow, not one tool: every
+        # lookup here happens while the patient is waiting to be
+        # answered about their symptom.
+        if agent_name == "medical":
+            return
+
         silent = {
             name for name in _SILENT_RESOLVER_TOOLS
             if not _is_list_mode(name, args_by_tool.get(name))
