@@ -2768,6 +2768,150 @@ def list_branch_services(
 
 
 @tool
+def find_branches_offering_service(
+    state: Annotated[AgentState, InjectedState],
+    service_name: str = "",
+    days_ahead: int = DOCTOR_AVAILABILITY_WINDOW_DAYS,
+) -> dict:
+    """Which OTHER branches can actually book a given service right now,
+    and how many doctors provide it at each.
+
+    Use this when the patient wants a service at a branch that has no
+    bookable doctor: instead of a dead end ("this branch has nobody"),
+    it answers the question they actually have - where CAN I get this?
+
+    `service_name`: the service's name, or a bare number picking one
+    from a service list just shown. Falls back to the service already
+    chosen in this booking session.
+
+    Returns:
+    {"status": "found", "service": {"id", "name"},
+     "branches": [{"id", "name", "doctorCount"}, ...]}
+    {"status": "not_found", "service": {...}}  # nobody offers it anywhere
+    {"status": "service_not_matched"} / {"status": "not_configured"} / {"status": "error"}
+
+    Every branch listed is one the tools VERIFIED has a bookable doctor
+    for this service inside the availability window - never infer a
+    branch offers something because its name or address suggests it."""
+
+    base_url = _doctors_base_url(state)
+    if not base_url:
+        logger.warning(
+            "find_branches_offering_service called but no doctors_base_url is configured for client_id=%s",
+            state.get("client_id"),
+        )
+        return {"status": "not_configured"}
+
+    session = _get_booking_session(state.get("session_id"))
+
+    resolved_service = None
+    if service_name and service_name.strip():
+        resolved_service = _resolve_service_for_booking(state, service_name)
+    elif session.get("service_id"):
+        resolved_service = {
+            "id": session["service_id"],
+            "name": session.get("service_display_name"),
+        }
+
+    if not resolved_service:
+        logger.info(
+            "find_branches_offering_service: service_name=%r did not match any service",
+            service_name,
+        )
+        return {"status": "service_not_matched"}
+
+    now = datetime.utcnow()
+    result = api.get_doctors(
+        base_url,
+        service_ids=[resolved_service["id"]],
+        has_published_service=True,
+        has_service_schedule=True,
+        intersection_start=now.isoformat() + "Z",
+        intersection_end=(now + timedelta(days=days_ahead)).isoformat() + "Z",
+        page_size=200,
+        language=conversation_language(state),
+    )
+
+    if not result["success"]:
+        logger.error(
+            "find_branches_offering_service: get_doctors failed: status_code=%s error=%s",
+            result.get("status_code"), result.get("error"),
+        )
+        return {"status": "error"}
+
+    doctor_items = [
+        i for i in (result["data"] or {}).get("items", [])
+        if i.get("hasSlots") is not False and i.get("id")
+    ]
+
+    if not doctor_items:
+        return {"status": "not_found", "service": resolved_service}
+
+    # The Doctors endpoint doesn't reliably say WHICH branch each doctor
+    # sits at, so the branch comes from the schedule rows - the same
+    # pattern `_branch_ids_with_available_doctors` uses, for the same
+    # reason.
+    effective_date = None
+    try:
+        timezone_name = (state.get("templates") or {}).get("_timezone", DEFAULT_TIMEZONE)
+        effective_date = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+    except Exception:
+        logger.exception("find_branches_offering_service: failed to compute today's date")
+
+    schedule_result = api.get_doctor_schedule(
+        base_url, doctor_ids=[i["id"] for i in doctor_items], page_size=500,
+        effective_date=effective_date, include_future=True,
+        language=conversation_language(state),
+    )
+
+    if not schedule_result["success"]:
+        logger.error(
+            "find_branches_offering_service: get_doctor_schedule failed: status_code=%s error=%s",
+            schedule_result.get("status_code"), schedule_result.get("error"),
+        )
+        return {"status": "error"}
+
+    doctors_per_branch = {}
+    for row in (schedule_result["data"] or {}).get("items", []):
+        branch_id = row.get("branchId")
+        doctor_id = row.get("doctorId")
+        if branch_id and doctor_id:
+            doctors_per_branch.setdefault(branch_id, set()).add(doctor_id)
+
+    if not doctors_per_branch:
+        return {"status": "not_found", "service": resolved_service}
+
+    branches_result = api.get_branches(base_url, page_size=200, language=conversation_language(state))
+    names_by_id = {}
+    if branches_result["success"]:
+        for b in _with_branch_aliases((branches_result["data"] or {}).get("items", []), state):
+            if b.get("id"):
+                names_by_id[b["id"]] = _arabic_preferred_name(b) or b.get("name")
+
+    branches = [
+        {
+            "id": branch_id,
+            "name": names_by_id.get(branch_id),
+            "doctorCount": len(doctor_ids),
+        }
+        for branch_id, doctor_ids in doctors_per_branch.items()
+        if names_by_id.get(branch_id)
+    ]
+
+    if not branches:
+        return {"status": "not_found", "service": resolved_service}
+
+    _remember_list(state, "branch", branches)
+
+    logger.info(
+        "find_branches_offering_service: service=%s (%s) -> %d branch(es)",
+        resolved_service["id"], resolved_service.get("name"), len(branches),
+    )
+
+    return {"status": "found", "service": resolved_service, "branches": branches}
+
+
+@tool
 def answer_hospital_faq(
     state: Annotated[AgentState, InjectedState],
     question: str,
@@ -6612,6 +6756,7 @@ ALL_TOOLS = [
     answer_hospital_faq,
     list_hospital_services,
     list_branch_services,
+    find_branches_offering_service,
     match_entity_info,
     reset_booking_session,
     match_entity_for_booking,
