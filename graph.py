@@ -2857,64 +2857,18 @@ _GENERIC_BRANCH_QUESTION_RE = re.compile(
 
 
 _NOT_A_DIAGNOSIS_RE = re.compile(
-    r"مش\s*تشخيص|ليس\s*تشخيص|مو\s*تشخيص|ما\s*هو\s*تشخيص|"
-    r"مش\s*تشخيصا?|not\s*a\s*(?:medical\s*)?diagnosis"
+    # Must match the REQUIRED notice ("...وليست تشخيصًا طبيًا مباشرة")
+    # as well as the shorter dialect phrasings. Getting this wrong makes
+    # the verifier demand a notice that is already there, so the
+    # "وليست/ليست" form is the important one.
+    r"وليست\s*تشخيص|ليست?\s*تشخيص|مش\s*تشخيص|مو\s*تشخيص|ما\s*هو\s*تشخيص|"
+    r"معلومات\s*عامه|not\s*a\s*(?:medical\s*)?diagnosis|general\s*information"
 )
 
 _SPECIALTY_OFFER_RE = re.compile(
     r"عندنا\s*دكاتره|عندنا\s*اطباء|دكاتره\s*متاح|اطباء\s*متاح|"
     r"احجزلك|احجز\s*لك|اشوف\s*لك\s*(?:ال)?دكاتره|"
     r"التخصص\s*(?:ال)?مناسب|تحب\s*(?:ت)?حجز"
-)
-
-
-_DISCLAIMER_BANNER_RE = re.compile(
-    r"⚕|(?:^|\n)\s*تنبيه\s*:|هذه\s*معلومات\s*عامه|"
-    r"ليست\s*تشخيصا?\s*طبيا|هذه\s*المعلومات\s*لا\s*تغني|"
-    r"(?:^|\n)\s*disclaimer\s*:"
-)
-
-
-def _reply_uses_disclaimer_banner(reply_text: str, state: AgentState) -> bool:
-    """True when the "not a diagnosis" note has been rendered as a
-    formal notice instead of a spoken clause.
-
-    The note itself is required (see
-    `_medical_reply_missing_not_a_diagnosis`) - this guards the OTHER
-    failure mode, where requiring it produced a legal-looking banner
-    pasted in front of the message.
-
-    CONFIRMED REAL PRODUCTION FAILURE: "⚕️ تنبيه: هذه معلومات عامة
-    وليست تشخيصًا طبيًا مباشرة. لتشخيص الطبي عندنا دكاترة باطنة متاحين
-    — تحب أحجزلك عند واحد منهم؟" - a Modern Standard Arabic banner
-    bolted onto a dialect sentence, which also left "لتشخيص الطبي
-    عندنا دكاترة" behind: not grammatical Arabic. The patient is on
-    WhatsApp talking to someone who is meant to sound like a person."""
-
-    if not reply_text:
-        return False
-
-    return bool(_DISCLAIMER_BANNER_RE.search(_norm_ar(reply_text)))
-
-
-_DISCLAIMER_BANNER_CORRECTION_DIRECTIVE = (
-    "============================================================\n"
-    "THE 'NOT A DIAGNOSIS' NOTE IS A SPOKEN CLAUSE, NOT A BANNER\n"
-    "============================================================\n"
-    "Your previous draft rendered it as a formal notice - a \"⚕️ تنبيه:\" "
-    "header, a Modern Standard Arabic disclaimer sentence, or a "
-    "separate block pasted in front of the message. That reads like "
-    "terms and conditions, not like the person who wrote the rest of "
-    "the reply.\n\n"
-    "Rewrite the offer line as ONE natural sentence in this clinic's "
-    "own dialect, with the clause already inside it:\n"
-    "    ده مش تشخيص طبي طبعًا، بس عندنا دكاترة باطنة متاحين - تحب "
-    "أحجزلك عند واحد منهم؟\n\n"
-    "No banner, no ⚕️, no MSA disclaimer sentence, no separate "
-    "paragraph. And make sure the finished line is grammatical - "
-    "CONFIRMED REAL PRODUCTION FAILURE: bolting the notice on left "
-    "\"لتشخيص الطبي عندنا دكاترة باطنة متاحين\", which is not Arabic.\n\n"
-    "Keep the rest of the message exactly as it was.\n\n"
 )
 
 
@@ -2946,30 +2900,26 @@ def _medical_reply_missing_not_a_diagnosis(reply_text: str, state: AgentState) -
 
 _NOT_A_DIAGNOSIS_CORRECTION_DIRECTIVE = (
     "============================================================\n"
-    "ADD THE 'NOT A DIAGNOSIS' CLAUSE - IT IS REQUIRED\n"
+    "ADD THE 'NOT A DIAGNOSIS' NOTICE - IT IS REQUIRED\n"
     "============================================================\n"
     "Your previous draft pointed the patient at a specialty or offered "
-    "them a doctor without saying that this is not a medical diagnosis. "
-    "That clause is required on any medical-guidance reply that steers "
-    "them: you are a booking assistant, not a clinician, and without it "
-    "a symptom-to-specialty suggestion reads as a verdict on their "
-    "condition.\n\n"
-    "Add it as a SHORT, SPOKEN clause inside the line that offers the "
-    "appointment - in this clinic's own dialect, e.g.:\n"
-    "    ده مش تشخيص طبي طبعًا، بس عندنا دكاترة باطنة متاحين - تحب "
-    "أحجزلك عند واحد منهم؟\n\n"
-    "REWRITE THAT LINE AS ONE NATURAL SENTENCE. Do not paste a notice "
-    "in front of the existing text and leave it dangling:\n"
-    "  - No \"⚕️ تنبيه:\" banner, no emoji marker, no separate "
-    "paragraph, no bold - this is something a person says, not a legal "
-    "notice.\n"
-    "  - Not Modern Standard Arabic (\"هذه معلومات عامة وليست تشخيصًا "
-    "طبيًا\") when the rest of the message is in dialect - it must sound "
-    "like the same person who wrote the line above it.\n"
-    "  - The result must be grammatical. CONFIRMED REAL PRODUCTION "
-    "FAILURE from bolting it on: \"⚕️ تنبيه: هذه معلومات عامة وليست "
-    "تشخيصًا طبيًا مباشرة. لتشخيص الطبي عندنا دكاترة باطنة متاحين\" - "
-    "the leftover \"لتشخيص الطبي عندنا دكاترة\" is not Arabic at all.\n\n"
+    "them a doctor without the required notice. It is mandatory on any "
+    "medical-guidance reply that steers them: you are a booking "
+    "assistant, not a clinician, and without it a symptom-to-specialty "
+    "suggestion reads as a verdict on their condition.\n\n"
+    "Add this line EXACTLY as written, on its own line, immediately "
+    "before the line that offers the appointment:\n"
+    "    \u2695\ufe0f تنبيه: هذه معلومات عامة وليست تشخيصًا طبيًا مباشرة.\n\n"
+    "Keep the \u2695\ufe0f and the word \"تنبيه:\". This one line is "
+    "deliberately a formal notice in Modern Standard Arabic, even though "
+    "the rest of the message is in dialect.\n\n"
+    "Then make sure the offer that follows is a COMPLETE, grammatical "
+    "sentence of its own - not a fragment continuing from the notice. "
+    "CONFIRMED REAL PRODUCTION FAILURE: bolting it on produced \"لتشخيص "
+    "الطبي عندنا دكاترة باطنة متاحين\", which is not grammatical Arabic; "
+    "it needs \"للتشخيص الطبي، عندنا في [اسم المستشفى] دكاترة باطنة "
+    "متاحين — تحب أحجزلك عند واحد منهم؟\", or simply start it with "
+    "\"عندنا في [اسم المستشفى]...\".\n\n"
     "Change nothing else about the reply.\n\n"
 )
 
@@ -3790,11 +3740,11 @@ _REPLY_VERIFIERS = (
     ),
     (
         lambda reply, state, agent_name: (
-            agent_name == "medical" and _reply_uses_disclaimer_banner(reply, state)
+            agent_name == "medical" and _medical_reply_asks_which_specialty(reply, state)
         ),
-        lambda reply, state: _DISCLAIMER_BANNER_CORRECTION_DIRECTIVE,
-        "medical-guidance reply rendered the 'not a diagnosis' note as a formal "
-        "banner instead of a spoken clause",
+        lambda reply, state: _SPECIALTY_CHOICE_CORRECTION_DIRECTIVE,
+        "medical-guidance reply asked the patient to choose a specialty instead of "
+        "showing the doctors",
     ),
     (
         lambda reply, state, agent_name: (
@@ -4423,7 +4373,17 @@ def _build_branch_pick_directive(messages: list, session_id: str) -> str:
     if not name:
         return ""
 
-    if chosen.get("hasAvailableDoctors") is False:
+    # A branch row can reach here from two places: `match_entity_info`'s
+    # list (which carries `hasAvailableDoctors`) or a booking-flow list
+    # like `list_branches_for_specialty` (which does not). Fall back to
+    # the session note so an empty branch is recognised either way -
+    # otherwise the same branch is treated as bookable purely because of
+    # which tool happened to list it.
+    branch_is_empty = chosen.get("hasAvailableDoctors") is False
+    if not branch_is_empty and session.get("info_branch_no_doctors"):
+        branch_is_empty = _norm_ar(session["info_branch_no_doctors"]) == _norm_ar(name)
+
+    if branch_is_empty:
         # Remember it, so the NEXT turn ("I want to book there") is also
         # covered - see _build_empty_branch_booking_intent_directive.
         session["info_branch_no_doctors"] = name
@@ -4624,13 +4584,25 @@ def _build_empty_branch_booking_intent_directive(messages: list, session_id: str
         "particular doctor or the list of available doctors there - "
         "there is no doctor to pick and no list to show, so every one of "
         "those is a question with no possible answer.\n\n"
-        "This reply, in one message:\n"
-        "  1. Say plainly that this branch has no doctors available for "
-        "booking right now.\n"
-        "  2. Call `list_branches_for_specialty` and show the branches "
-        "that DO have doctors - BY NAME ONLY, emoji-numbered, with no "
-        "doctor names.\n"
-        "  3. Ask ONE question: which of those branches they'd like.\n\n"
+        "This reply, in one message - and it still TELLS THEM ABOUT THE "
+        "BRANCH before closing the door on booking there:\n"
+        f"  1. The address of {branch_name}.\n"
+        "  2. Its services, numbered, from `list_branch_services`. They "
+        "picked this branch to find out about it; a branch having no "
+        "doctor free does not make its address and services irrelevant, "
+        "and skipping straight to \"can't book here\" leaves them with "
+        "nothing at all about the place they asked about.\n"
+        "  3. Then, plainly, that this branch has no booking right now, "
+        "and ONE question: تحب أعرض لك الفروع اللي فيها حجز؟\n"
+        "  4. Only if they say yes, call `find_branches_offering_service` "
+        "(when a service is in play) or `list_branches_for_specialty` and "
+        "list those branches BY NAME ONLY, no doctor names.\n\n"
+        "Do not collapse steps 1-2. CONFIRMED REAL REGRESSION: this turn "
+        "previously replied with the address, the branch's one service, "
+        "and then the honest question - and a later change reduced it to "
+        "just \"الفرع هذا ما فيه حجز حاليًا، تحب أعرض لك الفروع اللي "
+        "فيها حجز؟\", dropping the address and services the patient had "
+        "actually asked for.\n\n"
         "CONFIRMED REAL PRODUCTION FAILURE: this exact turn came back as "
         "\"اخترت فرع المعادي ✅ / تحب تحجز مع دكتور معيّن عند فرع "
         "المعادي، ولا تبي أعرض لك الدكاترة المتاحين هناك؟\" - and only "
