@@ -2856,6 +2856,124 @@ _GENERIC_BRANCH_QUESTION_RE = re.compile(
 )
 
 
+_NOT_A_DIAGNOSIS_RE = re.compile(
+    r"مش\s*تشخيص|ليس\s*تشخيص|مو\s*تشخيص|ما\s*هو\s*تشخيص|"
+    r"مش\s*تشخيصا?|not\s*a\s*(?:medical\s*)?diagnosis"
+)
+
+_SPECIALTY_OFFER_RE = re.compile(
+    r"عندنا\s*دكاتره|عندنا\s*اطباء|دكاتره\s*متاح|اطباء\s*متاح|"
+    r"احجزلك|احجز\s*لك|اشوف\s*لك\s*(?:ال)?دكاتره|"
+    r"التخصص\s*(?:ال)?مناسب|تحب\s*(?:ت)?حجز"
+)
+
+
+_DISCLAIMER_BANNER_RE = re.compile(
+    r"⚕|(?:^|\n)\s*تنبيه\s*:|هذه\s*معلومات\s*عامه|"
+    r"ليست\s*تشخيصا?\s*طبيا|هذه\s*المعلومات\s*لا\s*تغني|"
+    r"(?:^|\n)\s*disclaimer\s*:"
+)
+
+
+def _reply_uses_disclaimer_banner(reply_text: str, state: AgentState) -> bool:
+    """True when the "not a diagnosis" note has been rendered as a
+    formal notice instead of a spoken clause.
+
+    The note itself is required (see
+    `_medical_reply_missing_not_a_diagnosis`) - this guards the OTHER
+    failure mode, where requiring it produced a legal-looking banner
+    pasted in front of the message.
+
+    CONFIRMED REAL PRODUCTION FAILURE: "⚕️ تنبيه: هذه معلومات عامة
+    وليست تشخيصًا طبيًا مباشرة. لتشخيص الطبي عندنا دكاترة باطنة متاحين
+    — تحب أحجزلك عند واحد منهم؟" - a Modern Standard Arabic banner
+    bolted onto a dialect sentence, which also left "لتشخيص الطبي
+    عندنا دكاترة" behind: not grammatical Arabic. The patient is on
+    WhatsApp talking to someone who is meant to sound like a person."""
+
+    if not reply_text:
+        return False
+
+    return bool(_DISCLAIMER_BANNER_RE.search(_norm_ar(reply_text)))
+
+
+_DISCLAIMER_BANNER_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "THE 'NOT A DIAGNOSIS' NOTE IS A SPOKEN CLAUSE, NOT A BANNER\n"
+    "============================================================\n"
+    "Your previous draft rendered it as a formal notice - a \"⚕️ تنبيه:\" "
+    "header, a Modern Standard Arabic disclaimer sentence, or a "
+    "separate block pasted in front of the message. That reads like "
+    "terms and conditions, not like the person who wrote the rest of "
+    "the reply.\n\n"
+    "Rewrite the offer line as ONE natural sentence in this clinic's "
+    "own dialect, with the clause already inside it:\n"
+    "    ده مش تشخيص طبي طبعًا، بس عندنا دكاترة باطنة متاحين - تحب "
+    "أحجزلك عند واحد منهم؟\n\n"
+    "No banner, no ⚕️, no MSA disclaimer sentence, no separate "
+    "paragraph. And make sure the finished line is grammatical - "
+    "CONFIRMED REAL PRODUCTION FAILURE: bolting the notice on left "
+    "\"لتشخيص الطبي عندنا دكاترة باطنة متاحين\", which is not Arabic.\n\n"
+    "Keep the rest of the message exactly as it was.\n\n"
+)
+
+
+def _medical_reply_missing_not_a_diagnosis(reply_text: str, state: AgentState) -> bool:
+    """True when a medical-guidance reply steers the patient toward a
+    specialty or a doctor without saying this isn't a diagnosis.
+
+    This is a compliance requirement, not a style preference: a
+    booking assistant mapping symptoms to a specialty must not leave
+    that reading as a clinical verdict. Prompt wording alone has
+    already drifted on this once (it was softened to "leave it out if
+    it doesn't fit"), so it is checked here.
+
+    Deliberately narrow - it only fires when the reply is actually
+    STEERING (offering doctors, offering to book, naming the fitting
+    specialty). A follow-up question about the symptom, or a plain
+    emergency instruction, needs no such clause."""
+
+    if not reply_text:
+        return False
+
+    folded = _norm_ar(reply_text)
+
+    if not _SPECIALTY_OFFER_RE.search(folded):
+        return False
+
+    return not _NOT_A_DIAGNOSIS_RE.search(folded)
+
+
+_NOT_A_DIAGNOSIS_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "ADD THE 'NOT A DIAGNOSIS' CLAUSE - IT IS REQUIRED\n"
+    "============================================================\n"
+    "Your previous draft pointed the patient at a specialty or offered "
+    "them a doctor without saying that this is not a medical diagnosis. "
+    "That clause is required on any medical-guidance reply that steers "
+    "them: you are a booking assistant, not a clinician, and without it "
+    "a symptom-to-specialty suggestion reads as a verdict on their "
+    "condition.\n\n"
+    "Add it as a SHORT, SPOKEN clause inside the line that offers the "
+    "appointment - in this clinic's own dialect, e.g.:\n"
+    "    ده مش تشخيص طبي طبعًا، بس عندنا دكاترة باطنة متاحين - تحب "
+    "أحجزلك عند واحد منهم؟\n\n"
+    "REWRITE THAT LINE AS ONE NATURAL SENTENCE. Do not paste a notice "
+    "in front of the existing text and leave it dangling:\n"
+    "  - No \"⚕️ تنبيه:\" banner, no emoji marker, no separate "
+    "paragraph, no bold - this is something a person says, not a legal "
+    "notice.\n"
+    "  - Not Modern Standard Arabic (\"هذه معلومات عامة وليست تشخيصًا "
+    "طبيًا\") when the rest of the message is in dialect - it must sound "
+    "like the same person who wrote the line above it.\n"
+    "  - The result must be grammatical. CONFIRMED REAL PRODUCTION "
+    "FAILURE from bolting it on: \"⚕️ تنبيه: هذه معلومات عامة وليست "
+    "تشخيصًا طبيًا مباشرة. لتشخيص الطبي عندنا دكاترة باطنة متاحين\" - "
+    "the leftover \"لتشخيص الطبي عندنا دكاترة\" is not Arabic at all.\n\n"
+    "Change nothing else about the reply.\n\n"
+)
+
+
 def _reply_asks_generic_branch_after_doctor(reply_text: str, state: AgentState) -> bool:
     """True when a doctor is settled and the reply asks a bare "which
     branch?" without having shown that doctor's own schedule.
@@ -3671,6 +3789,22 @@ _REPLY_VERIFIERS = (
         "the patient agreed to proceed on the channel number the service already has",
     ),
     (
+        lambda reply, state, agent_name: (
+            agent_name == "medical" and _reply_uses_disclaimer_banner(reply, state)
+        ),
+        lambda reply, state: _DISCLAIMER_BANNER_CORRECTION_DIRECTIVE,
+        "medical-guidance reply rendered the 'not a diagnosis' note as a formal "
+        "banner instead of a spoken clause",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            agent_name == "medical" and _medical_reply_missing_not_a_diagnosis(reply, state)
+        ),
+        lambda reply, state: _NOT_A_DIAGNOSIS_CORRECTION_DIRECTIVE,
+        "medical-guidance reply steered the patient to a specialty/doctor without "
+        "the required 'not a diagnosis' clause",
+    ),
+    (
         lambda reply, state, agent_name: _reply_asks_generic_branch_after_doctor(reply, state),
         lambda reply, state: _DOCTOR_SCHEDULE_INSTEAD_OF_BRANCHES_CORRECTION,
         "reply asked a generic 'which branch?' after a doctor was settled, instead of "
@@ -4343,6 +4477,44 @@ def _build_branch_pick_directive(messages: list, session_id: str) -> str:
     session.pop("info_branch_no_doctors", None)
     session["info_branch_id"] = chosen.get("id")
     session["info_branch_name"] = name
+
+    # A SERVICE IS ALREADY CHOSEN - DON'T START OVER.
+    #
+    # When the patient picked a service, asked which branches offer it,
+    # and has now picked one of those branches, the service question is
+    # settled. Re-listing that branch's whole catalogue throws away the
+    # choice they already made and asks it again.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: after choosing جلسة إستشارة
+    # أخصائي التغذية and being shown the two branches that offer it, the
+    # patient picked فرع النزهة - and the reply was "فرع النزهة فيه
+    # الخدمات التالية: 1️⃣ برنامج علاج نفسي نهاري 2️⃣ إستشارة الطبيب
+    # العام 3️⃣ جلسة إستشارة أخصائي التغذية / تبغى تحجز موعد في فرع
+    # النزهة لإحدى هذه الخدمات؟" - offering them the service they had
+    # already chosen, as one of three options.
+    chosen_service = session.get("service_display_name") or session.get("service_id")
+    if chosen_service:
+        service_label = session.get("service_display_name") or "the service they chose"
+        return (
+            "============================================================\n"
+            "BRANCH PICKED FOR AN ALREADY-CHOSEN SERVICE - KEEP GOING\n"
+            "============================================================\n"
+            f"Option {position} is {name}. The patient already chose "
+            f"{service_label}, and this branch is one of the branches "
+            "that offer it - that is why it was on the list.\n\n"
+            "Do NOT list this branch's services again, and do NOT ask "
+            "which service they want. Both re-ask a question that is "
+            "already answered.\n\n"
+            f"Call `find_available_doctors` with `branch_name=\"{name}\"` "
+            "(the chosen service is already on the session and narrows "
+            "it automatically) and show the doctors who provide it "
+            "there, numbered, then ask ONE question: which doctor.\n\n"
+            "CONFIRMED REAL PRODUCTION FAILURE: this exact step replied "
+            "with the branch's full service catalogue and asked them to "
+            "pick a service - the one they had chosen two turns earlier "
+            "being item 3 on that list.\n\n"
+        )
+
     return (
         "============================================================\n"
         "THEY PICKED A BRANCH FROM THE LIST\n"
