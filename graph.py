@@ -2744,6 +2744,93 @@ def _doctor_names_from_tools(state: AgentState) -> set:
     return {n for n in names if n}
 
 
+_TIME_LIST_RE = re.compile(r"[1-9]\uFE0F?\u20E3\s*\d{1,2}\s*[:：]\s*\d{2}")
+_SOONEST_OFFER_RE = re.compile(
+    r"اقرب\s*موعد|أقرب\s*موعد|هل\s*يناسبك|يناسبك\s*(?:هذا|ده|هالموعد)|"
+    r"earliest\s*(?:available\s*)?appointment|does\s*(?:this|that)\s*work"
+)
+
+
+def _reply_dumps_times_without_offering_soonest(reply_text: str, state: AgentState) -> bool:
+    """True when a reply answers a DAY choice with the full list of that
+    day's times, instead of offering the soonest one first.
+
+    The agreed flow is: day settled -> ONE concrete soonest appointment
+    + "does that suit you?" -> only if they decline, the full list. A
+    wall of twenty times is what that flow exists to avoid, and the
+    prose rule for it has not held on its own.
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient answered "الأحد", and
+    got "المواعيد المتاحة ليوم الأحد 30/08/2026" followed by eight
+    numbered times - no soonest-appointment offer at all, while the
+    identical step in another flow did it correctly.
+
+    Fires only when the patient's own last message was a DAY choice, so
+    a time list they explicitly asked for is untouched."""
+
+    if not reply_text:
+        return False
+
+    if len(_TIME_LIST_RE.findall(reply_text)) < 3:
+        return False
+
+    if _SOONEST_OFFER_RE.search(_norm_ar(reply_text)):
+        return False
+
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    last_human = None
+    for msg in reversed(state.get("messages") or []):
+        if isinstance(msg, _HumanMessage):
+            content = getattr(msg, "content", "")
+            last_human = content if isinstance(content, str) else str(content)
+            break
+
+    if not last_human:
+        return False
+
+    folded = _norm_ar(last_human)
+
+    picked_a_day = bool(
+        re.search(
+            r"الاثنين|الثلاثاء|الاربعاء|الخميس|الجمعه|السبت|الاحد|"
+            r"بكره|بكرا|اليوم|غدا|monday|tuesday|wednesday|thursday|friday|saturday|sunday",
+            folded,
+        )
+    )
+
+    if not picked_a_day:
+        return False
+
+    # If they asked outright to SEE the times, showing them is correct.
+    if re.search(r"الاوقات|المواعيد\s*المتاحه|وريني|اعرض", folded):
+        return False
+
+    return True
+
+
+_SOONEST_FIRST_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "OFFER THE SOONEST APPOINTMENT FIRST - NOT THE WHOLE DAY'S LIST\n"
+    "============================================================\n"
+    "The patient chose a DAY, and your previous draft answered with "
+    "every time on it. That is a wall of options where one sentence "
+    "would have finished the booking.\n\n"
+    "Rewrite it as a single concrete offer - the EARLIEST time from the "
+    "tool result you already have - plus one question:\n"
+    "    the doctor, the branch, the weekday and date, the time\n"
+    "    then: does that suit you?\n"
+    "Take the doctor, branch, date and time verbatim from the tool "
+    "result; invent nothing.\n\n"
+    "Only if they say it does NOT suit them do you show the rest of the "
+    "day's times as a numbered list.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: the patient answered \"الأحد\" "
+    "and received eight numbered times with no soonest-appointment "
+    "offer, while the same step in another flow correctly offered one "
+    "appointment and asked.\n\n"
+)
+
+
 def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
     """Doctor names presented in a numbered list that no tool result in
     this conversation ever returned.
@@ -3167,6 +3254,21 @@ def _medical_reply_names_two_specialties(reply_text: str, state: AgentState) -> 
     folded = _norm_ar(reply_text)
 
     if not _SPECIALTY_OFFER_RE.search(folded):
+        return False
+
+    # A DOCTOR LIST LEGITIMATELY CARRIES SEVERAL SPECIALTIES.
+    #
+    # Each doctor is labelled with their own specialty, so a two-doctor
+    # list naturally names two - informative, not contradictory. This
+    # guard is about the ADVICE line and the OFFER line disagreeing,
+    # which is a different thing.
+    #
+    # CONFIRMED REAL FALSE POSITIVE: "الأطباء المتاحين: 1️⃣ رانيا عبد
+    # الرحمن — استشاري · باطنه عام / 2️⃣ فارس الشارخ — اخصائي · طب
+    # الباطنة" was rejected twice as advising one specialty and offering
+    # another. It was a correct list built from a real tool result, and
+    # each retry burned a model call.
+    if len(_NUMBERED_LIST_ITEM_RE.findall(reply_text)) >= 2:
         return False
 
     specialty_names = set()
@@ -4368,6 +4470,12 @@ _REPLY_VERIFIERS = (
         lambda reply, state, agent_name: _reply_reoffers_doctor_roster_after_confirming_one(reply, state),
         lambda reply, state: _DOCTOR_ROSTER_CORRECTION_DIRECTIVE,
         "reply confirmed a doctor then offered the doctor roster again in the same message",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_dumps_times_without_offering_soonest(reply, state),
+        lambda reply, state: _SOONEST_FIRST_CORRECTION_DIRECTIVE,
+        "reply answered a day choice with the full time list instead of offering the "
+        "soonest appointment first",
     ),
     (
         lambda reply, state, agent_name: bool(_find_invented_doctors(reply, state)),
