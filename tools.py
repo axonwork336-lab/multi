@@ -287,28 +287,31 @@ def to_riyadh(utc_string: Optional[str], timezone_name: str = DEFAULT_TIMEZONE) 
 def to_local_wallclock(value: Optional[str], timezone_name: str = DEFAULT_TIMEZONE) -> Optional[str]:
     """For WORKING-HOURS rows (a doctor's weekly rota), not instants.
 
-    A rota row says "this doctor sits in clinic from 11:00 to 15:00 on
-    Tuesdays". That is a WALL-CLOCK time at the branch - it is not an
-    instant on a timeline, and there is nothing to convert. The
-    Doctors/GetDoctorSchedule endpoint echoes back the same wall-clock
-    the clinic's admin typed in, with NO timezone offset attached.
+    A rota row says "this doctor sits in clinic from 11:00 to 15:00".
+    That is a WALL-CLOCK time at the branch. There is nothing to
+    convert, and - critically - THE OFFSET THE API ATTACHES TO IT IS
+    NOT REAL.
 
-    `to_riyadh` assumes a naive value is UTC and shifts it into the
-    client's zone. That is right for SLOTS (Doctors/GetDoctorScheduleSlots
-    returns real instants, confirmed carrying an explicit "+00:00"), and
-    wrong for rota rows.
+    EVIDENCE, from one production trace plus the clinic's own admin UI:
+      - Admin UI for د. فارس الشارخ at Al Manar: 11:00 - 15:00.
+        Patient saw: "من 2:00 مساءً لـ 6:00 مساءً" (14:00 - 18:00).
+      - Raw row for د. رانيا عبد الرحمن, logged verbatim:
+        fromDateTime '2026-08-06T07:45:00+00:00',
+        toDateTime   '2028-01-18T14:15:00+00:00'
+        Patient saw: "من 10:45 صباحًا لـ 5:15 مساءً" (10:45 - 17:15).
+    Both are exactly +3 - the Asia/Riyadh offset applied to a number
+    that was already local. The endpoint stamps "+00:00" on a
+    wall-clock it never converted.
 
-    CONFIRMED REAL PRODUCTION FAILURE: د. فارس الشارخ's rota at Al Manar
-    reads 11:00-15:00 in the admin UI, and the patient was shown
-    "من 2:00 مساءً لـ 6:00 مساءً" - the naive 11:00 was read as UTC and
-    pushed +3 into Asia/Riyadh. Every working-hours line in the product
-    was three hours late, and the slot list underneath inherited the
-    same window.
+    So: take the clock components and drop the offset entirely. Never
+    call `astimezone` on a rota row.
 
-    Behaviour: a value that DOES carry a timezone is still converted
-    normally (it is a real instant, so the offset is meaningful). Only
-    naive values are left exactly as they are, because they are already
-    local."""
+    (Note the same row's DATE parts - 2026-08-06 to 2028-01-18 - are the
+    rota's effective RANGE, not a single day. Only the time-of-day
+    component is the working window.)
+
+    `timezone_name` is accepted so callers read consistently with
+    `to_riyadh`, and is deliberately unused."""
 
     if not value:
         return None
@@ -318,13 +321,10 @@ def to_local_wallclock(value: Optional[str], timezone_name: str = DEFAULT_TIMEZO
     try:
         dt = datetime.fromisoformat(cleaned)
     except ValueError:
-        # Unparseable - hand it back untouched rather than guessing.
         return value
 
-    if dt.tzinfo is not None:
-        return to_riyadh(value, timezone_name)
-
-    return dt.isoformat()
+    # Drop tzinfo rather than converting - the offset is decoration.
+    return dt.replace(tzinfo=None).isoformat()
 
 
 _ARABIC_WEEKDAY_NAMES = [
