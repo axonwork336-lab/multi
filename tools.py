@@ -4987,7 +4987,13 @@ def resolve_available_day(
         doctor_id, branch_id, weekday_name, after_date, from_date, to_date, len(items),
     )
 
-    lead_time = now + timedelta(hours=12)  # 12h minimum advance booking lead, matches production
+    # NAIVE, to match the wall-clock slot times it is compared against.
+    # `now` stays timezone-aware because the API request params use it;
+    # only the comparison value is stripped. Mixing the two raises
+    # TypeError - CONFIRMED REAL PRODUCTION CRASH: "can't compare
+    # offset-naive and offset-aware datetimes" at `dt <= lead_time`,
+    # which took down the whole turn.
+    lead_time = now.replace(tzinfo=None) + timedelta(hours=12)  # 12h minimum advance booking lead
     after_dt = None
     if after_date:
         try:
@@ -5687,7 +5693,9 @@ def list_available_days_for_booking(
 
     now = datetime.now(tz)
     horizon_days = 42  # same booking window resolve_available_day uses
-    lead_time = now + timedelta(hours=12)  # same 12h minimum advance lead
+    # Naive for the same reason as resolve_available_day's - it is
+    # compared against wall-clock slot times.
+    lead_time = now.replace(tzinfo=None) + timedelta(hours=12)  # same 12h minimum advance lead
 
     result = api.get_doctor_schedule_slots(
         base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
@@ -6533,7 +6541,9 @@ def find_best_doctor_in_specialty(
                 dt = datetime.fromisoformat(slot_start)
             except ValueError:
                 continue
-            if dt <= now:
+            # `slot_start` is wall-clock (naive); `now` is aware. Compare
+            # like with like - see the lead_time note above.
+            if dt <= now.replace(tzinfo=None):
                 continue
             if best is None or dt < best[0]:
                 best = (dt, item)
