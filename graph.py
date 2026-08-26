@@ -2879,6 +2879,45 @@ _SPECIALTY_CHOICE_QUESTION_RE = re.compile(
 )
 
 
+_MEDICAL_OFFER_PATTERN_RE = re.compile(
+    r"وليست\s*تشخيص|ليست?\s*تشخيص|مش\s*تشخيص|معلومات\s*عامه|"
+    r"not\s*a\s*(?:medical\s*)?diagnosis"
+)
+
+
+def _in_medical_guidance_handoff(state: AgentState) -> bool:
+    """True when the assistant's last message was a medical-guidance
+    offer ("...عندنا دكاترة باطنة متاحين، تحب أحجزلك؟") - i.e. the
+    patient's current reply is them accepting it.
+
+    WHY THIS IS NEEDED: the ROUTER moves the conversation out of the
+    `medical` agent the moment the patient agrees - "اه" is classified
+    as a bare affirmation answering a booking offer, so the very next
+    turn runs under `booking`. Any guard gated on `agent_name ==
+    "medical"` is therefore silent on exactly the turn after the
+    guidance reply, which is where these failures happen.
+
+    CONFIRMED REAL PRODUCTION FAILURE: a correct guidance reply named
+    طب الباطنة and offered an appointment; the patient said "اه"; and
+    the reply was "وش التخصص اللي حاب تحجز فيه؟" followed by all seven
+    registered specialties. Both the specialty-choice guard and the
+    catalogue-dump guard existed and neither fired, because the turn was
+    no longer `medical`."""
+
+    from langchain_core.messages import AIMessage as _AIMessage
+
+    for msg in reversed(state.get("messages", []) or []):
+        if not isinstance(msg, _AIMessage):
+            continue
+        content = getattr(msg, "content", "")
+        text = content if isinstance(content, str) else str(content)
+        if not text.strip():
+            continue
+        return bool(_MEDICAL_OFFER_PATTERN_RE.search(_norm_ar(text)))
+
+    return False
+
+
 def _medical_reply_asks_which_specialty(reply_text: str, state: AgentState) -> bool:
     """True when a medical-guidance reply asks the patient to pick a
     specialty.
@@ -3796,7 +3835,8 @@ _REPLY_VERIFIERS = (
     ),
     (
         lambda reply, state, agent_name: (
-            agent_name == "medical" and _medical_reply_asks_which_specialty(reply, state)
+            (agent_name == "medical" or _in_medical_guidance_handoff(state))
+            and _medical_reply_asks_which_specialty(reply, state)
         ),
         lambda reply, state: _SPECIALTY_CHOICE_CORRECTION_DIRECTIVE,
         "medical-guidance reply asked the patient to choose a specialty instead of "
@@ -3823,7 +3863,8 @@ _REPLY_VERIFIERS = (
     ),
     (
         lambda reply, state, agent_name: (
-            agent_name == "medical" and _reply_dumps_specialty_catalogue(reply, state)
+            (agent_name == "medical" or _in_medical_guidance_handoff(state))
+            and _reply_dumps_specialty_catalogue(reply, state)
         ),
         lambda reply, state: _SPECIALTY_CATALOGUE_CORRECTION_DIRECTIVE,
         "medical-guidance reply printed the specialty catalogue for the patient to pick from",
