@@ -327,6 +327,22 @@ def to_local_wallclock(value: Optional[str], timezone_name: str = DEFAULT_TIMEZO
     return dt.replace(tzinfo=None).isoformat()
 
 
+def _local_now_naive(timezone_name: str = DEFAULT_TIMEZONE) -> datetime:
+    """"Now", as a NAIVE local datetime.
+
+    Slot times are wall-clock with no real offset (see
+    `to_local_wallclock`), so "has this slot already passed?" has to be
+    compared against a naive local now. Comparing a naive datetime with
+    an aware one raises TypeError, which - inside the try/except that
+    wraps these filters - silently disables the past-slot filter and
+    starts offering appointments earlier today."""
+
+    try:
+        return datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)
+    except Exception:
+        return datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).replace(tzinfo=None)
+
+
 _ARABIC_WEEKDAY_NAMES = [
     "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد",
 ]
@@ -2585,8 +2601,8 @@ def get_available_reschedule_slots(
     language = conversation_language(state)
     slots = []
     for item in items:
-        slot_start = to_riyadh(item.get("slotStart"), timezone_name)
-        slot_end = to_riyadh(item.get("slotEnd"), timezone_name)
+        slot_start = to_local_wallclock(item.get("slotStart"), timezone_name)
+        slot_end = to_local_wallclock(item.get("slotEnd"), timezone_name)
         slots.append({
             "slotStart": slot_start,
             "slotEnd": slot_end,
@@ -2608,7 +2624,7 @@ def get_available_reschedule_slots(
     # ~5pm the same day). Compared in the client's own local timezone,
     # matching how slotStart itself was already converted.
     try:
-        now_local = datetime.now(ZoneInfo(timezone_name))
+        now_local = _local_now_naive(timezone_name)
         slots = [
             s for s in slots
             if s["slotStart"] and datetime.fromisoformat(s["slotStart"]) > now_local
@@ -4973,7 +4989,7 @@ def resolve_available_day(
     for item in items:
         if item.get("isBooked"):
             continue
-        slot_start_local = to_riyadh(item.get("slotStart"), timezone_name)
+        slot_start_local = to_local_wallclock(item.get("slotStart"), timezone_name)
         if not slot_start_local:
             continue
         try:
@@ -5414,16 +5430,14 @@ def _open_slots_on_day(state, base_url: str, doctor_id: str, branch_id: str,
         )
         return None
 
-    try:
-        now_local = datetime.now(ZoneInfo(timezone_name))
-    except Exception:
-        now_local = datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+    # Naive, to match the wall-clock slot times - see _local_now_naive.
+    now_local = _local_now_naive(timezone_name)
 
     starts = []
     for item in (result["data"] or {}).get("items", []):
         if item.get("isBooked") is True:
             continue
-        local = to_riyadh(item.get("slotStart"), timezone_name)
+        local = to_local_wallclock(item.get("slotStart"), timezone_name)
         if not local:
             continue
         try:
@@ -5693,7 +5707,7 @@ def list_available_days_for_booking(
         if item.get("isBooked"):
             continue
 
-        slot_start_local = to_riyadh(item.get("slotStart"), timezone_name)
+        slot_start_local = to_local_wallclock(item.get("slotStart"), timezone_name)
         if not slot_start_local:
             continue
 
@@ -6262,8 +6276,8 @@ def get_available_slots_for_booking(
     language = conversation_language(state)
     slots = []
     for item in items:
-        slot_start = to_riyadh(item.get("slotStart"), timezone_name)
-        slot_end = to_riyadh(item.get("slotEnd"), timezone_name)
+        slot_start = to_local_wallclock(item.get("slotStart"), timezone_name)
+        slot_end = to_local_wallclock(item.get("slotEnd"), timezone_name)
         slots.append({
             "slotStart": slot_start,
             "slotEnd": slot_end,
@@ -6279,7 +6293,7 @@ def get_available_slots_for_booking(
     # Exclude past slots, dedupe, sort, cap - same safeguards as the
     # reschedule flow's equivalent (all confirmed real production issues).
     try:
-        now_local = datetime.now(ZoneInfo(timezone_name))
+        now_local = _local_now_naive(timezone_name)
         slots = [s for s in slots if s["slotStart"] and datetime.fromisoformat(s["slotStart"]) > now_local]
     except Exception:
         logger.exception("get_available_slots_for_booking: failed to filter past slots, showing all")
@@ -6502,7 +6516,7 @@ def find_best_doctor_in_specialty(
         for item in raw_slot_items:
             if item.get("isBooked"):
                 continue
-            slot_start = to_riyadh(item.get("slotStart"), timezone_name)
+            slot_start = to_local_wallclock(item.get("slotStart"), timezone_name)
             if not slot_start:
                 continue
             try:
@@ -6530,7 +6544,7 @@ def find_best_doctor_in_specialty(
             },
             "slot": {
                 "slotStart": dt.isoformat(),
-                "slotEnd": to_riyadh(item.get("slotEnd"), timezone_name),
+                "slotEnd": to_local_wallclock(item.get("slotEnd"), timezone_name),
                 "date_display": _display_date(dt.isoformat()),
                 "weekday_display": _display_weekday(dt.isoformat(), conversation_language(state)),
                 "time_display": _display_time_12h(dt.isoformat(), conversation_language(state)),
