@@ -277,6 +277,14 @@ DEFAULT_COUNTRY_CODE: str = os.getenv("DEFAULT_COUNTRY_CODE", "20")  # Egypt
 
 THREAD_ID_PREFIX: str = "guest-cancel"
 
+# Maximum LangGraph steps in a single turn. Guards the agent->tools->
+# agent cycle, which is otherwise bounded only by the model deciding to
+# stop - and when it doesn't, the turn never returns and the patient
+# receives nothing at all (confirmed twice in production). A normal turn
+# uses a handful of steps; even the deepest real flow stays far inside
+# this, so hitting it means something is genuinely looping.
+GRAPH_RECURSION_LIMIT: int = int(os.getenv("GRAPH_RECURSION_LIMIT", "30"))
+
 # After this many seconds of no message on a given session_id, the next
 # message starts a completely fresh conversation (new thread_id) instead
 # of resuming the old one - see main.py's send_message().
