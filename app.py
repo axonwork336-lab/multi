@@ -19,6 +19,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from langgraph.errors import GraphRecursionError
+
 import config
 import main as agent  # unmodified from this point of view: send_message()
 
@@ -141,6 +143,26 @@ def chat(req: ChatRequest) -> ChatResponse:
         result = agent.send_message_with_signals(
             req.client_id, req.session_id, req.message,
             channel_phone=req.channel_phone, client_config=resolved_config,
+        )
+    except GraphRecursionError:
+        # The turn hit the step ceiling - something looped instead of
+        # answering. The patient must still get a message: a 500 here
+        # means silence on their phone, which is the worst outcome and
+        # the one confirmed in production twice.
+        logger.exception(
+            "Graph hit the recursion limit for session_id=%s client_id=%s - something is "
+            "looping. Returning the configured failure message so the patient is not left "
+            "with nothing.", req.session_id, req.client_id,
+        )
+        templates = config.get_messages(req.client_id, client_row_override=resolved_config)
+        return ChatResponse(
+            reply=(
+                templates.get("msg_On_failure")
+                or "حدث خطأ تقني 😕. تحب تحاول مرة ثانية؟"
+            ),
+            escalate=False,
+            location=False,
+            branch_name=None,
         )
     except Exception:
         logger.exception(
