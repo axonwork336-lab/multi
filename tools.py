@@ -455,8 +455,15 @@ def _shape_appointment(item: dict, timezone_name: str = DEFAULT_TIMEZONE, langua
                 shaped[name] = item[key]
                 break
 
-    local_from = to_riyadh(item.get("bookingTimeFrom"), timezone_name)
-    local_to = to_riyadh(item.get("bookingTimeTo"), timezone_name)
+    # WALL-CLOCK, like every other time in this API.
+    #
+    # A booking's stored time came from a slotStart, which is wall-clock
+    # carrying a meaningless "+00:00" (see to_local_wallclock). Running
+    # it through `to_riyadh` would shift it +3 and tell the patient the
+    # wrong time for an appointment they already hold - the same class
+    # of bug the rota and slot displays had.
+    local_from = to_local_wallclock(item.get("bookingTimeFrom"), timezone_name)
+    local_to = to_local_wallclock(item.get("bookingTimeTo"), timezone_name)
 
     shaped["bookingTimeFrom"] = local_from
     shaped["bookingTimeTo"] = local_to
@@ -2713,7 +2720,10 @@ def reschedule_appointment(
 
     language = conversation_language(state)
     timezone_name = (state.get("templates") or {}).get("_timezone")
-    local_new_from = to_riyadh(new_time_from, timezone_name)
+    # `new_time_from` is the slotStart the patient picked, already
+    # wall-clock - converting it here would confirm a time three hours
+    # later than the one they chose.
+    local_new_from = to_local_wallclock(new_time_from, timezone_name)
 
     # THE NEW TIME, READY TO DISPLAY.
     #
