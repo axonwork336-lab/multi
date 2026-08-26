@@ -2940,6 +2940,27 @@ def _medical_reply_offers_unrelated_specialty(reply_text: str, state: AgentState
     if not _SPECIALTY_OFFER_RE.search(folded):
         return False
 
+    # CHECK ONLY THE OFFER, NOT THE WHOLE REPLY.
+    #
+    # The advice line legitimately names the RIGHT specialty ("يفضل
+    # تراجع طبيب عيون فورًا") while the offer names a wrong one.
+    # Scanning the whole message let that advice line satisfy the check,
+    # so the guard stayed silent on the exact failure it exists for.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE: "...يفضل تراجع طبيب عيون فورًا
+    # ... عندنا في مستشفى ميدتاون الطبية دكاترة في تخصص طب الأطفال
+    # متاحين — تحب أحجزلك عند واحد منهم؟" - "عيون" was present in the
+    # message, so the eye check passed, while the patient was in fact
+    # being offered a paediatrician.
+    # Split the RAW text into lines before normalizing: `_norm_ar`
+    # collapses all whitespace (newlines included) into single spaces,
+    # so splitting after it yields one line and the scoping is lost.
+    offer_text = "\n".join(
+        normalized_line
+        for normalized_line in (_norm_ar(line) for line in reply_text.splitlines())
+        if _SPECIALTY_OFFER_RE.search(normalized_line)
+    ) or folded
+
     from langchain_core.messages import HumanMessage as _HumanMessage
 
     patient_text = " ".join(
@@ -2956,7 +2977,7 @@ def _medical_reply_offers_unrelated_specialty(reply_text: str, state: AgentState
             continue
         # The symptom is in play. If the reply names ANY specialty that
         # could treat it, that's fine.
-        if any(w in folded for w in ok_specialty_words):
+        if any(w in offer_text for w in ok_specialty_words):
             return False
         return True
 
