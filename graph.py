@@ -1960,6 +1960,72 @@ def _build_appointment_display_directive(messages: list) -> str:
     )
 
 
+def _split_bilingual_greeting(text: str) -> Optional[dict]:
+    """Split a greeting template that is actually TWO greetings stapled
+    together - one full paragraph in English, one full paragraph in
+    Arabic (in either order) - into {"en": ..., "ar": ...}.
+
+    Some clients' `msg_unknown_fallback` is authored this way on
+    purpose, so the very first, language-unknown message can greet in
+    both languages at once. That is fine for a channel that truly
+    doesn't know the patient's language yet, but once this turn's
+    language IS known (`target_language`, from `_detect_target_language`
+    - here just "hi" is already enough), sending both halves puts two
+    languages in one message. See the MIXED-LANGUAGE GREETING GUARD in
+    `_run_agent` for the production failure this was written for.
+
+    Heuristic, deliberately simple: scan line by line, tracking which
+    script each line "commits" to (Arabic, Latin, or neither - a blank
+    line or an emoji-only line carries the previous line's script
+    forward). The first point where the running script flips is treated
+    as the boundary between the two paragraphs. Returns None when no
+    such flip is found (the template is single-language, or the mixing
+    is too interleaved to safely separate) - callers must treat that as
+    "could not split" and fall back to their existing behaviour, never
+    guess and risk cutting a real client template in half.
+    """
+
+    lines = (text or "").split("\n")
+
+    def _line_script(line: str) -> Optional[str]:
+        if _looks_arabic(line):
+            return "ar"
+        if _has_latin_letters(line):
+            return "en"
+        return None
+
+    scripts = [_line_script(line) for line in lines]
+
+    running = []
+    last_seen = None
+    for s in scripts:
+        if s:
+            last_seen = s
+        running.append(last_seen)
+
+    if not running or running[0] is None:
+        return None
+
+    first_lang = running[0]
+    split_at = None
+    for i, s in enumerate(running):
+        if s and s != first_lang:
+            split_at = i
+            break
+
+    if split_at is None:
+        # Single language throughout - nothing to split.
+        return None
+
+    part_a = "\n".join(lines[:split_at]).strip()
+    part_b = "\n".join(lines[split_at:]).strip()
+
+    if not part_a or not part_b:
+        return None
+
+    return {first_lang: part_a, ("ar" if first_lang == "en" else "en"): part_b}
+
+
 def _build_greeting(templates: dict, user_message: str, target_language: str) -> str:
     """
     Build the deterministic opening greeting for this conversation.
@@ -1988,6 +2054,23 @@ def _build_greeting(templates: dict, user_message: str, target_language: str) ->
 
     greeting = templates.get("msg_unknown_fallback")
 
+    # A BILINGUAL TEMPLATE IS SPLIT BEFORE ANYTHING ELSE RUNS.
+    #
+    # Some clients author `msg_unknown_fallback` as one English
+    # paragraph followed by one Arabic paragraph in a SINGLE field -
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): an
+    # English "hi" got the full English AND the full Arabic paragraph
+    # back, one after the other, in the very first message the clinic
+    # sent. Isolating the half that matches this turn's language here
+    # means the real client-authored wording (branding, service list,
+    # emoji, exact phrasing) is what goes out - not the generic
+    # hardcoded template below, which only happens to look right for
+    # clients whose English paragraph happens to match it.
+    if target_language in ("en", "ar"):
+        split = _split_bilingual_greeting(greeting)
+        if split and split.get(target_language):
+            greeting = split[target_language]
+
     # LANGUAGE COMES FIRST, BRANDING COMES WITH IT.
     #
     # An earlier version always used the configured `msg_unknown_fallback`
@@ -2002,9 +2085,11 @@ def _build_greeting(templates: dict, user_message: str, target_language: str) ->
     # Neither trade-off is necessary. The order is:
     #   1. A greeting the client authored in this language, if their
     #      config provides one (`msg_unknown_fallback_en`) - always wins.
-    #   2. The configured greeting, when it is already in the right
-    #      language for this conversation.
-    #   3. The standard template rendered in the conversation's language,
+    #   2. A bilingual configured greeting, already split above into
+    #      just this conversation's language.
+    #   3. The configured greeting, when it is already in the right
+    #      language for this conversation (single-language template).
+    #   4. The standard template rendered in the conversation's language,
     #      filled with THIS clinic's real agent name and clinic name -
     #      so it is branded, and it matches the structure, ordering and
     #      emoji of the Arabic one exactly. Same shape, different
@@ -4413,6 +4498,43 @@ def _apply_output_contract(
     return contracted
 
 
+def _safe_fallback_reply(state: AgentState, target_language: Optional[str]) -> str:
+    """The message sent instead of a reply that a verifier flagged TWICE
+    in the same turn (original draft, then its corrective retry) - see
+    the zero-tolerance fallback in the verifier loop below.
+
+    Deliberately generic and deliberately NOT run back through the
+    verifier table or the LLM: the whole point is a reply that cannot
+    itself contain an invented doctor, branch, availability claim, etc.,
+    because it names none of them. Prefers the clinic's own authored
+    `msg_On_failure` wording (same field main.py falls back to for an
+    empty reply) so the voice stays consistent with the rest of the
+    conversation, but picks a plain English default over an Arabic
+    template when the conversation itself is in English, rather than
+    switching languages on the one message where the patient most needs
+    clarity."""
+
+    templates = state.get("templates") or {}
+    authored = (templates.get("msg_On_failure") or "").strip()
+
+    is_english = (target_language or "").strip().lower().startswith("en")
+
+    if authored and not is_english:
+        return authored
+    if authored and is_english:
+        # An authored template exists but the conversation is in
+        # English - only reuse it if it looks like it's already
+        # written in English (avoids answering an English question
+        # with an Arabic-only failure template).
+        has_arabic = any("\u0600" <= ch <= "\u06FF" for ch in authored)
+        if not has_arabic:
+            return authored
+
+    if is_english:
+        return "Sorry, I ran into a technical issue just now - could you please try that again? 🌷"
+    return "عذرًا، حصلت مشكلة تقنية. ممكن تبعت رسالتك تاني؟ 🌷"
+
+
 # ==========================================================
 # The reply verifiers, as data
 # ==========================================================
@@ -4483,6 +4605,12 @@ _REPLY_VERIFIERS = (
         lambda reply, state: _selected_slot_correction_directive(reply, state),
         "reply asked for the appointment time, but a slot has already been locked in "
         "via select_appointment_slot for this booking",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_reasks_day_patient_already_named(reply, state),
+        lambda reply, state: _DAY_ALREADY_NAMED_CORRECTION_DIRECTIVE,
+        "reply re-asked which day, but the patient's own last message already named "
+        "a day matching one in the just-shown day list",
     ),
     (
         lambda reply, state, agent_name: _reply_asks_for_a_phone_already_known(reply, state),
@@ -6732,6 +6860,86 @@ _ASKS_FOR_SLOT_RE = re.compile(
 )
 
 
+_ASKS_WHICH_DAY_RE = re.compile(
+    r"أي\s*يوم|انهي\s*يوم|أنهي\s*يوم|اي\s*يوم|which\s*day"
+)
+
+
+def _reply_reasks_day_patient_already_named(reply_text: str, state: AgentState) -> bool:
+    """True when the reply asks the patient which day they want, while
+    their OWN latest message already named a weekday that matches one
+    of the days most recently remembered (from `list_available_days_
+    for_booking`) - AND the reply shows no times (so it genuinely is a
+    re-ask, not a legitimate "these times don't work, want another day"
+    follow-up after already showing that day's slots).
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient answered "الاثنين",
+    which the model correctly used to resolve which of two branches
+    they meant - but the reply then asked "أي يوم يناسبك للحجز؟" again,
+    re-showing the exact same day list, instead of extracting Monday's
+    from_date/to_date and calling `get_available_slots_for_booking`.
+    The patient had to type "الاثنين" a second time before the times
+    were finally shown.
+    """
+
+    if not reply_text or not _ASKS_WHICH_DAY_RE.search(_norm_ar(reply_text)):
+        return False
+
+    # If the reply already contains a numbered list of times (rather
+    # than days), this isn't the failure pattern - it's a normal times
+    # list that happens to also mention "day" in passing.
+    if re.search(r"صباح|مساء|am\b|pm\b|:\d{2}", reply_text, re.IGNORECASE):
+        return False
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return False
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    last_list = session.get("last_list") or {}
+    if last_list.get("entity_type") != "day":
+        return False
+
+    remembered_days = last_list.get("items") or []
+    if not remembered_days:
+        return False
+
+    last_human = ""
+    for m in reversed(state.get("messages") or []):
+        if getattr(m, "type", None) == "human":
+            last_human = _norm_ar(str(getattr(m, "content", "") or ""))
+            break
+
+    if not last_human:
+        return False
+
+    for day in remembered_days:
+        weekday_display = _norm_ar(str(day.get("weekday_display") or ""))
+        weekday_name_en = str(day.get("weekday_name") or "").strip().lower()
+        if weekday_display and weekday_display in last_human:
+            return True
+        if weekday_name_en and weekday_name_en in last_human.lower():
+            return True
+
+    return False
+
+
+_DAY_ALREADY_NAMED_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "THE DAY WAS ALREADY NAMED - DO NOT RE-ASK, SHOW THE TIMES\n"
+    "============================================================\n"
+    "Your previous draft asked the patient which day they want. They "
+    "already named a day, in their own last message, that matches one "
+    "of the days you had just listed. Do NOT ask which day again and do "
+    "NOT re-show the day list.\n\n"
+    "Take that day's from_date/to_date from the day list you already "
+    "have (do not recompute or guess it) and call "
+    "get_available_slots_for_booking for it right now, then show the "
+    "times in this same reply - exactly as STEP NB4 describes for "
+    "'when they pick one of the days you listed'.\n\n"
+)
+
+
 def _reply_asks_for_a_slot_already_locked_in(reply_text: str, state: AgentState) -> bool:
     """True when the reply asks the patient for the appointment time,
     while a slot has already been resolved via `select_appointment_slot`
@@ -7146,6 +7354,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                 if isinstance(call, dict)
             },
             agent_name=agent_name,
+            channel_phone=state.get("channel_phone"),
         )
 
     # ONE QUESTION PER MESSAGE - enforced here, not just asked for in the
@@ -7241,10 +7450,32 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                 continue
 
             if check(retry.content, state, agent_name):
+                # ZERO-TOLERANCE FALLBACK.
+                #
+                # Before this change, failing the SAME check twice (once
+                # on the original draft, once on the corrective retry)
+                # still ended with the original, already-flagged reply
+                # going out to the patient unmodified - the `continue`
+                # here fell through to the bottom of the loop with
+                # `normalized` untouched. CONFIRMED REAL PRODUCTION
+                # FAILURE: the branch-name verifier logged this exact
+                # "STILL failed after correction" error and the patient
+                # was sent the flagged reply anyway five seconds later.
+                #
+                # A verifier firing twice in a row means the model
+                # cannot self-correct this claim right now - the safer
+                # move is to never let an unverified, twice-flagged claim
+                # reach the patient at all, even if that means a generic
+                # "try again" instead of a fluent (but unverified) reply.
+                # A slightly worse turn is a much better outcome than a
+                # confidently wrong one.
                 logger.error(
-                    "agent[%s]: reply STILL failed the same check after correction (%s)",
+                    "agent[%s]: reply STILL failed the same check after correction (%s) - "
+                    "replacing with the safe fallback message rather than sending the "
+                    "twice-flagged reply",
                     agent_name, description,
                 )
+                normalized = _safe_fallback_reply(state, target_language)
                 continue
 
             logger.info("agent[%s]: corrected on retry (%s)", agent_name, description)
@@ -7280,8 +7511,61 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         first_user_message = state["messages"][0].content if state["messages"] else ""
         greeting = _build_greeting(state.get("templates") or {}, first_user_message, target_language or "ar")
 
-        if greeting and not _already_contains_greeting(response.content or "", greeting):
-            reply_content = response.content or ""
+        reply_so_far = response.content or ""
+
+        # MIXED-LANGUAGE GREETING GUARD.
+        #
+        # The reference-phrases section elsewhere in the system prompt
+        # tells the LLM to reproduce the clinic's configured greeting
+        # "EXACT... word for word" every time. Some clients' configured
+        # `msg_unknown_fallback` is itself bilingual - one English
+        # paragraph followed by one Arabic paragraph, written that way
+        # on purpose for the very first, language-unknown contact.
+        # Reproduced verbatim in a conversation whose language THIS turn
+        # already knows (target_language, from _detect_target_language),
+        # that puts both languages in the very first message the clinic
+        # ever sends.
+        #
+        # CONFIRMED REAL PRODUCTION FAILURE: medtown, session
+        # 201003365691+medtown2, 2026-08-30 - the patient's first
+        # message was the English word "hi"; the reply sent back was
+        # the full English paragraph immediately followed by the full
+        # Arabic paragraph, one after another in the same message.
+        #
+        # `_already_contains_greeting`'s signature match only confirms
+        # that the persona line for THIS conversation's language is
+        # present somewhere in the reply - it says nothing about
+        # whether the OTHER language's entire block also rode along, so
+        # a bilingual raw template slips past it undetected (the
+        # English signature line is genuinely in there; so is an entire
+        # second paragraph in Arabic). Detect that specific shape - both
+        # scripts present, and a reply too long to be an incidental
+        # word or two in the other language - and treat it as NOT
+        # correctly greeted yet, so the pure, single-language
+        # deterministic greeting below still replaces it instead of
+        # being skipped.
+        mixed_language_greeting = bool(
+            target_language in ("en", "ar")
+            and _looks_arabic(reply_so_far)
+            and _has_latin_letters(reply_so_far)
+            and len(reply_so_far) > 200
+        )
+        if mixed_language_greeting:
+            logger.warning(
+                "agent[%s]: opening reply carried BOTH an Arabic and an English "
+                "block while target_language=%s - replacing with the pure "
+                "single-language deterministic greeting instead of sending both. "
+                "Original: %r",
+                agent_name, target_language, reply_so_far,
+            )
+
+        if greeting and (mixed_language_greeting or not _already_contains_greeting(reply_so_far, greeting)):
+            # A reply already flagged as bilingual is discarded entirely
+            # rather than kept as "extra content" underneath the
+            # corrected greeting - it is, by definition, a duplicate of
+            # the greeting itself (in the wrong language too), not
+            # additional substance the patient asked for.
+            reply_content = "" if mixed_language_greeting else reply_so_far
 
             # THE REFUSAL NEVER RIDES ALONG WITH THE GREETING.
             #
@@ -7315,6 +7599,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     updates["messages"] = [response]
 
     return updates
+
 
 
 def agent(state: AgentState) -> dict:
