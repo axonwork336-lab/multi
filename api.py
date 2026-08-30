@@ -18,6 +18,7 @@ need a try/except around a tool call.
 """
 
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -28,6 +29,8 @@ from config import (
     AUTHENTICA_FALLBACK_EMAIL,
     AUTHENTICA_TEMPLATE_ID,
     CLIENT_ID_HEADER,
+    DOCTORS_API_MAX_RETRIES,
+    DOCTORS_API_RETRY_BACKOFF_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
 )
 
@@ -324,22 +327,73 @@ def _post_json(url: str, payload: dict, client_id: Optional[str] = None, languag
 
     logger.debug("POST %s payload=%s", url, payload)
 
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers=_headers(client_id=client_id, language=language),
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.Timeout:
-        logger.warning("Request timed out: %s", url)
-        return _result(False, error="timeout")
-    except requests.RequestException as exc:
-        logger.exception("Request failed: %s", url)
-        return _result(False, error=str(exc))
+    # Retries ONLY cover failure modes that are plausibly transient on
+    # this specific endpoint (timeout, connection error, 5xx) - see the
+    # DOCTORS_API_MAX_RETRIES comment in config.py. A 4xx is a real,
+    # reproducible problem with THIS request (bad payload, bad auth,
+    # wrong path) and retrying it would just get the same 4xx back
+    # slower, so those still fall straight through to the existing
+    # handling below with no retry loop involved.
+    max_attempts = max(1, DOCTORS_API_MAX_RETRIES + 1)
+    response = None
+    last_timeout = False
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        last_timeout = False
+        last_exc = None
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=_headers(client_id=client_id, language=language),
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except requests.Timeout:
+            last_timeout = True
+            response = None
+        except requests.RequestException as exc:
+            last_exc = exc
+            response = None
+
+        if response is not None and response.status_code < 500:
+            # Success or a non-retryable 4xx - stop retrying either way.
+            break
+
+        is_last_attempt = attempt == max_attempts
+        if response is not None:
+            logger.error(
+                "Doctors/Specialties API server error: %s status=%s body=%s (attempt %d/%d%s)",
+                url, response.status_code, response.text[:1000], attempt, max_attempts,
+                "" if is_last_attempt else ", retrying",
+            )
+        elif last_timeout:
+            logger.warning(
+                "Request timed out: %s (attempt %d/%d%s)",
+                url, attempt, max_attempts, "" if is_last_attempt else ", retrying",
+            )
+        else:
+            logger.warning(
+                "Request failed: %s error=%s (attempt %d/%d%s)",
+                url, last_exc, attempt, max_attempts, "" if is_last_attempt else ", retrying",
+            )
+
+        if is_last_attempt:
+            break
+
+        # Exponential backoff (0.5s, 1s, 2s, ...) - a short pause is
+        # enough to ride out the sub-second blip this endpoint is known
+        # to have, without holding up the patient for long if it's a
+        # real outage.
+        time.sleep(DOCTORS_API_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+    if response is None:
+        if last_timeout:
+            return _result(False, error="timeout")
+        return _result(False, error=str(last_exc) if last_exc else "request_failed")
 
     if response.status_code >= 500:
-        logger.error("Doctors/Specialties API server error: %s status=%s body=%s", url, response.status_code, response.text[:1000])
+        logger.error("Doctors/Specialties API server error: %s status=%s body=%s - giving up after %d attempt(s)", url, response.status_code, response.text[:1000], max_attempts)
         return _result(False, response.status_code, error="server_error")
 
     if response.status_code == 404:
