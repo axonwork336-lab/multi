@@ -4061,6 +4061,111 @@ _AVAILABILITY_CORRECTION_DIRECTIVE = (
 
 
 # ==========================================================
+# Fabricated "no doctor/branch by that name" stop verifier
+# ==========================================================
+#
+# WHY THIS EXISTS: STEP C1's PRIORITY check tells the model to extract
+# a doctor/branch name from the patient's very first complaint message
+# and verify it via `match_entity_info` before anything else. That
+# instruction only applies when a name was ACTUALLY given - but the
+# model can misfire it on a message that names nobody at all, invent
+# some fragment of the message as if it were a name, get a real
+# "not_matched" back for that invented fragment, and then correctly
+# (from its own point of view) say the fixed "we couldn't find a
+# doctor by that name" apology and stop the complaint entirely.
+#
+# CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): the patient's
+# entire message was "عاوزه اشتكي علشان الدواء اتوصفلي غلط" ("I want to
+# complain because the medication I was prescribed was wrong") - no
+# doctor name, no word for "doctor" even appears in it - and the reply
+# was the fixed STOP apology: "نعتذر، ما لقينا دكتور بهذا الاسم في
+# مستشفى ميدتاون الطبية، لذلك ما نقدر نكمل تسجيل الشكوى..." The patient
+# had said nothing that could be mistaken for a name; the flow was
+# ended over a lookup the situation never called for.
+#
+# This is deliberately narrow: it only fires when the STOP apology is
+# used and NEITHER of the two legitimate ways to reach it are present -
+# (a) the assistant had just asked STEP C2b's own "تحت أي دكتور
+# بالظبط؟"/"في أنهي فرع بالظبط؟" question, so any answer plausibly
+# names one even without repeating the word itself, or (b) the
+# patient's own message contains a recognizable doctor/branch cue word
+# at all. Both are treated as "there was something to check" and left
+# alone; only the case with neither is flagged.
+
+_COMPLAINT_STOP_APOLOGY_RE = re.compile(
+    r"ما\s*لقينا\s*(دكتور|دكتوره|فرعا?)\s*بهذا\s*الاسم"
+)
+
+_ASKED_WHICH_DOCTOR_OR_BRANCH_RE = re.compile(
+    r"تحت\s*أي\s*دكتور\s*بالظبط|في\s*أنهي\s*فرع\s*بالظبط|"
+    r"which\s*doctor\s*exactly|which\s*branch\s*exactly"
+)
+
+_DOCTOR_CUE_WORD_RE = re.compile(r"دكتور|دكتوره|د\.|طبيب|doctor")
+_BRANCH_CUE_WORD_RE = re.compile(r"فرع|branch")
+
+
+def _reply_fabricates_doctor_not_found_stop(reply_text: str, state: AgentState) -> bool:
+    match = _COMPLAINT_STOP_APOLOGY_RE.search(reply_text or "")
+    if not match:
+        return False
+
+    is_branch = match.group(1).startswith("فرع")
+    cue_re = _BRANCH_CUE_WORD_RE if is_branch else _DOCTOR_CUE_WORD_RE
+
+    messages = state.get("messages") or []
+
+    last_human_text = ""
+    prior_ai_text = ""
+    seen_human = False
+    for m in reversed(messages):
+        mtype = getattr(m, "type", None)
+        if mtype == "human" and not seen_human:
+            last_human_text = str(getattr(m, "content", "") or "")
+            seen_human = True
+            continue
+        if mtype == "ai" and seen_human:
+            content = str(getattr(m, "content", "") or "").strip()
+            if content:
+                prior_ai_text = content
+                break
+
+    # Legitimate case (a): the assistant had just explicitly asked which
+    # doctor/branch, so this answer plausibly names one.
+    if _ASKED_WHICH_DOCTOR_OR_BRANCH_RE.search(prior_ai_text):
+        return False
+
+    # Legitimate case (b): the patient's own message contains a
+    # recognizable doctor/branch cue word somewhere.
+    if cue_re.search(last_human_text):
+        return False
+
+    return True
+
+
+_DOCTOR_NOT_FOUND_STOP_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "YOU STOPPED THE COMPLAINT OVER A NAME THAT WAS NEVER GIVEN - REWRITE\n"
+    "============================================================\n"
+    "Your previous draft said no doctor/branch by that name could be "
+    "found and stopped the complaint - but the patient's own message "
+    "does not actually name a doctor or a branch, and you had not just "
+    "asked them which one they meant. This means a name was invented "
+    "(from the message itself, or from elsewhere) and checked against "
+    "`match_entity_info` when there was nothing real to check.\n\n"
+    "This complaint is NOT about a specific doctor or branch unless the "
+    "patient actually said one. Continue the COMPLAINT FLOW normally: "
+    "if their message already describes what went wrong, thank them and "
+    "ask if there's anything else to add (STEP C1b) - do not ask "
+    "'which doctor?' or 'which branch?' unless they raise one "
+    "themselves. Do not call `match_entity_info` again unless they "
+    "actually name someone.\n\n"
+    "Rewrite the reply now, continuing the complaint flow instead of "
+    "stopping it.\n\n"
+)
+
+
+# ==========================================================
 # Fabricated "your complaint was filed" verifier
 # ==========================================================
 #
@@ -4718,6 +4823,12 @@ _REPLY_VERIFIERS = (
         lambda reply, state: _COMPLAINT_CORRECTION_DIRECTIVE,
         "reply confirmed a complaint was filed but send_complaint_email was never "
         "called successfully in this conversation",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_fabricates_doctor_not_found_stop(reply, state),
+        lambda reply, state: _DOCTOR_NOT_FOUND_STOP_CORRECTION_DIRECTIVE,
+        "reply stopped the complaint over a doctor/branch name that the patient "
+        "never actually gave",
     ),
     (
         lambda reply, state, agent_name: _reply_fabricates_handoff(reply, state),
