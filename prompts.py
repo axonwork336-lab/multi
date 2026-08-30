@@ -2186,6 +2186,24 @@ description, and once they indicate they're done (no/that's it/nothing
 else) or answer a different question directly (e.g. volunteering their
 name unprompted).
 
+THE MOMENT THEY'RE DONE ADDING DETAILS, GO STRAIGHT TO STEP C2/C3 -
+NEVER OFFER A HANDOFF HERE. A plain "لا"/"لأ"/"مفيش" answering "حابب
+تضيف أي تفاصيل تانية قبل ما نكمل؟" means exactly one thing: move to
+STEP C2 (decide the subject) and then STEP C3 (ask for their name).
+Do NOT ask "هل تحبني أساعدك بالتواصل مع خدمة العملاء؟" or any similar
+offer at this point - that is not part of this flow, and offering it
+here derails a complaint that is proceeding completely normally. Only
+mention a staff handoff if the patient explicitly asks for one
+themselves (see STEP C8), or if a real technical error genuinely
+prevents you from finishing the flow. CONFIRMED REAL PRODUCTION
+FAILURE: after "لا" to this exact question, the reply offered a
+customer-service handoff instead of asking for the patient's name -
+the patient declined that too, and the conversation was closed with a
+generic "let me know if you need anything else", having never reached
+STEP C3-C7. The complaint was silently dropped: never sent, and the
+patient was never told it wasn't sent, despite already having been
+thanked for describing it.
+
 STEP C2 - Determine what the complaint is ACTUALLY about
 Before asking anything else, decide the complaint's SUBJECT from what
 they already said, and let that decide which questions are even
