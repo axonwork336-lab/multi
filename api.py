@@ -99,6 +99,73 @@ def _headers(client_id: Optional[str] = None, language: Optional[str] = None) ->
 # Guest Bookings API
 # ==========================================================
 
+def _request_with_retry(method: str, url: str, **kwargs):
+    """Shared retry loop for every outbound call in this module (POST/PUT
+    alike), so a slow-but-eventually-alive upstream gets the same patience
+    everywhere - not just on the Doctors/Specialties endpoint that
+    originally motivated this.
+
+    Retries ONLY cover failure modes that are plausibly transient
+    (timeout, connection error, 5xx) - see the DOCTORS_API_MAX_RETRIES
+    comment in config.py. A 4xx is a real, reproducible problem with THIS
+    request and retrying it would just get the same 4xx back slower, so
+    those are returned immediately with no retry loop involved.
+
+    Returns (response_or_None, last_was_timeout, last_exception).
+    Callers treat `response is None` as "never got a response at all"
+    and fall back to the existing timeout/exception handling; a non-None
+    response (even a 4xx/5xx) is handled by the caller's normal
+    status-code branches exactly as before.
+    """
+
+    max_attempts = max(1, DOCTORS_API_MAX_RETRIES + 1)
+    response = None
+    last_timeout = False
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        last_timeout = False
+        last_exc = None
+        try:
+            response = requests.request(method, url, timeout=REQUEST_TIMEOUT_SECONDS, **kwargs)
+        except requests.Timeout:
+            last_timeout = True
+            response = None
+        except requests.RequestException as exc:
+            last_exc = exc
+            response = None
+
+        if response is not None and response.status_code < 500:
+            break
+
+        is_last_attempt = attempt == max_attempts
+        if response is not None:
+            logger.error(
+                "%s %s server error status=%s (attempt %d/%d%s)",
+                method.upper(), url, response.status_code, attempt, max_attempts,
+                "" if is_last_attempt else ", retrying",
+            )
+        elif last_timeout:
+            logger.warning(
+                "Request timed out: %s %s (attempt %d/%d%s)",
+                method.upper(), url, attempt, max_attempts,
+                "" if is_last_attempt else ", retrying",
+            )
+        else:
+            logger.warning(
+                "Request failed: %s %s error=%s (attempt %d/%d%s)",
+                method.upper(), url, last_exc, attempt, max_attempts,
+                "" if is_last_attempt else ", retrying",
+            )
+
+        if is_last_attempt:
+            break
+
+        time.sleep(DOCTORS_API_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+    return response, last_timeout, last_exc
+
+
 def get_bookings_by_ref(base_url: str, ref_number: str, language: Optional[str] = None, client_id: Optional[str] = None) -> dict:
     """POST {base_url}/api/GuestBookings/GetList with bookingRefNum.
 
@@ -143,19 +210,16 @@ def get_bookings_by_phone(
 def _post_bookings(url: str, payload: dict, language: Optional[str], client_id: Optional[str]) -> dict:
     logger.debug("POST %s payload=%s", url, payload)
 
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers=_headers(client_id=client_id, language=language),
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.Timeout:
-        logger.warning("Booking lookup timed out: %s", url)
-        return _result(False, error="timeout")
-    except requests.RequestException as exc:
+    response, last_timeout, last_exc = _request_with_retry(
+        "post", url, json=payload, headers=_headers(client_id=client_id, language=language),
+    )
+
+    if response is None:
+        if last_timeout:
+            logger.warning("Booking lookup timed out: %s", url)
+            return _result(False, error="timeout")
         logger.exception("Booking lookup request failed: %s", url)
-        return _result(False, error=str(exc))
+        return _result(False, error=str(last_exc) if last_exc else "request_failed")
 
     if response.status_code >= 500:
         logger.error("GuestBookings API server error: %s status=%s body=%s", url, response.status_code, response.text[:500])
@@ -204,18 +268,16 @@ def cancel_booking_by_guid(base_url: str, booking_guid: str, client_id: Optional
 
     logger.debug("PUT %s", url)
 
-    try:
-        response = requests.put(
-            url,
-            headers=_headers(client_id=client_id),
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.Timeout:
-        logger.warning("Cancel request timed out: %s", url)
-        return _result(False, error="timeout")
-    except requests.RequestException as exc:
+    response, last_timeout, last_exc = _request_with_retry(
+        "put", url, headers=_headers(client_id=client_id),
+    )
+
+    if response is None:
+        if last_timeout:
+            logger.warning("Cancel request timed out: %s", url)
+            return _result(False, error="timeout")
         logger.exception("Cancel request failed: %s", url)
-        return _result(False, error=str(exc))
+        return _result(False, error=str(last_exc) if last_exc else "request_failed")
 
     if response.status_code >= 500:
         return _result(False, response.status_code, error="server_error")
@@ -254,13 +316,13 @@ def authentica_send_otp(phone: str) -> dict:
     }
     headers = {"Accept": "application/json", "X-Authorization": AUTHENTICA_API_KEY}
 
-    try:
-        response = requests.post(url, headers=headers, data=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-    except requests.Timeout:
-        return _result(False, error="timeout")
-    except requests.RequestException as exc:
+    response, last_timeout, last_exc = _request_with_retry("post", url, headers=headers, data=payload)
+
+    if response is None:
+        if last_timeout:
+            return _result(False, error="timeout")
         logger.exception("Authentica send_otp failed")
-        return _result(False, error=str(exc))
+        return _result(False, error=str(last_exc) if last_exc else "request_failed")
 
     if response.status_code >= 400:
         return _result(False, response.status_code, error="send_otp_failed")
@@ -279,13 +341,13 @@ def authentica_verify_otp(phone: str, otp: str, email: str = "") -> dict:
     payload = {"otp": otp, "email": email, "phone": phone}
     headers = {"Accept": "application/json", "X-Authorization": AUTHENTICA_API_KEY}
 
-    try:
-        response = requests.post(url, headers=headers, data=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-    except requests.Timeout:
-        return _result(False, error="timeout")
-    except requests.RequestException as exc:
+    response, last_timeout, last_exc = _request_with_retry("post", url, headers=headers, data=payload)
+
+    if response is None:
+        if last_timeout:
+            return _result(False, error="timeout")
         logger.exception("Authentica verify_otp failed")
-        return _result(False, error=str(exc))
+        return _result(False, error=str(last_exc) if last_exc else "request_failed")
 
     if response.status_code >= 400:
         return _result(False, response.status_code, error="verify_otp_failed")
@@ -735,19 +797,16 @@ def _put_json(url: str, payload: dict, client_id: Optional[str] = None) -> dict:
 
     logger.info("PUT %s payload=%s", url, payload)
 
-    try:
-        response = requests.put(
-            url,
-            json=payload,
-            headers=_headers(client_id=client_id),
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.Timeout:
-        logger.warning("Request timed out: %s", url)
-        return _result(False, error="timeout")
-    except requests.RequestException as exc:
+    response, last_timeout, last_exc = _request_with_retry(
+        "put", url, json=payload, headers=_headers(client_id=client_id),
+    )
+
+    if response is None:
+        if last_timeout:
+            logger.warning("Request timed out: %s", url)
+            return _result(False, error="timeout")
         logger.exception("Request failed: %s", url)
-        return _result(False, error=str(exc))
+        return _result(False, error=str(last_exc) if last_exc else "request_failed")
 
     if response.status_code >= 500:
         logger.error("GuestBookings/Update server error: %s status=%s payload=%s body=%s", url, response.status_code, payload, response.text[:1000])
