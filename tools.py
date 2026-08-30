@@ -7193,6 +7193,19 @@ def request_human_handoff(
     return {"status": "handoff_requested"}
 
 
+# Cues that the patient is genuinely asking WHERE a branch is / how to
+# get there - as opposed to simply naming it (answering a branch
+# question during booking, a complaint, or anywhere else). Deliberately
+# covers both "address" wording and "how do I get there" wording, in
+# Arabic and English.
+_LOCATION_REQUEST_CUE_RE = re.compile(
+    r"عنوان|فين|وين|أين|اين|موقع|خريط[هة]|كيف\s*(?:أ|ا)وصل|"
+    r"ازاي\s*(?:أ|ا)روح|إزاي\s*(?:أ|ا)روح|طريقه\s*(?:ال)?وصول|"
+    r"location|address|map|direction|how\s*(?:do\s*i|to)\s*get\s*there|"
+    r"where\s*is"
+)
+
+
 @tool
 def share_branch_location(
     state: Annotated[AgentState, InjectedState],
@@ -7224,7 +7237,33 @@ def share_branch_location(
     and sends the actual map pin. Still give the patient the address in
     text in this same reply, exactly as usual.
 
-    Returns {"status": "location_requested", "branch_name": branch_name}."""
+    Returns {"status": "location_requested", "branch_name": branch_name}
+    when the patient's own latest message genuinely asked for the
+    location/address/directions.
+    {"status": "not_requested", "reason": "no_explicit_location_request"}
+    otherwise - NOTHING is signalled to n8n and no map pin is sent. This
+    is enforced here, not left to the docstring above alone.
+
+    CONFIRMED REAL PRODUCTION FAILURE: during the COMPLAINT flow's STEP
+    C5, the patient was asked "هل في فرع محدد حابة تسجلي الشكوى عليه؟"
+    and answered simply "فرع المنار" (naming the branch, no location
+    question at all) - and a map pin of that branch was sent anyway."""
+
+    latest_text = ""
+    for msg in reversed(state.get("messages") or []):
+        if getattr(msg, "type", None) == "human":
+            content = getattr(msg, "content", "")
+            latest_text = content if isinstance(content, str) else str(content or "")
+            break
+
+    if not _LOCATION_REQUEST_CUE_RE.search(latest_text):
+        logger.warning(
+            "share_branch_location: REFUSED for client_id=%s session_id=%s branch_name=%r - "
+            "the patient's latest message %r does not actually ask for a location/address, "
+            "so no map pin flag was raised",
+            state.get("client_id"), state.get("session_id"), branch_name, latest_text,
+        )
+        return {"status": "not_requested", "reason": "no_explicit_location_request"}
 
     logger.info(
         "share_branch_location: session_id=%s client_id=%s branch_name=%r",
