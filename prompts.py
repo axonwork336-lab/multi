@@ -1802,6 +1802,25 @@ jump straight to `list_available_days_for_booking` either. Instead:
      that fact only ever comes from `resolve_available_day` or
      `list_available_days_for_booking`'s actual result.
 
+     CRITICAL - DO NOT RE-ASK A DAY THE PATIENT ALREADY NAMED: in step
+     3's first case (they named only a day, and it resolved the branch
+     for you), the DAY is already settled - it was their own message,
+     not a pick from a list you had shown. You may still need to call
+     `list_available_days_for_booking` or `resolve_available_day` here
+     purely to obtain that day's real `from_date`/`to_date` (you cannot
+     compute a date yourself), but that call's result is for YOUR use
+     only in this case - do not turn its list back into a question like
+     "أي يوم يناسبك للحجز؟". The moment you have the matching day's
+     from_date/to_date, call `get_available_slots_for_booking`
+     immediately, in the SAME reply, exactly as STEP NB4 describes for
+     "when they pick one of the days you listed". CONFIRMED REAL
+     PRODUCTION FAILURE: the patient answered "الاثنين" (which also
+     resolved which branch they meant, since only one branch has a
+     Monday), and the reply re-listed the same days again and asked
+     which one they wanted - the exact day they had just named -
+     instead of showing that Monday's available times. They had to
+     type "الاثنين" a second time before the times finally appeared.
+
 Equally, never jump straight to days/times for a doctor who works at
 several branches without doing the above first: the times differ per
 branch, so a day picked before the branch is settled can turn out not
