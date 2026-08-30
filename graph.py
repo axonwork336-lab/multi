@@ -2792,6 +2792,18 @@ _NOT_A_BRANCH_NAME = {
     # name, forcing a pointless correction retry over a perfectly
     # accurate reply.
     "واحد", "واحده", "واحدة", "اثنين", "اثنان", "تلاته", "ثلاثة", "التالي",
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): "حابب
+    # تحجز في أنهي فرع وانهي يوم؟" ("which branch and which day would
+    # you like?") was parsed as a branch literally named "وانهي يوم" -
+    # the second question word ("وانهي"/"which... and") landed right
+    # after "فرع" because this is a compound question (branch AND day),
+    # a shape none of the entries above were written to catch. The
+    # reply was 100% correct (both real branches it named earlier in
+    # the same message were already known) and still got discarded and
+    # replaced with a generic error after two failed correction
+    # retries.
+    "اني", "أني", "انهي", "أنهي", "وانهي", "وأنهي", "اي", "أي", "وأي", "واي",
+    "يوم", "ايه", "إيه",
 }
 
 _NOT_A_BRANCH_NAME_NORM = {tools._normalize_arabic(w) for w in _NOT_A_BRANCH_NAME}
@@ -3977,7 +3989,19 @@ def _reply_recommends_medication(reply_text: str, state: AgentState) -> bool:
     return bool(_MEDICATION_MENTION_RE.search(_norm_ar(reply_text)))
 
 
-_DOCTOR_ESTABLISHING_TOOLS = ("find_available_doctors", "match_entity_for_booking")
+_DOCTOR_ESTABLISHING_TOOLS = (
+    "find_available_doctors", "match_entity_for_booking",
+    # RESCHEDULE establishes its current doctor differently than NEW
+    # BOOKING does - by looking up the existing appointment's own
+    # doctor, not by searching/matching a name. Without this, a fresh
+    # `lookup_appointment` for a second, different booking later in the
+    # same session does not reset the scope, and a stale availability
+    # lookup for the FIRST doctor keeps satisfying this check for the
+    # second one - the exact class of bug this scoping was added to
+    # close, just reachable through reschedule's own doctor-resolution
+    # path instead of booking's.
+    "lookup_appointment",
+)
 
 
 def _reply_denies_availability_without_lookup(reply_text: str, state: AgentState) -> bool:
