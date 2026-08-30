@@ -7780,6 +7780,21 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         # a visibly different shape from every other reply, which is
         # exactly the inconsistency this project exists to remove. One
         # loop, one finaliser, one behaviour.
+        #
+        # `used_safe_fallback` tracks whether `normalized` ends this
+        # block as the generic zero-tolerance fallback message (see
+        # `_safe_fallback_reply` below) rather than a real answer - the
+        # opening-greeting step further down must never staple a
+        # greeting UNDER this message the way it deliberately does for
+        # everything else, for the same reason it already excludes scope
+        # refusals: "حدث خطأ تقني" is not a substantive reply the
+        # greeting should introduce, it is this turn failing outright.
+        # CONFIRMED REAL PRODUCTION FAILURE: medtown, session
+        # 201158877175+medtown2, 2026-08-30 11:30 - the fallback message
+        # was sent glued underneath the full opening greeting/menu,
+        # because nothing downstream distinguished it from a normal
+        # first reply.
+        used_safe_fallback = False
         for check, correction_directive, description in _REPLY_VERIFIERS:
             if not check(normalized, state, agent_name):
                 continue
@@ -7874,6 +7889,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     agent_name, description,
                 )
                 normalized = _safe_fallback_reply(state, target_language)
+                used_safe_fallback = True
                 continue
 
             logger.info("agent[%s]: corrected on retry (%s)", agent_name, description)
@@ -7983,6 +7999,21 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                 logger.warning(
                     "agent[%s]: the scope refusal was attached to the opening greeting - "
                     "dropped. A greeting is in scope. Original: %r",
+                    agent_name, reply_content,
+                )
+                reply_content = ""
+
+            if reply_content and used_safe_fallback:
+                # See `used_safe_fallback` above - a twice-flagged reply
+                # that got swapped for the generic technical-error
+                # message is not a real answer to staple a greeting
+                # onto; drop it here exactly as scope refusals are
+                # dropped just above, so the patient's very first
+                # message from the clinic isn't "hi! here's what I can
+                # help with... 😕 technical error, try again?".
+                logger.warning(
+                    "agent[%s]: the zero-tolerance fallback message was about to be "
+                    "attached to the opening greeting - dropped. Original: %r",
                     agent_name, reply_content,
                 )
                 reply_content = ""
