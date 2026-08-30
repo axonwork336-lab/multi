@@ -3135,6 +3135,19 @@ def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
             # Times, dates, weekdays - a numbered list is not always a
             # list of people. See _NON_DOCTOR_LIST_ITEM_RE.
             continue
+        # A branch listing also uses "1️⃣ <name>" formatting, and a bare
+        # branch name (e.g. "المنار") passes the person-name shape test
+        # just as easily as a real doctor name does. Branch entries are
+        # followed by an address line ("العنوان: ..."), which no doctor
+        # entry ever has - use that as the disambiguator so branch lists
+        # don't get misread as an invented doctor roster.
+        # CONFIRMED REAL FALSE POSITIVE (medtown, 2026-08-30): a 2-branch
+        # list ("1️⃣ المنار / العنوان: ...", "2️⃣ النزهة / العنوان: ...")
+        # was rejected twice as invented doctors, forcing the generic
+        # fallback error message to go out instead of a valid answer.
+        lookahead = reply_text[match.end():match.end() + 120]
+        if "العنوان" in lookahead:
+            continue
         candidate = _norm_ar(raw_candidate)
         # Substring either way: tool results carry titles and suffixes
         # the reply trims ("د. طه مبروك" vs "طه مبروك — استشاري").
