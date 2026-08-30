@@ -4166,6 +4166,105 @@ _DOCTOR_NOT_FOUND_STOP_CORRECTION_DIRECTIVE = (
 
 
 # ==========================================================
+# Complaint derailed into a handoff offer instead of STEP C3 verifier
+# ==========================================================
+#
+# WHY THIS EXISTS: STEP C1b says that once the patient answers "لا"/
+# "that's it" to "حابب تضيف أي تفاصيل تانية قبل ما نكمل؟", the flow
+# moves on to STEP C2/C3 (determine the subject, then ask the
+# patient's name) - collecting toward STEP C7's actual send. Nothing in
+# the flow says to offer a human-handoff detour at that exact point,
+# and STEP C8 only directs the PATIENT to ask for "موظف" themselves if
+# THEY want that - it is not something to proactively offer mid-flow.
+#
+# CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): after "لا"
+# to the STEP C1b question, the reply asked "هل تحبني أساعدك في
+# التواصل مع أحد ممثلي خدمة العملاء مباشرةً؟" instead of asking for the
+# patient's name - and when the patient said "لا" to THAT too, the
+# conversation was simply closed with "شكرًا لك... هل تحتاج شيء ثاني
+# الآن؟". The complaint was never sent, the patient was never told it
+# wasn't sent, and STEP C3-C7 (name, phone, branch, confirm, send) were
+# never reached at all - the complaint was silently dropped while the
+# patient believed it had been handled ("شكرًا للتوضيح" had already
+# been said earlier).
+
+_MORE_DETAILS_QUESTION_RE = re.compile(
+    r"حابب\s*تضيف\s*اي\s*تفاصيل\s*تانيه|اي\s*تفاصيل\s*تانيه\s*قبل\s*ما\s*نكمل|"
+    r"anything\s*else\s*(?:you.?d\s*like\s*to\s*)?add"
+)
+
+_PLAIN_NEGATIVE_RE = re.compile(
+    r"^\s*(?:لا+|لأ+|مفيش|ولا\s*حاجه|no+|nope|nothing)\b", re.IGNORECASE
+)
+
+_OFFERS_CUSTOMER_SERVICE_HANDOFF_RE = re.compile(
+    r"(?:أساعدك|تحب|تحبني)[^.\n؟?]{0,25}(?:التواصل|أوصلك|أحولك)[^.\n؟?]{0,25}"
+    r"(?:ممثل|موظف|خدمه\s*العملاء)|"
+    r"customer\s*service\s*representative"
+)
+
+
+def _reply_derails_complaint_into_handoff_offer(reply_text: str, state: AgentState) -> bool:
+    if not reply_text or not _OFFERS_CUSTOMER_SERVICE_HANDOFF_RE.search(_norm_ar(reply_text)):
+        return False
+
+    messages = state.get("messages") or []
+
+    last_human_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "human":
+            last_human_idx = i
+            break
+
+    if last_human_idx is None:
+        return False
+
+    last_human_text = str(getattr(messages[last_human_idx], "content", "") or "").strip()
+    folded_last_human = _norm_ar(last_human_text)
+    if not _PLAIN_NEGATIVE_RE.match(folded_last_human):
+        return False
+
+    # If the patient's own message ALSO separately, explicitly asks for
+    # a person ("عايز اتكلم مع موظف حقيقي"), the offer isn't a
+    # derailment - it's a normal response to a genuine request. Only
+    # the bare-decline case (nothing more than "لا"/"nope") is the
+    # confirmed failure pattern this guard exists for.
+    if any(root in folded_last_human for root in tools._EXPLICIT_HUMAN_REQUEST_ROOTS):
+        return False
+
+    prior_ai_text = ""
+    for i in range(last_human_idx - 1, -1, -1):
+        m = messages[i]
+        if getattr(m, "type", None) == "ai":
+            content = str(getattr(m, "content", "") or "").strip()
+            if content:
+                prior_ai_text = content
+                break
+
+    return bool(_MORE_DETAILS_QUESTION_RE.search(_norm_ar(prior_ai_text)))
+
+
+_COMPLAINT_HANDOFF_DERAIL_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "DO NOT OFFER A HANDOFF HERE - ASK FOR THE PATIENT'S NAME (STEP C3)\n"
+    "============================================================\n"
+    "Your previous draft offered to connect the patient with a customer "
+    "service representative, right after they said there was nothing "
+    "more to add to their complaint. Offering a handoff at this exact "
+    "point is not part of the COMPLAINT FLOW and derails a complaint "
+    "that was proceeding normally - the patient did not ask for a "
+    "human, and there has been no technical failure.\n\n"
+    "Continue the flow instead: decide the complaint's subject (STEP "
+    "C2), then ask ONLY for the patient's name if you don't already "
+    "have it for this complaint (STEP C3). Do not mention a staff "
+    "handoff at all unless the patient explicitly asks for one "
+    "themselves.\n\n"
+    "Rewrite the reply now, asking for the patient's name instead of "
+    "offering a handoff.\n\n"
+)
+
+
+# ==========================================================
 # Fabricated "your complaint was filed" verifier
 # ==========================================================
 #
@@ -4829,6 +4928,13 @@ _REPLY_VERIFIERS = (
         lambda reply, state: _DOCTOR_NOT_FOUND_STOP_CORRECTION_DIRECTIVE,
         "reply stopped the complaint over a doctor/branch name that the patient "
         "never actually gave",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_derails_complaint_into_handoff_offer(reply, state),
+        lambda reply, state: _COMPLAINT_HANDOFF_DERAIL_CORRECTION_DIRECTIVE,
+        "reply offered a customer-service handoff right after the patient said "
+        "there was nothing more to add to their complaint, instead of continuing "
+        "to STEP C3",
     ),
     (
         lambda reply, state, agent_name: _reply_fabricates_handoff(reply, state),
