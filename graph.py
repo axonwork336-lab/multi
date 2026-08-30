@@ -3493,10 +3493,25 @@ def _medical_reply_offers_unrelated_specialty(reply_text: str, state: AgentState
     # Split the RAW text into lines before normalizing: `_norm_ar`
     # collapses all whitespace (newlines included) into single spaces,
     # so splitting after it yields one line and the scoping is lost.
+    #
+    # A numbered doctor roster IS the offer, just spread across its own
+    # lines rather than living on the closing question line ("تحب تحجز
+    # عند أي واحد فيهم؟"). That closing line alone rarely repeats the
+    # specialty word, so scoping to _SPECIALTY_OFFER_RE lines only was
+    # throwing away the very lines that name the specialty being
+    # offered - the roster entries above it.
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): "1️⃣ ...
+    # · جراحة العظام\n2️⃣ ... · جراحة العظام\nتحب تحجز عند أي واحد
+    # فيهم؟" for a patient who said "وجع في عظام رجلي" - the roster
+    # lines correctly named جراحة العظام, but only the closing question
+    # matched _SPECIALTY_OFFER_RE, so the specialty word never reached
+    # `offer_text` and a completely correct referral was rejected twice.
+    _NUMBERED_LIST_LINE_RE = re.compile(r"^\s*(?:[1-9]\uFE0F?\u20E3|[1-9][\.\)])\s*")
     offer_text = "\n".join(
         normalized_line
         for normalized_line in (_norm_ar(line) for line in reply_text.splitlines())
         if _SPECIALTY_OFFER_RE.search(normalized_line)
+        or _NUMBERED_LIST_LINE_RE.match(normalized_line)
     ) or folded
 
     from langchain_core.messages import HumanMessage as _HumanMessage
@@ -5686,6 +5701,21 @@ def _build_negation_directive(messages: list) -> str:
         "Whatever that question offered - this doctor, this day, this "
         "time, this branch - they have declined it. Your reply must "
         "move AWAY from it:\n"
+        "  - Asked whether to book/continue on the SAME WHATSAPP NUMBER "
+        "(\"نكمل الحجز على نفس رقم الواتساب ده؟\" or similar) and they "
+        "said no -> this is NOT a refusal of the day/time/doctor, even "
+        "if a booking confirmation or an appointment detail sits right "
+        "above that question in the same message. Your entire reply "
+        "must ask for the alternative phone number (or booking "
+        "reference) - see the CHANNEL IDENTITY instructions elsewhere "
+        "in this prompt for the exact next step. Do NOT reopen the "
+        "day/time/doctor choice, and do NOT call any availability tool.\n"
+        "    CONFIRMED REAL PRODUCTION FAILURE: right after the Saturday "
+        "slot was confirmed, the assistant asked \"نكمل الحجز على نفس "
+        "رقم واتساب ده؟\"; the patient said \"لا\"; the reply then "
+        "offered a DIFFERENT day (Wednesday) instead of asking for the "
+        "other phone number - the day/time had already been settled and "
+        "was never what \"لا\" was answering.\n"
         "  - Offered a DAY or a TIME and they said no -> show the OTHER "
         "days/times that are actually available (call the tool again "
         "with the next offset), never the same one reworded.\n"
