@@ -4908,7 +4908,9 @@ def _apply_output_contract(
     return contracted
 
 
-def _safe_fallback_reply(state: AgentState, target_language: Optional[str]) -> str:
+def _safe_fallback_reply(
+    state: AgentState, target_language: Optional[str], failure_description: Optional[str] = None,
+) -> str:
     """The message sent instead of a reply that a verifier flagged TWICE
     in the same turn (original draft, then its corrective retry) - see
     the zero-tolerance fallback in the verifier loop below.
@@ -4916,18 +4918,90 @@ def _safe_fallback_reply(state: AgentState, target_language: Optional[str]) -> s
     Deliberately generic and deliberately NOT run back through the
     verifier table or the LLM: the whole point is a reply that cannot
     itself contain an invented doctor, branch, availability claim, etc.,
-    because it names none of them. Prefers the clinic's own authored
-    `msg_On_failure` wording (same field main.py falls back to for an
-    empty reply) so the voice stays consistent with the rest of the
-    conversation, but picks a plain English default over an Arabic
-    template when the conversation itself is in English, rather than
-    switching languages on the one message where the patient most needs
-    clarity."""
+    because it names none of them.
+
+    `failure_description` is the verifier's own `description` string (see
+    the reply-verifier table below) - used ONLY to pick which one of a
+    small set of PRE-WRITTEN, equally-safe messages to send. This never
+    lets the failed verifier's own content back into the reply; it's a
+    lookup key, not text that gets echoed. Before this, every twice-
+    flagged reply - a medical mismatch, a fabricated cancellation, an
+    unsent complaint confirmation, an invented appointment - all
+    collapsed into the same "حدث خطأ تقني" (technical issue) wording.
+    CONFIRMED CONFUSING IN PRACTICE: that phrasing tells the patient the
+    SYSTEM is broken, when the real situation is usually "the assistant
+    can't confidently answer this specific thing right now" - a
+    difference that changes what the patient should reasonably do next
+    (try again later vs. ask for a human). Categories below are chosen
+    to be actionable without naming any doctor/branch/date the failed
+    verifier flagged, so they stay just as safe as the generic message.
+
+    Prefers the clinic's own authored `msg_On_failure` wording (same
+    field main.py falls back to for an empty reply) so the voice stays
+    consistent with the rest of the conversation for the GENERIC case;
+    the category-specific messages below intentionally do NOT use
+    `msg_On_failure`, since a clinic only authors one failure message and
+    it's written for the generic case, not for e.g. "we can't confirm
+    your appointment" specifically. Picks a plain English default over
+    an Arabic template when the conversation itself is in English,
+    rather than switching languages on the one message where the patient
+    most needs clarity."""
+
+    is_english = (target_language or "").strip().lower().startswith("en")
+    desc = (failure_description or "").lower()
+
+    # Ordered so a more specific match wins over a more general one when
+    # a description could plausibly match more than one category.
+    _CATEGORY_MESSAGES = (
+        (
+            ("medical-guidance", "specialty that does not treat", "specialty catalogue"),
+            "معلش، مش قادرة أحدد لك التخصص الأنسب لحالتك بدقة كافية دلوقتي 🌷\n"
+            "أفضل حاجة إنك تتواصل مع فريقنا الطبي مباشرة يوجهوك صح. تحب أحولك لهم؟",
+            "Sorry, I can't confidently match your symptoms to the right "
+            "specialty just now 🌷\nIt's best to speak directly with our "
+            "medical team so they can guide you properly. Would you like "
+            "me to connect you with them?",
+        ),
+        (
+            ("fabricated appointment", "invents availability", "invented availability",
+             "no availability tool"),
+            "معلش، مش قادرة أتأكد من موعد فعلي متاح دلوقتي 🌷\n"
+            "ممكن نرجع نشوف الأيام والمواعيد المتاحة تاني من الأول؟",
+            "Sorry, I can't confirm a real available slot right now 🌷\n"
+            "Shall we look at the available days and times again from the "
+            "start?",
+        ),
+        (
+            ("cancellation without", "confirm cancelling", "offers cancellation without lookup"),
+            "معلش، مش لاقية حجز مؤكد بالمعلومات دي 🌷\n"
+            "ممكن تبعتلي رقم الحجز أو رقم الجوال المسجل بيه الحجز؟",
+            "Sorry, I can't find a confirmed booking with that information 🌷\n"
+            "Could you send me the booking reference or the phone number "
+            "the booking is under?",
+        ),
+        (
+            ("complaint was filed", "fabricates complaint submission"),
+            "معلش، مش قادرة أأكد تسجيل الشكوى فعلياً دلوقتي 🌷\n"
+            "حابب أحولك لفريق خدمة العملاء يتابعوها معاك مباشرة؟",
+            "Sorry, I can't confirm your complaint was actually filed yet "
+            "🌷\nWould you like me to connect you with our customer "
+            "service team so they can follow up directly?",
+        ),
+        (
+            ("branch had nothing available", "denies a branch", "branch denial"),
+            "معلش، حصل لبس عندي في معلومة الفرع 🌷\n"
+            "ممكن تأكدلي اسم الفرع تاني؟",
+            "Sorry, I mixed up the branch information 🌷\n"
+            "Could you confirm the branch name again?",
+        ),
+    )
+
+    for keys, ar_msg, en_msg in _CATEGORY_MESSAGES:
+        if any(key in desc for key in keys):
+            return en_msg if is_english else ar_msg
 
     templates = state.get("templates") or {}
     authored = (templates.get("msg_On_failure") or "").strip()
-
-    is_english = (target_language or "").strip().lower().startswith("en")
 
     if authored and not is_english:
         return authored
@@ -7954,7 +8028,7 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                     "twice-flagged reply",
                     agent_name, description,
                 )
-                normalized = _safe_fallback_reply(state, target_language)
+                normalized = _safe_fallback_reply(state, target_language, description)
                 used_safe_fallback = True
                 continue
 
