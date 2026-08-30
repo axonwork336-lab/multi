@@ -41,6 +41,7 @@ import os
 import sys
 import logging
 import re
+import ast
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -2900,16 +2901,44 @@ def _looks_like_a_person_name(candidate: str) -> bool:
 
 
 def _doctor_names_from_tools(state: AgentState) -> set:
-    """Every doctor name any tool result in this conversation returned."""
+    """Every doctor name any tool result in this conversation returned.
+
+    ROBUST TO SERIALIZATION FORMAT: a tool's dict return value normally
+    reaches here as valid double-quoted JSON (LangGraph's ToolNode tries
+    `json.dumps` first), but this project's OWN code elsewhere routinely
+    also checks tool-message content against a single-quoted Python
+    repr form (e.g. `"'status': 'sent'" in content`), confirming that
+    tool content is not reliably one format only in practice - a
+    fallback error path, an older serialization, or a differently-typed
+    return value can all produce it differently. `json.loads` alone
+    silently drops every tool result it cannot parse - and since
+    `known` being EMPTY makes this whole check stand down entirely (see
+    below), any parsing gap here doesn't just miss one name, it disables
+    the invented-doctor guard for the rest of the conversation.
+    `ast.literal_eval` is tried as a fallback specifically to close that
+    gap."""
 
     names = set()
 
     for msg in state.get("messages", []) or []:
         if getattr(msg, "type", None) != "tool":
             continue
-        try:
-            data = json.loads(msg.content)
-        except (ValueError, TypeError):
+
+        raw = getattr(msg, "content", None)
+
+        data = None
+        if isinstance(raw, (dict, list)):
+            data = raw
+        elif isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
+                try:
+                    data = ast.literal_eval(raw)
+                except (ValueError, SyntaxError, TypeError, MemoryError):
+                    data = None
+
+        if data is None:
             continue
 
         def _collect(node):
@@ -3072,13 +3101,21 @@ def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
         return []
 
     known = _doctor_names_from_tools(state)
-    if not known:
-        # No doctor data at all this conversation. A numbered list of
-        # people here is unbacked by definition, but staying silent is
-        # safer than guessing what the list is - other guards cover the
-        # no-tool-call case.
-        return []
 
+    # NOTE: `known` being empty is deliberately NOT treated as "nothing
+    # to check" any more. It used to return [] here on the reasoning
+    # that "other guards cover the no-tool-call case" - but no such
+    # guard actually exists, and this exact gap is what let a fully
+    # invented 4-doctor roster (covering four different specialties)
+    # through with zero tool activity anywhere in the turn. CONFIRMED
+    # REAL PRODUCTION FAILURE (medtown, 2026-08-30): the patient said
+    # "معرفوش" (I don't know [which doctor]) and got "أعرض لك الدكاترة
+    # المتاحين عندنا الحين" followed by four names and specialties, none
+    # of which any tool in this conversation had ever returned. With
+    # `known` empty, every person-like candidate below simply matches
+    # nothing in it and is correctly reported as invented - this is the
+    # SAME loop as the normal case, just with an empty comparison set
+    # instead of a special early exit.
     invented = []
     for match in _DOCTOR_MENTION_RE.finditer(reply_text):
         raw_candidate = match.group(1)
