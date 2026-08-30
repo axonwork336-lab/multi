@@ -107,6 +107,19 @@ def _latest_human_text_for_handoff_guard(state: AgentState) -> str:
     return ""
 
 
+def _latest_ai_text_before_handoff_guard(state: AgentState) -> str:
+    """The most recent AIMessage's raw text (the assistant's own last
+    turn) - used only to check whether a staff/customer-service handoff
+    was actually OFFERED before this turn, never to allow a handoff on
+    its own."""
+
+    for msg in reversed(state.get("messages") or []):
+        if getattr(msg, "type", None) == "ai":
+            content = getattr(msg, "content", "")
+            return content if isinstance(content, str) else str(content or "")
+    return ""
+
+
 # ==========================================================
 # Pure data helpers (unchanged in spirit from the old tools.py - these
 # are data transforms, not user-facing text, so they stay)
@@ -7176,6 +7189,39 @@ def request_human_handoff(
             "status": "not_requested",
             "reason": "complaint_word_without_explicit_human_request",
         }
+
+    # GENERAL CONSENT GATE (not tied to any one specific wording): the
+    # complaint-word guard above exists because a documented prose rule
+    # ("frustration is not agreement") was still not enough on its own
+    # once - the same reasoning applies to every OTHER way this tool
+    # could be called with patient_agreed=True on an inference rather
+    # than a real yes. Require the agreement to be grounded in
+    # something the code can actually see:
+    #   - the patient's own latest message explicitly names a person
+    #     ("موظف", "خدمة العملاء", "human agent"...), OR
+    #   - the assistant's OWN previous turn actually said one of those
+    #     same words - i.e. a handoff was genuinely offered, and this
+    #     turn's short "yes" is answering THAT offer.
+    # This is a heuristic, not a perfect parse of intent - it can still
+    # ask an extra confirming question in a genuinely-agreed edge case
+    # phrased outside these words, which is the safe direction to be
+    # wrong in for something that ends a patient's conversation.
+    if patient_agreed and not has_explicit_human_request:
+        latest_ai_text = _latest_ai_text_before_handoff_guard(state)
+        had_prior_offer = any(root in latest_ai_text for root in _EXPLICIT_HUMAN_REQUEST_ROOTS)
+        if not had_prior_offer:
+            logger.warning(
+                "request_human_handoff: BLOCKED BY GENERAL CONSENT GATE - patient_agreed=True "
+                "but the patient's latest message %r names no person explicitly, and the "
+                "assistant's own last turn %r did not offer a staff handoff either. Overriding "
+                "to not_requested rather than trusting an inferred consent. session_id=%s "
+                "client_id=%s original_reason=%r",
+                latest_text, latest_ai_text, state.get("session_id"), state.get("client_id"), reason,
+            )
+            return {
+                "status": "not_requested",
+                "reason": "consent_not_grounded_in_conversation",
+            }
 
     if not patient_agreed:
         # Fail closed: an unconfirmed handoff silently drops rather than
