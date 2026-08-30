@@ -3242,11 +3242,25 @@ _MEDICATION_MENTION_RE = re.compile(
     # these are deliberately loose. The confirmed production failure
     # spelled it "البارستامول" (no ي) - a stricter pattern missed it
     # entirely, which is exactly the failure mode to avoid here.
+    #
+    # DELIBERATELY EXCLUDES the bare generic noun "دواء"/"دوا" (just
+    # "medicine"/"medication" with no specific drug or class named).
+    # CONFIRMED REAL PRODUCTION FAILURE: a patient's own complaint was
+    # "الدواء اللي اتوصفلي غلط" (the medication I was prescribed was
+    # wrong) - a COMPLAINT ABOUT a medication, naming no drug at all -
+    # and every reply that went on to discuss that complaint (asking for
+    # details, summarizing it for confirmation, etc.) kept re-matching
+    # this pattern on the bare word "دواء", permanently blocking the
+    # entire medication-complaint flow into a generic fallback error.
+    # A specific drug NAME or a drug CLASS (بنادول, بروفين, مضاد حيوي,
+    # مسكن, ...) still means the assistant is naming/suggesting
+    # something to take, which is the actual safety concern this check
+    # exists for - the generic word "medicine" on its own does not.
     r"بنادول|باندول|بار[اي]?س?ي?تامول|باراس?ي?تامول|بروفين|بروفن|"
     r"اي?بوبروفين|إيبوبروفين|اسبرين|أسبرين|فولتارين|كتافلام|"
     r"اوجمنتين|أوجمنتين|زيرتك|كلاريتين|"
     r"مضاد\s*حيوي|خافض[^\n]{0,10}حرار|ادوي[هة][^\n]{0,15}حرار|"
-    r"مسكن|حبوب[^\n]{0,10}مسكن|دوا\b|دواء|علاج\s*من\s*(?:ال)?صيدلي|"
+    r"مسكن|حبوب[^\n]{0,10}مسكن|علاج\s*من\s*(?:ال)?صيدلي|"
     r"paracetamol|acetaminophen|panadol|ibuprofen|advil|tylenol|aspirin|"
     r"antibiotic|antihistamine|painkiller|analgesic|fever\s*reducer"
 )
