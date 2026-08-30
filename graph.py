@@ -3219,10 +3219,10 @@ _AVAILABILITY_TOOLS = (
 
 
 _AVAILABILITY_DENIAL_RE = re.compile(
-    r"ما\s*(?:في|فيه|ظهر|لقيت|لقينا)[^.\n؟?]{0,40}مواعيد|"
+    r"ما\s*(?:في|فيه|ظهر|لقيت|لقينا|عندي|عندنا|عنده|عندها)[^.\n؟?]{0,40}مواعيد|"
     r"مفيش[^.\n؟?]{0,40}مواعيد|"
     r"لا\s*(?:يوجد|توجد)[^.\n؟?]{0,40}مواعيد|"
-    r"مواعيد[^.\n؟?]{0,25}(?:متاحه|متاحة)?[^.\n؟?]{0,15}حاليا?\b[^.\n؟?]{0,15}(?:عند|مع)|"
+    r"مواعيد[^.\n؟?]{0,25}(?:متاحه|متاحة)?[^.\n؟?]{0,15}(?:حاليا?|الحين|هسه)\b[^.\n؟?]{0,15}(?:عند|مع)|"
     r"no\s+(?:available\s+)?(?:appointments?|slots?|availability)|"
     r"(?:doesn'?t|does\s+not)\s+have\s+(?:any\s+)?(?:available\s+)?(?:appointments?|slots?)"
 )
@@ -3940,10 +3940,13 @@ def _reply_recommends_medication(reply_text: str, state: AgentState) -> bool:
     return bool(_MEDICATION_MENTION_RE.search(_norm_ar(reply_text)))
 
 
+_DOCTOR_ESTABLISHING_TOOLS = ("find_available_doctors", "match_entity_for_booking")
+
+
 def _reply_denies_availability_without_lookup(reply_text: str, state: AgentState) -> bool:
     """True when the reply tells the patient a doctor has no available
-    appointments, while NO availability tool has run in this
-    conversation.
+    appointments, while NO availability tool has run for the CURRENTLY
+    discussed doctor.
 
     CONFIRMED REAL PRODUCTION FAILURE: the patient picked د. هشام عوض
     from position 1, `match_entity_for_booking` confirmed him - and the
@@ -3957,7 +3960,24 @@ def _reply_denies_availability_without_lookup(reply_text: str, state: AgentState
     `_reply_invents_availability` is the mirror image of this - it
     catches dates/times asserted with no tool behind them. Between them
     both directions are covered: you may not invent availability, and
-    you may not invent its absence."""
+    you may not invent its absence.
+
+    SCOPED TO THE CURRENT DOCTOR, NOT THE WHOLE CONVERSATION: an earlier
+    version accepted ANY availability-lookup tool call anywhere in the
+    conversation as satisfying this check - so once a real lookup had
+    happened for one doctor, a denial for a COMPLETELY DIFFERENT doctor
+    much later in the same session (a new search, a fresh
+    `find_available_doctors` result) went unflagged, because the bar
+    had already been satisfied by unrelated history. CONFIRMED REAL
+    PRODUCTION FAILURE (medtown, 2026-08-30): `find_available_doctors`
+    found "بدر تميمي" again for a fresh pediatrics search, the patient
+    agreed to book ("اه"), and the reply was "ما عندي مواعيد لدكتور بدر
+    تميمي الحين" with no availability tool called anywhere near that
+    turn - while an unrelated availability lookup from earlier in the
+    same long-running session (for whatever was being discussed back
+    then) was still sitting in the message history, silently satisfying
+    the old, unscoped check. Only lookups AFTER the doctor now being
+    discussed was most recently (re-)established count."""
 
     if not reply_text:
         return False
@@ -3965,7 +3985,16 @@ def _reply_denies_availability_without_lookup(reply_text: str, state: AgentState
     if not _AVAILABILITY_DENIAL_RE.search(_norm_ar(reply_text)):
         return False
 
-    for msg in state.get("messages", []) or []:
+    messages = state.get("messages", []) or []
+
+    last_establish_idx = None
+    for i, msg in enumerate(messages):
+        if getattr(msg, "name", None) in _DOCTOR_ESTABLISHING_TOOLS:
+            last_establish_idx = i
+
+    start_idx = last_establish_idx + 1 if last_establish_idx is not None else 0
+
+    for msg in messages[start_idx:]:
         if getattr(msg, "name", None) in _AVAILABILITY_LOOKUP_TOOLS:
             return False
 
