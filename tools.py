@@ -1267,6 +1267,16 @@ def list_specialties(state: Annotated[AgentState, InjectedState]) -> dict:
             return {"status": "no_bookable_specialties", "unstaffed_specialties": unstaffed_names}
         return {"status": "not_found"}
 
+    # CRITICAL: record the exact list, in the exact order, that the
+    # model is about to show - the same reason every other user-facing
+    # list in this file does this (see _remember_list). Before this,
+    # `list_specialties` was the one list-producing tool that never
+    # called it, so a bare "1" reply had nothing deterministic to
+    # resolve against and the model had to recall the specialty id from
+    # memory/context instead - see `_resolve_specialty_for_booking` and
+    # `find_available_doctors`'s `specialty_name` parameter.
+    _remember_list(state, "specialty", specialties)
+
     return {"status": "found", "specialties": specialties}
 
 
@@ -2003,6 +2013,56 @@ def _resolve_service_for_booking(state, service_text: str) -> Optional[dict]:
     return None
 
 
+def _resolve_specialty_for_booking(state, specialty_text: str) -> list:
+    """Resolve the patient's specialty text - a name ("طب الأطفال") or a
+    bare number picking from the specialty list they were just shown -
+    to a list of {"id", "name"} (a list because a resolved specialty is
+    still expanded to its siblings by `_expand_specialty_ids` later).
+
+    Checks the remembered specialty list first (that IS the list they
+    saw, so a positional pick can only mean one thing), then falls back
+    to fuzzy-matching the name against it. Returns [] when nothing
+    matches - the caller must not guess an id in that case.
+
+    WHY THIS EXISTS: every OTHER list this project shows (doctors,
+    branches, services, days, slots) is remembered via `_remember_list`
+    so a bare "1" resolves by POSITION against the exact list the
+    patient actually saw - specialties were the one list-producing tool
+    (`list_specialties`) that never called `_remember_list`, leaving the
+    model to recall the specialty id from memory/context instead of
+    from a deterministic lookup. CONFIRMED REAL PRODUCTION FAILURE
+    (medtown, 2026-08-30): the patient picked "1" for طب الأطفال
+    (position 1 in the list just shown), and the doctor returned for
+    that specialty was later shown with a schedule labelled "إستشارة
+    الطبيب العام" (general physician consultation) - the same class of
+    bug already fixed for days/branches/doctors elsewhere in this file,
+    now closed the same way here.
+    """
+
+    if not specialty_text:
+        return []
+
+    session = _get_booking_session(state.get("session_id"))
+    last_list = session.get("last_list") or {}
+
+    items = last_list.get("items") or [] if last_list.get("entity_type") == "specialty" else []
+
+    if not items:
+        return []
+
+    position = _extract_selection_number(specialty_text)
+    if position is not None and 1 <= position <= len(items):
+        chosen = items[position - 1]
+        if chosen.get("id"):
+            return [{"id": chosen["id"], "name": chosen.get("name")}]
+
+    match = _fuzzy_match(specialty_text, items, ["name"])
+    if match["result"] == "matched" and match["item"].get("id"):
+        return [{"id": match["item"]["id"], "name": match["item"].get("name")}]
+
+    return []
+
+
 _SPECIALTY_STOPWORDS = {"طب", "جراحه", "امراض", "علاج", "قسم", "عام", "عامه", "استشارات"}
 
 
@@ -2094,6 +2154,7 @@ def find_available_doctors(
     allow_broader_search: bool = True,
     all_branches: bool = False,
     service_name: str = "",
+    specialty_name: str = "",
 ) -> dict:
     """Find doctors who currently have a bookable service AND an available
     schedule slot within the next `days_ahead` days, across one or more
@@ -2108,6 +2169,22 @@ def find_available_doctors(
     أعرف التخصص المناسب الأول عشان أقدر أجيب لك الدكاترة المتاحين. تحب
     تبدأ بالتخصص ولا بالدكتور؟" - inventing a prerequisite that does not
     exist and restarting a flow that was two steps from done.
+
+    `specialty_name`: PREFER THIS over hand-typing `specialty_ids`
+    whenever the patient just answered a specialty list `list_specialties`
+    showed them - pass their raw text here (a bare number like "1", or
+    the name they typed). It is resolved against the EXACT list they
+    were just shown (by position first, then by fuzzy name match) and
+    turned into the correct id for you - you never need to recall or
+    retype an id from memory. Only fall back to typing `specialty_ids`
+    yourself when there is no specialty list in this conversation to
+    resolve against. Leave both empty when neither applies. CONFIRMED
+    REAL PRODUCTION FAILURE: a patient picked "1" from a freshly shown
+    specialty list, and the doctor found for the id then used turned
+    out to be scheduled under an unrelated, more generic service - the
+    same class of bug this parameter's remembered-list resolution
+    exists to prevent for every other list in this project (doctors,
+    branches, services, days).
 
     `branch_name`: optional. Pass the user's raw branch text when they've
     said which branch they want (e.g. "الدقي", "فرع زايد") - the branch
@@ -2196,6 +2273,32 @@ def find_available_doctors(
     # `specialty_ids` is optional - a service or a branch is enough on
     # its own. Normalized here so every use below is safe.
     specialty_ids = specialty_ids or []
+
+    # RESOLVE `specialty_name` (a bare number or raw text picking from
+    # the specialty list just shown) INTO ITS REAL ID.
+    #
+    # This is the specialty equivalent of the `service_name`/`branch_name`
+    # resolution just below - see `_resolve_specialty_for_booking` for
+    # why this exists (specialties were the one remembered-list omission
+    # in this project). Merged into any `specialty_ids` the model also
+    # passed directly, rather than replacing them, so both paths can be
+    # used together safely.
+    if specialty_name and specialty_name.strip():
+        resolved_specialties = _resolve_specialty_for_booking(state, specialty_name)
+        if resolved_specialties:
+            for item in resolved_specialties:
+                if item.get("id") and item["id"] not in specialty_ids:
+                    specialty_ids.append(item["id"])
+            logger.info(
+                "find_available_doctors: resolved specialty_name=%r -> %s",
+                specialty_name, [i.get("id") for i in resolved_specialties],
+            )
+        else:
+            logger.info(
+                "find_available_doctors: specialty_name=%r did not match the remembered "
+                "specialty list or any fuzzy candidate",
+                specialty_name,
+            )
 
     # Pull in sibling specialties registered under a near-identical name
     # ("طب الباطنة" / "باطنه عام"), so doctors filed under the other one
@@ -6698,6 +6801,81 @@ def find_best_doctor_in_specialty(
 # Complaint Agent (collect a complaint, email it via SMTP)
 # ==========================================================
 
+# EXPLICIT-CONFIRMATION GATE for send_complaint_email (STEP C6/C7).
+#
+# The field-presence check below (`missing`) was added after a
+# CONFIRMED REAL PRODUCTION FAILURE where the tool was called in the
+# same turn the patient first described their problem, with no
+# follow-up questions, no name, and no confirmation. It stops a
+# complaint with genuinely BLANK fields - but it does NOT stop a
+# complaint whose fields are all technically non-empty because they
+# were silently carried over from an EARLIER, unrelated part of the
+# same session (e.g. a patient's name captured minutes earlier while
+# booking an appointment), with STEP C6's summary-and-confirm question
+# never actually asked for THIS complaint.
+#
+# CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): the patient
+# said "الدواء اللي اتوصفلي غلط" (the medication I was prescribed was
+# wrong) and `send_complaint_email` fired in that SAME turn - no
+# question about which doctor, no phone confirmation (or offer to use
+# a different number), no branch question, and critically no "تأكيد
+# إرسال الشكوى بهذا الشكل؟" confirmation - because `patient_name` had
+# already been captured during an earlier booking attempt in the same
+# conversation and so was never "missing".
+#
+# This gate requires the LAST thing the assistant said before this
+# call to be recognizably STEP C6's confirmation question, and the
+# patient's own latest message to be a genuine affirmative answer to
+# it - not just any non-empty field values.
+_COMPLAINT_CONFIRMATION_QUESTION_RE = re.compile(
+    r"تأكيد\s*(?:ال)?إرسال|تأكيد\s*(?:ال)?ارسال|أأكد\s*(?:ال)?إرسال|"
+    r"موافق\s*ع(?:لى)?\s*(?:ال)?إرسال|هل\s*(?:ال)?بيانات\s*صحيح|"
+    r"confirm\s*(?:the\s*)?(?:sending\s*(?:the\s*)?)?complaint|"
+    r"shall\s*i\s*send\s*(?:this|the)\s*complaint"
+)
+
+_COMPLAINT_AFFIRMATIVE_RE = re.compile(
+    r"^\s*(?:نعم|ايوه|أيوه|ايوة|آيوه|اه|آه|ايه|تمام|أكيد|اكيد|ماشي|"
+    r"موافق|موافقه|موافقة|صح|تم|ok|okay|yes|sure|confirm(?:ed)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _complaint_explicitly_confirmed(state: AgentState) -> bool:
+    """True only when the assistant's own immediately-preceding message
+    reads as STEP C6's confirmation question AND the patient's latest
+    message is a genuine affirmative reply to it."""
+
+    messages = list(state.get("messages") or [])
+
+    last_human_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "human":
+            last_human_idx = i
+            break
+
+    if last_human_idx is None:
+        return False
+
+    last_human_text = str(getattr(messages[last_human_idx], "content", "") or "").strip()
+    if not _COMPLAINT_AFFIRMATIVE_RE.match(last_human_text):
+        return False
+
+    for i in range(last_human_idx - 1, -1, -1):
+        m = messages[i]
+        if getattr(m, "type", None) != "ai":
+            continue
+        content = str(getattr(m, "content", "") or "").strip()
+        if not content:
+            # An AI message with tool_calls but no text content - keep
+            # looking further back for the last one that actually said
+            # something to the patient.
+            continue
+        return bool(_COMPLAINT_CONFIRMATION_QUESTION_RE.search(content))
+
+    return False
+
+
 @tool
 def send_complaint_email(
     state: Annotated[AgentState, InjectedState],
@@ -6731,10 +6909,14 @@ def send_complaint_email(
     Returns:
     {"status": "sent"}
     {"status": "incomplete", "missing": [...], "reason": ...}
-        # Required details are missing or too thin to act on - NOTHING
-        # was sent. Go back and collect what's listed in `missing` (one
-        # question per message), confirm it with the patient, then call
-        # this again. Do NOT tell them the complaint was submitted.
+        # Required details are missing or too thin to act on, OR the
+        # patient's own explicit confirmation to STEP C6's "تأكيد إرسال
+        # الشكوى بهذا الشكل؟" question was not the immediately-preceding
+        # exchange (missing item "explicit_confirmation") - NOTHING was
+        # sent either way. Go back and collect what's listed in
+        # `missing` (one question per message), show the full summary,
+        # get an explicit yes to THAT summary, then call this again.
+        # Do NOT tell them the complaint was submitted.
     {"status": "not_configured"}  # this clinic has no complaint recipient email(s) set up
     {"status": "error"}  # sending failed (webhook or SMTP error)"""
 
@@ -6771,6 +6953,15 @@ def send_complaint_email(
     # clinic as a whole legitimately has no branch, and demanding one
     # would force exactly the irrelevant question the complaint flow is
     # meant to avoid.
+
+    if not missing and not _complaint_explicitly_confirmed(state):
+        # Every field is technically present, but STEP C6's own
+        # summarize-and-confirm question was never asked (or the
+        # patient's latest message isn't a genuine "yes" to it) - see
+        # the CONFIRMED REAL PRODUCTION FAILURE note above. Refuse to
+        # send rather than trust that fields being non-empty means the
+        # patient actually agreed to submit THIS complaint.
+        missing.append("explicit_confirmation")
 
     if missing:
         logger.warning(
