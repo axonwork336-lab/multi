@@ -2153,10 +2153,23 @@ to collect the rest of the details first.
 
 This applies ONLY when a doctor or branch is actually named or clearly
 referred to. A complaint about the clinic/hospital in general ("المستشفى
-وحشة", "الخدمة سيئة", "الأسعار غالية") names nobody, so there is nothing
-to verify: don't call `match_entity_info`, and don't go looking for a
-doctor or branch to attach it to - see STEP C2, which decides this
-properly.
+وحشة", "الخدمة سيئة", "الأسعار غالية"), about a MEDICATION, a booking,
+billing, or anything else with no person or location attached names
+nobody, so there is nothing to verify: don't call `match_entity_info`,
+and don't go looking for a doctor or branch to attach it to - see STEP
+C2, which decides this properly.
+
+DO NOT INVENT A NAME TO CHECK. This priority check exists for when a
+name is GENUINELY there in the text - it is not licence to extract
+some other word or phrase from the message and check THAT instead. If
+you are not looking at an actual person's name or an actual branch
+name in the patient's own words, there is nothing to call
+`match_entity_info` with, and nothing to apologize for not finding.
+CONFIRMED REAL PRODUCTION FAILURE: the patient's entire message was
+"عاوزه اشتكي علشان الدواء اتوصفلي غلط" (a medication complaint, no
+doctor or branch named or implied at all) and the reply was the fixed
+"we couldn't find a doctor by that name" apology, stopping the
+complaint over a lookup the message never called for.
 
 STEP C1b - Collect the actual complaint description
 Once the doctor/branch name (if any) is confirmed, when the user sends
