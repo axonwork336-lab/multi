@@ -4107,7 +4107,7 @@ _AVAILABILITY_CORRECTION_DIRECTIVE = (
 # alone; only the case with neither is flagged.
 
 _COMPLAINT_STOP_APOLOGY_RE = re.compile(
-    r"ما\s*لقينا\s*(دكتور|دكتوره|فرعا?)\s*بهذا\s*الاسم"
+    r"ما\s*لقي(?:ت|نا)?\s*(دكتور|دكتوره|فرعا?)\s*بهذا\s*الاسم"
 )
 
 _ASKED_WHICH_DOCTOR_OR_BRANCH_RE = re.compile(
@@ -4118,13 +4118,64 @@ _ASKED_WHICH_DOCTOR_OR_BRANCH_RE = re.compile(
 _DOCTOR_CUE_WORD_RE = re.compile(r"دكتور|دكتوره|د\.|طبيب|doctor")
 _BRANCH_CUE_WORD_RE = re.compile(r"فرع|branch")
 
+# A generic word for "the doctor"/"a doctor" (or "the branch") ON ITS
+# OWN, with nothing else - not an actual name. Matched against the
+# FOLDED form of the exact `user_input` argument passed to
+# `match_entity_info`, so this is the strongest possible signal that no
+# real name was ever given: the model called the lookup tool with
+# literally the generic noun itself rather than any name at all.
+_GENERIC_DOCTOR_WORD_ONLY_RE = re.compile(
+    r"^\s*(?:ال)?دكتور(?:ه)?\s*$|^\s*(?:ال)?طبيب(?:ه)?\s*$|^\s*د\s*$"
+)
+_GENERIC_BRANCH_WORD_ONLY_RE = re.compile(r"^\s*(?:ال)?فرع\s*$")
+
+
+def _last_match_entity_info_user_input(state: AgentState, entity_type: str) -> Optional[str]:
+    """The `user_input` most recently passed to `match_entity_info` for
+    the given `entity_type` ("doctor"/"branch"), or None if it hasn't
+    been called with that entity_type anywhere in this conversation."""
+
+    for m in reversed(state.get("messages") or []):
+        for call in (getattr(m, "tool_calls", None) or []):
+            name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+            if name != "match_entity_info":
+                continue
+            args = (call.get("args") if isinstance(call, dict) else getattr(call, "args", None)) or {}
+            if (str(args.get("entity_type") or "")).strip().lower() != entity_type:
+                continue
+            return str(args.get("user_input") or "")
+
+    return None
+
 
 def _reply_fabricates_doctor_not_found_stop(reply_text: str, state: AgentState) -> bool:
-    match = _COMPLAINT_STOP_APOLOGY_RE.search(reply_text or "")
+    folded_reply = _norm_ar(reply_text or "")
+    match = _COMPLAINT_STOP_APOLOGY_RE.search(folded_reply)
     if not match:
         return False
 
     is_branch = match.group(1).startswith("فرع")
+    entity_type = "branch" if is_branch else "doctor"
+
+    # STRONGEST SIGNAL FIRST: what was actually passed to
+    # `match_entity_info`. If it was literally just the bare generic
+    # word ("دكتور"/"الدكتور"/"طبيب"/"فرع") with nothing else, that is
+    # never a real name no matter what the surrounding message looked
+    # like - flag it regardless of the heuristics below.
+    #
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): the
+    # patient said "دكتور كتبلي دواء غلط مش لحالتي" (a/the doctor
+    # prescribed me the wrong medication) - genuinely mentions "دكتور"
+    # as a common noun, with no name attached - and the call was made
+    # as `match_entity_info(user_input="دكتور", entity_type="doctor")`.
+    # The message-level heuristic below alone would have missed this
+    # (the word "دكتور" DOES appear in the patient's message), which is
+    # exactly why this stronger, argument-level check exists.
+    generic_re = _GENERIC_BRANCH_WORD_ONLY_RE if is_branch else _GENERIC_DOCTOR_WORD_ONLY_RE
+    last_call_input = _last_match_entity_info_user_input(state, entity_type)
+    if last_call_input is not None and generic_re.match(_norm_ar(last_call_input)):
+        return True
+
     cue_re = _BRANCH_CUE_WORD_RE if is_branch else _DOCTOR_CUE_WORD_RE
 
     messages = state.get("messages") or []
