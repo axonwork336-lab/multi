@@ -602,6 +602,7 @@ def schedule(
     answering_a_list: bool = False,
     tool_args: Optional[dict] = None,
     agent_name: Optional[str] = None,
+    channel_phone: Optional[str] = None,
 ) -> None:
     """Arm the interim message for a tool phase that is about to start.
 
@@ -621,6 +622,14 @@ def schedule(
     "checking the available times" - so this narrows the wording where
     it genuinely changes what the patient is waiting for. Optional and
     additive: omit it and every existing behaviour is unchanged.
+
+    `channel_phone`: the patient's own WhatsApp number for this
+    session (state["channel_phone"]). Carried through to the webhook
+    payload delivered to n8n (see _deliver) so the n8n flow can route
+    the interim message on the same channel/variable it uses for the
+    final reply, without having to re-derive it from session_id.
+    Optional and additive: omit it and the payload simply omits the
+    field, unchanged from before.
 
     Never raises: a failure here must not be able to break a turn that
     would otherwise have answered the patient perfectly well.
@@ -740,7 +749,7 @@ def schedule(
 
             # Newest wording wins, so the message describes what is
             # actually running when it goes out.
-            _pending[session_id] = (client_id, text)
+            _pending[session_id] = (client_id, text, channel_phone)
 
             if session_id in _timers:
                 # A countdown from this turn's tool phase is already
@@ -786,11 +795,11 @@ def _fire(session_id: str) -> None:
     if not pending:
         return
 
-    client_id, text = pending
-    _deliver(session_id, client_id, text)
+    client_id, text, channel_phone = pending
+    _deliver(session_id, client_id, text, channel_phone)
 
 
-def _deliver(session_id: str, client_id: str, text: str) -> None:
+def _deliver(session_id: str, client_id: str, text: str, channel_phone: Optional[str] = None) -> None:
     """Runs on the timer thread, only if the turn is still going."""
 
     with _lock:
@@ -826,6 +835,13 @@ def _deliver(session_id: str, client_id: str, text: str) -> None:
         "session_id": session_id,
         "client_id": client_id,
         "reply": text,
+        # The patient's own WhatsApp number for this session, so the n8n
+        # flow can address the interim message the same way it addresses
+        # the final reply, without re-parsing session_id. Present
+        # whenever the caller had it (see schedule()'s channel_phone
+        # param); omitted (None) only for the legacy/test call sites that
+        # don't pass it, which keeps this additive rather than breaking.
+        "channel_phone": channel_phone,
     }
 
     try:
