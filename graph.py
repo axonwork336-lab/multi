@@ -2771,7 +2771,13 @@ def _is_redundant_closing_question_only(reply_text: str, greeting: str) -> bool:
 # reconfirm a doctor that was already settled. \b sees no boundary
 # between "ل" and "ف" (both word characters), so "الفرع" is correctly
 # left alone, while "فرع الدقي" (space before "فرع") still matches.
-_BRANCH_MENTION_RE = re.compile(r"\bفرع\s+([^\n،,.؟?:()\[\]0-9️⃣]{2,25})")
+# Quote characters (straight, curly, Arabic) are excluded too: a real
+# branch name never contains one, but a reply that CORRECTLY denies a
+# name the patient invented ("ما لقيت فرع اسمه \"فرع النيل\"") quotes
+# that invalid name right back at them, and without this exclusion the
+# capture runs straight through the quote and swallows the rest of the
+# denial sentence as if it were itself a branch name.
+_BRANCH_MENTION_RE = re.compile(r"\bفرع\s+([^\n،,.؟?:()\[\]0-9️⃣\"'«»\u201c\u201d]{2,25})")
 
 # Words that follow "فرع" in ordinary questions rather than naming one -
 # "أي فرع تفضل؟" is not a branch called "تفضل". Without this the
@@ -2804,6 +2810,13 @@ _NOT_A_BRANCH_NAME = {
     # retries.
     "اني", "أني", "انهي", "أنهي", "وانهي", "وأنهي", "اي", "أي", "وأي", "واي",
     "يوم", "ايه", "إيه",
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): "ما لقيت
+    # فرع اسمه \"فرع النيل\"" - a correct denial that a patient-invented
+    # branch exists - was itself parsed as naming a branch, because
+    # "اسمه" ("named") introduces someone else's claim about a branch,
+    # not a branch name. Without this the denial sentence gets treated
+    # as the invention it's actually refuting.
+    "اسمه", "اسمها", "اسمك", "اسمكم", "اسم",
 }
 
 _NOT_A_BRANCH_NAME_NORM = {tools._normalize_arabic(w) for w in _NOT_A_BRANCH_NAME}
@@ -3194,8 +3207,18 @@ def _find_invented_branches(reply_text: str, state: AgentState) -> list:
         # stay silent rather than flagging everything.
         return []
 
+    # Strip quoted spans before scanning. A reply that correctly denies
+    # a name the PATIENT invented quotes that name straight back at
+    # them ('ما لقيت فرع اسمه "فرع النيل"') - the quoted text is being
+    # referenced, not asserted, and scanning it anyway means the denial
+    # sentence gets flagged as the very invention it's refuting.
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-30): exactly
+    # this sentence, followed by two genuinely correct branches, was
+    # discarded twice and replaced with the generic fallback error.
+    scan_text = re.sub(r"[\"'«»\u201c\u201d][^\"'«»\u201c\u201d\n]{1,40}[\"'«»\u201c\u201d]", " ", reply_text)
+
     invented = []
-    for match in _BRANCH_MENTION_RE.finditer(reply_text):
+    for match in _BRANCH_MENTION_RE.finditer(scan_text):
         name = _norm_ar(match.group(1))
         if not name or len(name) < 3:
             continue
