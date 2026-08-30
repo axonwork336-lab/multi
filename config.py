@@ -91,6 +91,32 @@ REQUEST_TIMEOUT_SECONDS: float = float(
     os.getenv("BOOKING_API_TIMEOUT_SECONDS", "15")
 )
 
+# How many times to retry a Doctors/Specialties API call that failed with
+# a 5xx or a timeout, before giving up. Confirmed real production
+# behaviour: this endpoint has been measured returning the SAME query in
+# 0.5s and then, later, either timing out at 29s or answering with a bare
+# 500 and an empty body - a transient blip, not a real outage - yet
+# _post_json previously gave up on the FIRST 500/timeout. That one failed
+# call then propagated all the way to the model, which (with no real
+# branch/doctor data to work from) started inventing branch names, which
+# the reply-validation guard correctly caught and replaced with the
+# generic "حدث خطأ تقني" fallback - so a single transient 500 upstream
+# was surfacing as a hard failure to the patient. Kept LOW and env-
+# overridable: this is a shield against a known-flaky endpoint's short
+# blips, not a way to paper over a genuinely down service - if it's
+# really down, retrying more just delays the (still correct) failure
+# response to the patient.
+DOCTORS_API_MAX_RETRIES: int = int(
+    os.getenv("DOCTORS_API_MAX_RETRIES", "2")
+)
+
+# Base delay between retries, in seconds. Doubles each attempt
+# (0.5s, 1s, 2s, ...) so a genuinely struggling endpoint isn't hammered
+# harder than a transient one.
+DOCTORS_API_RETRY_BACKOFF_SECONDS: float = float(
+    os.getenv("DOCTORS_API_RETRY_BACKOFF_SECONDS", "0.5")
+)
+
 
 # ==========================================================
 # Doctors / Specialties API (Medical Concierge feature)
