@@ -6932,6 +6932,26 @@ _ASKS_FOR_PHONE_RE = re.compile(
     r"your\s+(?:mobile|phone)\s+number|booking\s+(?:reference|number)"
 )
 
+# A SUMMARY/CONFIRMATION message (STEP C6's complaint summary, or the
+# booking review card) legitimately RESTATES the phone number as an
+# already-settled field ("📱 رقم الهاتف: نفس رقم الواتساب") - that is
+# not a request for it. CONFIRMED REAL PRODUCTION FAILURE: the STEP C6
+# summary "تأكيد إرسال الشكوى بهذا الشكل؟ ... رقم الهاتف: متضمن رقم
+# الواتساب الحالي" was flagged and replaced by the safe fallback message
+# TWICE in a row (the correction retry produced an equivalent summary
+# and was flagged again), which meant a complaint that had reached its
+# very last, ready-to-send step was thrown away into a generic
+# "technical error" message instead of being sent. A summary is
+# recognized by its own fixed confirmation phrasing and excluded here -
+# only a reply with NEITHER of these cues is treated as a genuine
+# re-ask.
+_SUMMARY_OR_CONFIRMATION_CUE_RE = re.compile(
+    r"تاكيد\s*(?:ال)?ارسال|تاكيد\s*(?:ال)?حجز|"
+    r"هل\s*(?:جميع\s*)?(?:ال)?بيانات\s*صحيح|"
+    r"confirm\s*(?:the\s*)?(?:sending\s*(?:the\s*)?)?(?:complaint|booking)|"
+    r"is\s*everything\s*correct"
+)
+
 # A bare yes. The patient agreeing to a yes/no question the assistant
 # itself asked.
 _BARE_AFFIRMATION_RE = re.compile(
@@ -7049,6 +7069,12 @@ def _reply_asks_for_a_phone_already_known(reply_text: str, state: AgentState) ->
         return False
 
     if not _ASKS_FOR_PHONE_RE.search(_norm_ar(reply_text)):
+        return False
+
+    if _SUMMARY_OR_CONFIRMATION_CUE_RE.search(_norm_ar(reply_text)):
+        # A summary/confirmation message restating the phone as an
+        # already-settled field, not a request for it - see the
+        # comment above _SUMMARY_OR_CONFIRMATION_CUE_RE.
         return False
 
     from langchain_core.messages import HumanMessage as _HumanMessage
