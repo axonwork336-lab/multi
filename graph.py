@@ -2190,6 +2190,20 @@ def _has_latin_letters(text: str) -> bool:
     return bool(re.search(r"[A-Za-z]{2,}", text or ""))
 
 
+def _latin_word_count(text: str) -> int:
+    """How many whole Latin-script words the text contains.
+
+    Distinguishes an incidental proper noun that came back from the API
+    in English ("Al Nozha", "Dr Smith") from an entire English paragraph
+    riding along in an otherwise-Arabic message. `_has_latin_letters`
+    cannot tell those apart - it is True for both - which is why the
+    mixed-language greeting guard needs this instead. See the
+    CONFIRMED REAL PRODUCTION FAILURE note at that guard.
+    """
+
+    return len(re.findall(r"[A-Za-z]{2,}", text or ""))
+
+
 def _detect_target_language(messages: list) -> Optional[str]:
     """
     Determine which language THIS reply must be in, deterministically -
@@ -5274,7 +5288,7 @@ _REPLY_VERIFIERS = (
             agent_name in ("booking", "concierge")
             and _reply_asks_same_number_before_booking_ready(reply, state)
         ),
-        lambda reply, state: _PREMATURE_SAME_NUMBER_CORRECTION_DIRECTIVE,
+        lambda reply, state: _premature_same_number_directive(reply, state),
         "new-booking reply asked STEP NB6's same-WhatsApp-number question before "
         "a doctor was confirmed and a time slot was selected in the booking "
         "session",
@@ -7886,6 +7900,52 @@ _PREMATURE_SAME_NUMBER_CORRECTION_DIRECTIVE = (
 )
 
 
+_FORGOT_TO_LOCK_SLOT_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "LOCK THE SLOT IN FIRST - THEN KEEP YOUR CONFIRMATION SENTENCE\n"
+    "============================================================\n"
+    "Your previous draft asked STEP NB6's same-WhatsApp-number "
+    "question, and the doctor IS confirmed and a time list WAS shown to "
+    "the patient - so the flow is in the right place. The only thing "
+    "missing is mechanical: `select_appointment_slot` has not been "
+    "called yet, so the time the patient just picked is not actually "
+    "locked into this booking session.\n\n"
+    "Call `select_appointment_slot` now with the slot they chose. Then "
+    "send the SAME reply you already drafted, KEEPING the sentence that "
+    "tells them which appointment was selected (day, date, time, doctor) "
+    "before the WhatsApp-number question.\n\n"
+    "Do NOT rewind the conversation to an earlier step, do NOT re-ask "
+    "which day or which time, and do NOT drop the confirmation sentence "
+    "- the patient must always be told exactly which appointment they "
+    "are confirming before being asked about the phone number.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-31 12:46:47): "
+    "the draft correctly said \"تم اختيار موعد الساعة 2:30 مساءً يوم "
+    "الأحد 06/09/2026 مع دكتور نور عبد الرحمن\" followed by the "
+    "WhatsApp question. The correction dropped that first sentence "
+    "entirely, so the patient was asked to confirm a booking without "
+    "ever being told which appointment it was.\n\n"
+)
+
+
+def _premature_same_number_directive(reply_text: str, state: AgentState) -> str:
+    """Which of the two corrections this actually needs.
+
+    The guard fires for two genuinely different situations, and telling
+    them apart matters: a booking that has not started yet must go back
+    to STEP NB1, but a booking whose doctor is confirmed and whose slot
+    list has already been shown is in exactly the right place and just
+    needs the slot committing - sending it back to NB1 there destroys
+    correct work."""
+
+    session = tools._BOOKING_SESSIONS.get(state.get("session_id")) or {}
+    last_list = session.get("last_list") or {}
+
+    if session.get("doctor_id") and last_list.get("entity_type") == "slot":
+        return _FORGOT_TO_LOCK_SLOT_CORRECTION_DIRECTIVE
+
+    return _PREMATURE_SAME_NUMBER_CORRECTION_DIRECTIVE
+
+
 def _reply_wrongly_scope_refuses_after_otp_failure(reply_text: str, state: AgentState) -> bool:
     """True when the reply is the fixed out-of-scope refusal, but the
     most recent tool call in this conversation was `verify_otp`
@@ -8767,10 +8827,25 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         # correctly greeted yet, so the pure, single-language
         # deterministic greeting below still replaces it instead of
         # being skipped.
+        # A LATIN PROPER NOUN IS NOT AN ENGLISH BLOCK. The test below
+        # deliberately counts Latin WORDS rather than asking whether any
+        # Latin letters exist at all: entity names routinely come back
+        # from the API in English ("Al Nozha", "Dr Smith") and land in
+        # an otherwise perfectly Arabic reply.
+        #
+        # CONFIRMED REAL PRODUCTION FAILURE (medtown, session
+        # 201158877175+medtown2, 2026-08-31 12:44:53): a correct 576-
+        # character Arabic reply listing a doctor's weekly schedule was
+        # discarded in full and replaced by the bare greeting, because
+        # its branch name rendered as "Al Nozha" - two Latin words.
+        # The patient asked a question and got no answer at all. The
+        # bilingual template this guard actually exists to catch
+        # carries an entire English paragraph, so a word count
+        # separates the two cleanly where a boolean cannot.
         mixed_language_greeting = bool(
             target_language in ("en", "ar")
             and _looks_arabic(reply_so_far)
-            and _has_latin_letters(reply_so_far)
+            and _latin_word_count(reply_so_far) >= 12
             and len(reply_so_far) > 200
         )
         if mixed_language_greeting:
