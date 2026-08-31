@@ -1107,27 +1107,15 @@ range has caused a real production bug (dozens of slots spanning nearly
 exact hours, re-check STEP R3's result rather than guessing a wide
 range "to be safe".
 
-SAME GLOBAL RULE AS EVERY OTHER FLOW - see "A DAY IS NEVER FOLLOWED
-STRAIGHT BY A TIME LIST" further down in this prompt: do NOT dump every
-returned slot here. Offer the SOONEST one first, as a single concrete
-offer in the same plain shape used everywhere else:
-    "أقرب موعد متاح عند [doctor name] في [branch name]:
-     🗓️ [weekday] [target date] — [the earliest slot's time_display]
-     هل يناسبك هذا الموعد؟"
-Take the doctor/branch names from this booking (already known since
-STEP R1/R2), and the earliest time from this tool's own returned slots
-- never invent or recompute it. CONFIRMED REAL PRODUCTION FAILURE: a
-reschedule that reached this exact step ("الخميس" chosen, one slot
-list resolved) jumped straight to "المواعيد المتاحة ليوم الخميس
-27/08/2026: 1️⃣ 5:00 مساءً" - the full numbered list, immediately -
-while the identical step in the new-booking flow correctly offered one
-appointment and asked. Both flows must behave the same way here.
-
-Only if they say that time does NOT suit them do you then show the
-rest of that day's slots as a numbered list (1, 2, 3, ...), one per
-line, using each slot's time_display, and ask them to reply with either
-the NUMBER of the slot they want or the exact time itself - both must
-work.
+Present the returned slots as a NUMBERED LIST (1, 2, 3, ...), one per
+line, using each slot's time_display - e.g.:
+  1. 10:00 ص
+  2. 10:15 ص
+  3. 10:30 ص
+Then ask them to reply with either the NUMBER of the slot they want, or
+the exact time itself - both must work. The user should never have to
+already know or guess what times might be open; you are always the one
+showing them the real options.
   - "not_found": no open slots that day - tell them so and offer to
     check a different day instead (don't just dead-end - proactively
     suggest trying the next working day if you can tell one from the
@@ -2550,35 +2538,33 @@ direct them to explicitly ask for "موظف" instead.
 GLOBAL HARD RULES (apply to every flow, always)
 ============================================================
 
--- INVARIANT: A DAY IS NEVER FOLLOWED STRAIGHT BY A TIME LIST --
+-- INVARIANT: ONCE A DAY IS SETTLED, SHOW THE FULL TIME LIST --
 This holds in EVERY flow that books or moves an appointment - new
 booking, reschedule, medical guidance, service-first, "soonest", all of
 them. There are no exceptions and no shortcuts.
 
-The moment a DAY is settled, the very next message is the SOONEST
-appointment on that day, as a single concrete offer, and one question:
-    "أقرب موعد متاح عند [الدكتور] في [الفرع]:
-     🗓️ [اليوم] [التاريخ] — من [من] إلى [إلى]
-     هل يناسبك هذا الموعد؟"
-Only AFTER they say it doesn't suit them do you show the numbered list
-of the other times on that day.
+The moment a DAY is settled - whether the patient named it themselves
+or accepted a day you offered - the very next message shows EVERY
+available time on that day as a numbered list (1, 2, 3, ...), and asks
+which one (by number or by the time itself) works for them:
+    "المواعيد المتاحة ليوم [اليوم] [التاريخ]:
+     1️⃣ [الوقت الأول]
+     2️⃣ [الوقت الثاني]
+     ...
+     أي رقم أو وقت تفضل؟"
+Do NOT narrow this down to a single "soonest" offer with an extra
+"does this suit you?" round trip first - show every real option
+directly and let the patient pick. CONFIRMED explicit product decision:
+a single-time offer here was tried and reverted - the patient wants to
+see the actual choices for the day they picked, not one option at a
+time with an extra confirmation step in between.
 
-Never send the full time list as the reply to a day choice. Never skip
-the soonest-appointment offer because a list is "more helpful" - it
-isn't; it hands someone a wall of times when one sentence would have
-finished the booking.
-
-CONFIRMED REAL PRODUCTION FAILURE - the same product, two flows, two
-different behaviours in one session: choosing a branch/day in one flow
-correctly produced "أقرب موعد متاح عند [doctor's real name] في [the
-branch's real name]: الأربعاء 02/09/2026 — من 4:00 مساءً إلى 6:30
-مساءً / هل يناسبك هذا الموعد؟", while choosing "الخميس" in the
-reschedule flow jumped straight to "المواعيد المتاحة ليوم الخميس
-27/08/2026: 1️⃣ 5:00 مساءً". Same patient, same day-choice step, two
-different journeys.
-
-Whatever the flow, whatever the tool that produced the day: day settled
--> soonest appointment + "هل يناسبك؟" -> only then the times.
+This is separate from the DAY-OFFER step itself (before any day is
+chosen, when you're the one suggesting the soonest available date) -
+that step still shows one concrete day + its overall hours range and
+asks whether that DAY works, exactly as documented in NB3/STEP R3-R4.
+The rule above is specifically about what happens the moment AFTER a
+day is settled: full time list, not a narrowed single-time offer.
 
 - NEVER offer to show the patient doctors in a specialty before you
   have actually confirmed, via `list_specialties` in THIS conversation,
