@@ -5231,7 +5231,19 @@ _REPLY_VERIFIERS = (
     ),
     (
         lambda reply, state, agent_name: (
-            agent_name in ("cancel", "reschedule")
+            # `concierge` is the full legacy agent - it carries the SAME
+            # cancel/reschedule prompt sections and tools as those two
+            # specialists (see agents/registry.py), and the router keeps
+            # a weak, single-word cue like "تعديل" on whichever agent was
+            # already active rather than switching - so `concierge` can
+            # and does independently start this exact flow and produce
+            # this exact bug. CONFIRMED REAL PRODUCTION FAILURE: routing
+            # never switched off `concierge` (no strong enough cue in
+            # "تعديل" alone), and `concierge` itself skipped straight to
+            # "نكمل تعديل موعدك على نفس رقم الواتساب ده؟" - the same
+            # violation this guard was written for, just from a
+            # different agent than originally gated on.
+            agent_name in ("cancel", "reschedule", "concierge")
             and _reply_skips_reference_or_phone_question(reply, state)
         ),
         lambda reply, state: _REFERENCE_OR_PHONE_CORRECTION_DIRECTIVE,
@@ -7445,6 +7457,20 @@ _ASKS_FOR_PHONE_DIRECTLY_RE = re.compile(
     r"رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?هاتف|mobile\s*number|phone\s*number"
 )
 
+# SCOPING, NOT A TRIGGER ON ITS OWN. The "same WhatsApp number?"
+# question ALSO appears in the completely unrelated NEW BOOKING flow
+# (STEP NB6: "نكمل الحجز على نفس رقم الواتساب ده؟") - which has no
+# "reference or phone?" STEP 1 at all, because there is no existing
+# booking to identify yet. Since `concierge` handles every flow, this
+# guard must only fire when the reply is actually about modifying or
+# cancelling an EXISTING appointment - never on a plain "نكمل الحجز"
+# (continuing a brand-new one), which does not mention "تعديل"/
+# "إلغاء"/"موعدك" at all.
+_CANCEL_OR_RESCHEDULE_CONTEXT_RE = re.compile(
+    r"تعديل|إلغاء|الغاء|موعدك|"
+    r"cancel\s*(?:your|the)?\s*appointment|reschedul"
+)
+
 # The STEP 1 question itself - "reference or phone?" - in any of the
 # forms the clinic's own dialect/templates might render it, in Arabic
 # or English. Matched LOOSELY (either keyword pair, in either order)
@@ -7493,6 +7519,27 @@ def _reply_skips_reference_or_phone_question(reply_text: str, state: AgentState)
     asks_for_phone_directly = bool(_ASKS_FOR_PHONE_DIRECTLY_RE.search(folded))
 
     if not (asks_same_number or asks_for_phone_directly):
+        return False
+
+    # SCOPING - see `_CANCEL_OR_RESCHEDULE_CONTEXT_RE` above. Check the
+    # reply itself first (the clinic's own "same number?" template
+    # usually says "تعديل موعدك" in the same sentence), and fall back
+    # to the patient's own last message (covers the bare "send your
+    # phone number" phrasing, which doesn't always repeat "موعدك"
+    # itself) - either one confirms this is actually the cancel/
+    # reschedule flow and not an unrelated new booking.
+    from langchain_core.messages import HumanMessage as _HumanMessage2
+    last_human_text = ""
+    for msg in reversed(state.get("messages") or []):
+        if isinstance(msg, _HumanMessage2):
+            content = getattr(msg, "content", "")
+            last_human_text = content if isinstance(content, str) else str(content or "")
+            break
+
+    if not (
+        _CANCEL_OR_RESCHEDULE_CONTEXT_RE.search(folded)
+        or _CANCEL_OR_RESCHEDULE_CONTEXT_RE.search(_norm_ar(last_human_text))
+    ):
         return False
 
     # The reply itself IS the "reference or phone?" question (presents
