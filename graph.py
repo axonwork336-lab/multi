@@ -2817,6 +2817,15 @@ _NOT_A_BRANCH_NAME = {
     # not a branch name. Without this the denial sentence gets treated
     # as the invention it's actually refuting.
     "اسمه", "اسمها", "اسمك", "اسمكم", "اسم",
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-31): a
+    # perfectly correct recovery message - "ما قدرنا نلاقي فرع بالرقم
+    # 1... تختار من: 1️⃣ المنار 2️⃣ النزهة" - was rejected as naming an
+    # invented branch. "فرع بالرقم" ("branch BY NUMBER") refers to the
+    # patient's numeric pick, not a name - the digit itself is already
+    # excluded from the capture, but the word introducing it ("بالرقم"/
+    # "برقم"/"رقم") wasn't, so it was captured alone as if it were the
+    # branch's actual name.
+    "رقم", "بالرقم", "برقم", "الرقم", "لرقم",
 }
 
 _NOT_A_BRANCH_NAME_NORM = {tools._normalize_arabic(w) for w in _NOT_A_BRANCH_NAME}
