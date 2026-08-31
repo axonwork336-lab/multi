@@ -7463,9 +7463,21 @@ _SAME_WHATSAPP_QUESTION_RE = re.compile(
     r"same\s*whatsapp\s*number|same\s*number\s*you"
 )
 
-_ASKS_FOR_PHONE_DIRECTLY_RE = re.compile(
-    r"رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?هاتف|mobile\s*number|phone\s*number"
+# ONE shared word-list for "a phone number", reused by every pattern
+# below so a synonym added in one place can't silently go missing from
+# another. CONFIRMED REAL PRODUCTION FAILURE this fragment fixes: the
+# patient answered STEP 1 with "رقم التليفون" ("telephone number") -
+# a completely standard synonym, already recognised by the older
+# `_ASKS_FOR_PHONE_RE` elsewhere in this file - but the guards below,
+# written separately, only recognised "جوال"/"هاتف"/"phone"/"mobile"
+# and missed "تليفون" entirely, so the patient's clear choice of phone
+# went unrecognised and the reference option got wrongly re-offered.
+_PHONE_WORD_FRAGMENT = (
+    r"(?:رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?موبايل|رقم\s*(?:ال)?تليفون|"
+    r"رقم\s*(?:ال)?هاتف|mobile\s*number|phone\s*number|telephone\s*number)"
 )
+
+_ASKS_FOR_PHONE_DIRECTLY_RE = re.compile(_PHONE_WORD_FRAGMENT)
 
 # SCOPING, NOT A TRIGGER ON ITS OWN. The "same WhatsApp number?"
 # question ALSO appears in the completely unrelated NEW BOOKING flow
@@ -7488,9 +7500,9 @@ _CANCEL_OR_RESCHEDULE_CONTEXT_RE = re.compile(
 # phrasing.
 _REFERENCE_OR_PHONE_QUESTION_RE = re.compile(
     r"(?:رقم\s*(?:ال)?حجز|(?:ال)?رقم\s*(?:ال)?مرجعي|reference\s*(?:number)?).{0,40}"
-    r"(?:رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?هاتف|phone\s*number)|"
-    r"(?:رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?هاتف|phone\s*number).{0,40}"
-    r"(?:رقم\s*(?:ال)?حجز|(?:ال)?رقم\s*(?:ال)?مرجعي|reference\s*(?:number)?)"
+    + _PHONE_WORD_FRAGMENT + r"|"
+    + _PHONE_WORD_FRAGMENT +
+    r".{0,40}(?:رقم\s*(?:ال)?حجز|(?:ال)?رقم\s*(?:ال)?مرجعي|reference\s*(?:number)?)"
 )
 
 # A booking reference ("GBN-2026-06-20-151") or anything that looks
@@ -7615,7 +7627,9 @@ _REFERENCE_OR_PHONE_CORRECTION_DIRECTIVE = (
 
 _CHOSE_PHONE_PATH_RE = re.compile(
     r"^\s*(?:رقم\s*)?(?:ال)?جوال\s*$|^\s*(?:رقم\s*)?(?:ال)?هاتف\s*$|"
-    r"^\s*phone\s*(?:number)?\s*$|^\s*mobile\s*(?:number)?\s*$"
+    r"^\s*(?:رقم\s*)?(?:ال)?تليفون\s*$|^\s*(?:رقم\s*)?(?:ال)?موبايل\s*$|"
+    r"^\s*phone\s*(?:number)?\s*$|^\s*mobile\s*(?:number)?\s*$|"
+    r"^\s*telephone\s*(?:number)?\s*$"
 )
 
 _CHOSE_REFERENCE_PATH_RE = re.compile(
