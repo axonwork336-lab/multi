@@ -662,6 +662,7 @@ def compare_phone(
     )
 
     if match:
+        _mark_phone_verified(state, provided_phone)
         return {"status": "match"}
 
     return {"status": "no_match"}
@@ -714,6 +715,14 @@ def lookup_appointment(
     {"status": "no_channel_identity"}  # use_channel_identity was True but
                           # no verified channel number is available - ask
                           # the user to type their phone number instead
+    {"status": "phone_not_verified"}  # you passed a phone number that
+                          # hasn't been verified in this conversation yet
+                          # (not the channel identity, no successful
+                          # compare_phone match, no successful verify_otp).
+                          # Go call compare_phone (and send_otp/verify_otp
+                          # if it doesn't match) BEFORE calling this tool
+                          # again with that number - never retry this call
+                          # as-is expecting a different result.
     Appointment fields: ref, doctorName, branchName, serviceName,
     specialtyName, statusName, date_display, time_display, patientFullName,
     mobileNumber, email, id."""
@@ -724,6 +733,26 @@ def lookup_appointment(
         if not channel_phone:
             return {"status": "no_channel_identity"}
         phone = channel_phone
+    elif phone and not ref_number:
+        # SERVER-SIDE ENFORCEMENT, NOT JUST A PROMPT RULE. The prompt
+        # instructs calling `compare_phone`/`send_otp`+`verify_otp`
+        # BEFORE this, for any phone that isn't the channel identity -
+        # but nothing in this tool itself used to check that actually
+        # happened, so a model that skipped straight here (a prompt-
+        # following slip, not a deliberate bypass) would still return a
+        # real patient's private appointment details - doctor, branch,
+        # date, time - to whoever is messaging, for a phone number they
+        # never proved was theirs. `_phone_is_verified` is TRUE only for
+        # the conversation's own channel number, a real `compare_phone`
+        # match, or a successful `verify_otp` recorded THIS session -
+        # never just because the model asserts it already checked.
+        if not _phone_is_verified(state, phone):
+            logger.warning(
+                "lookup_appointment: refusing phone-path lookup for an unverified number "
+                "(session_id=%s) - compare_phone/verify_otp must succeed first",
+                state.get("session_id"),
+            )
+            return {"status": "phone_not_verified"}
 
     base_url = _base_url(state)
 
@@ -941,7 +970,10 @@ def verify_otp(state: Annotated[AgentState, InjectedState], phone: str, otp: str
 
     if OTP_PROVIDER == "authentica":
         result = api.authentica_verify_otp(normalized, otp)
-        return {"status": "otp_valid" if result["success"] else "otp_invalid"}
+        if result["success"]:
+            _mark_phone_verified(state, phone)
+            return {"status": "otp_valid"}
+        return {"status": "otp_invalid"}
 
     record = _otp_storage.get(normalized)
 
@@ -952,6 +984,7 @@ def verify_otp(state: Annotated[AgentState, InjectedState], phone: str, otp: str
         return {"status": "otp_invalid"}
 
     if str(otp).strip() == str(record["otp"]):
+        _mark_phone_verified(state, phone)
         return {"status": "otp_valid"}
 
     return {"status": "otp_invalid"}
@@ -1042,10 +1075,65 @@ def _get_booking_session(session_id: str) -> dict:
         # this exists alongside last_list rather than replacing it.
         "known_branch_names": set(),
         "known_doctor_names": set(),
+        # Every phone number this session has actually PROVEN belongs
+        # to the person messaging - via a `compare_phone` match against
+        # their own channel identity, or a successful `verify_otp` - see
+        # `_mark_phone_verified` below. This is a SERVER-SIDE gate, not
+        # a prompt instruction: `lookup_appointment`'s phone path and
+        # `create_new_booking` both refuse to run against a phone
+        # number that isn't in here (or isn't the channel identity
+        # itself), regardless of what the model believes it already
+        # did. Prompt instructions alone are not enforcement - this is.
+        "verified_phones": set(),
     })
     session["_touched_at"] = time.monotonic()
     _prune_booking_sessions()
     return session
+
+
+def _mark_phone_verified(state: AgentState, phone: Optional[str]) -> None:
+    """Record that `phone` has been proven to belong to this
+    conversation's user - via a channel-identity match or a successful
+    OTP - so `lookup_appointment`/`create_new_booking` will accept it
+    without re-verifying. See `_get_booking_session`'s
+    `verified_phones` for why this exists as a separate, persistent,
+    session-scoped set rather than trusting the model's own account of
+    what it already checked."""
+
+    session_id = state.get("session_id")
+    normalized = normalize_phone_number(phone, state) if phone else None
+    if not session_id or not normalized:
+        return
+
+    session = _get_booking_session(session_id)
+    session["verified_phones"].add(normalized)
+
+
+def _phone_is_verified(state: AgentState, phone: Optional[str]) -> bool:
+    """True when `phone` is either this conversation's own verified
+    channel identity, or has been proven via `_mark_phone_verified`
+    (a real compare_phone match or a successful verify_otp) earlier in
+    THIS session. False for anything else - including a phone number
+    that merely LOOKS like it was mentioned earlier, or one the model
+    simply asserts is fine."""
+
+    normalized = normalize_phone_number(phone, state) if phone else None
+    if not normalized:
+        return False
+
+    channel_normalized = normalize_phone_number(state.get("channel_phone"), state) if state.get("channel_phone") else None
+    if channel_normalized and normalized == channel_normalized:
+        return True
+
+    session_id = state.get("session_id")
+    if not session_id:
+        return False
+
+    session = _BOOKING_SESSIONS.get(session_id)
+    if not session:
+        return False
+
+    return normalized in (session.get("verified_phones") or set())
 
 
 
@@ -5086,13 +5174,26 @@ def get_patient_info(state: Annotated[AgentState, InjectedState], mobile_number:
     for a NEW BOOKING - to avoid re-asking for their name/email if
     they've booked before. Returns:
     {"status": "found", "patientFullName": ..., "mobileNumber": ..., "email": ...}
+        # exactly ONE patient is registered under this number - use
+        # their name (and email, if present) directly, don't re-ask.
+    {"status": "found_multiple", "patients": [{"patientFullName": ..., "email": ...}, ...]}
+        # MORE THAN ONE patient is registered under this number (a
+        # shared family phone is common). Show each name as a short
+        # numbered list and ask which one this booking is for - or
+        # whether they'd like to add a NEW name instead. Never silently
+        # pick the first one, and never merge/guess between them.
     {"status": "not_found"}  # not registered - collect name/email fresh
     {"status": "too_early"}
         # No appointment time has been shown yet, so it is too early to
         # be collecting personal details - go back and show the
         # available times for the chosen day first, let the patient pick
         # one, and only then ask for their phone number.
-    {"status": "not_configured"} / {"status": "error"}"""
+    {"status": "not_configured"} / {"status": "error"}
+    {"status": "phone_not_verified"}  # mobile_number isn't the channel
+        # identity and hasn't been verified in this conversation (no
+        # successful compare_phone match, no successful verify_otp). Go
+        # complete that verification for this exact number BEFORE
+        # calling this tool again - never retry as-is."""
 
     session = _get_booking_session(state.get("session_id"))
     if not session.get("slots_shown"):
@@ -5111,6 +5212,19 @@ def get_patient_info(state: Annotated[AgentState, InjectedState], mobile_number:
             "reason": "no appointment time has been shown or chosen yet - show the available times first",
         }
 
+    # SERVER-SIDE ENFORCEMENT, NOT JUST A PROMPT RULE - same reasoning
+    # as `lookup_appointment`/`create_new_booking`'s equivalent checks:
+    # this reveals a real patient's name/email for a phone number, so
+    # it must not run against a number nobody has proven belongs to the
+    # person messaging.
+    if not _phone_is_verified(state, mobile_number):
+        logger.warning(
+            "get_patient_info: refusing lookup for an unverified mobile_number "
+            "(session_id=%s) - compare_phone/verify_otp must succeed first",
+            state.get("session_id"),
+        )
+        return {"status": "phone_not_verified"}
+
     base_url = _doctors_base_url(state)
     if not base_url:
         logger.warning("get_patient_info called but no doctors_base_url is configured for client_id=%s", state.get("client_id"))
@@ -5126,6 +5240,24 @@ def get_patient_info(state: Annotated[AgentState, InjectedState], mobile_number:
     items = data.get("items", [])
     if not items or not data.get("totalCount"):
         return {"status": "not_found"}
+
+    # CONFIRMED REAL GAP: this used to silently take items[0] and
+    # discard the rest, even though a phone number shared by a family
+    # can legitimately have several registered patients on file. Taking
+    # the first one silently risks booking the appointment under the
+    # WRONG family member's name - the tool never told the model there
+    # was ever a choice to make.
+    if len(items) > 1:
+        return {
+            "status": "found_multiple",
+            "patients": [
+                {
+                    "patientFullName": i.get("patientFullName"),
+                    "email": i.get("email"),
+                }
+                for i in items
+            ],
+        }
 
     item = items[0]
     return {
@@ -6236,7 +6368,12 @@ def create_new_booking(
         # patient plainly which detail wasn't accepted, ask for a
         # corrected one, and try the booking again with it. Never
         # describe this as a temporary technical problem.
-    {"status": "not_configured"} / {"status": "error"}"""
+    {"status": "not_configured"} / {"status": "error"}
+    {"status": "phone_not_verified"}  # mobile_number isn't the channel
+        # identity and hasn't been verified in this conversation (no
+        # successful compare_phone match, no successful verify_otp). Go
+        # complete that verification for this exact number BEFORE
+        # calling this tool again - never retry as-is."""
 
     session_id = state.get("session_id")
     session = _get_booking_session(session_id)
@@ -6247,6 +6384,23 @@ def create_new_booking(
         return {"status": "missing_doctor"}
     if not branch_id:
         return {"status": "missing_branch"}
+
+    # SERVER-SIDE ENFORCEMENT, NOT JUST A PROMPT RULE - same reasoning
+    # as `lookup_appointment`'s equivalent check. STEP NB6 in the
+    # prompt already instructs compare_phone/send_otp+verify_otp for
+    # any number that isn't the channel identity, but nothing in this
+    # tool previously checked that actually happened before creating a
+    # real appointment under that number - a prompt-following slip here
+    # would book (and hand a real reference number for) an appointment
+    # under a phone number nobody ever proved belonged to the person
+    # messaging.
+    if not _phone_is_verified(state, mobile_number):
+        logger.warning(
+            "create_new_booking: refusing to book for an unverified mobile_number "
+            "(session_id=%s) - compare_phone/verify_otp must succeed first",
+            session_id,
+        )
+        return {"status": "phone_not_verified"}
 
     base_url = _doctors_base_url(state)
     if not base_url:
