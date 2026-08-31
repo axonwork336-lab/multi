@@ -3141,6 +3141,8 @@ def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
     # nothing in it and is correctly reported as invented - this is the
     # SAME loop as the normal case, just with an empty comparison set
     # instead of a special early exit.
+    known_branches = _known_branch_text(state)
+
     invented = []
     for match in _DOCTOR_MENTION_RE.finditer(reply_text):
         raw_candidate = match.group(1)
@@ -3151,17 +3153,44 @@ def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
         # A branch listing also uses "1️⃣ <name>" formatting, and a bare
         # branch name (e.g. "المنار") passes the person-name shape test
         # just as easily as a real doctor name does. Branch entries are
-        # followed by an address line ("العنوان: ..."), which no doctor
-        # entry ever has - use that as the disambiguator so branch lists
-        # don't get misread as an invented doctor roster.
+        # normally followed by an address, which no doctor entry ever
+        # has - use that as the disambiguator so branch lists don't get
+        # misread as an invented doctor roster.
         # CONFIRMED REAL FALSE POSITIVE (medtown, 2026-08-30): a 2-branch
         # list ("1️⃣ المنار / العنوان: ...", "2️⃣ النزهة / العنوان: ...")
         # was rejected twice as invented doctors, forcing the generic
         # fallback error message to go out instead of a valid answer.
         lookahead = reply_text[match.end():match.end() + 120]
-        if "العنوان" in lookahead:
-            continue
+        # SECOND CONFIRMED REAL FALSE POSITIVE (medtown, 2026-08-30,
+        # same session, immediately after the first fix landed): the
+        # literal word "العنوان" is not the only way an address shows
+        # up. The model also writes it inline with no label at all -
+        # "1️⃣ الطوارئ - مركز تناسق للرعاية الطبية العاجلة، RQMA3217، "
+        # "7131 ابن النفيس، الرياض 14222" - which has no "العنوان"
+        # anywhere, so that check alone still let a 3-branch list get
+        # rejected twice and replaced with the generic fallback error.
+        # Two more signals now count as "this is an address, not a
+        # doctor", either one sufficient:
+        #   1. The candidate name itself is one of this conversation's
+        #      known branches (tool results / client config) - reuse
+        #      the exact same source _find_invented_branches checks
+        #      against, so the two guards can't disagree with each
+        #      other about what a branch is.
+        #   2. The text right after the name has an address shape: a
+        #      run of 3+ digits (a building/unit number or postal
+        #      code like "14222") together with a comma - a doctor
+        #      entry is never followed by that combination.
         candidate = _norm_ar(raw_candidate)
+        is_known_branch = candidate and (
+            candidate in known_branches
+            or any(part in known_branches for part in candidate.split() if len(part) >= 3)
+        )
+        looks_like_address = bool(
+            "العنوان" in lookahead
+            or (re.search(r"\d{3,}", lookahead) and "،" in lookahead)
+        )
+        if is_known_branch or looks_like_address:
+            continue
         # Substring either way: tool results carry titles and suffixes
         # the reply trims ("د. طه مبروك" vs "طه مبروك — استشاري").
         if any(candidate in k or k in candidate for k in known):
