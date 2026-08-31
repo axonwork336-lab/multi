@@ -2888,6 +2888,20 @@ def _known_branch_text(state: AgentState) -> str:
         if "branch" in key.lower() and isinstance(value, str):
             parts.append(value)
 
+    # PERSISTENT MEMORY, NOT JUST THIS TURN'S MESSAGE HISTORY.
+    # CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-31): a reply
+    # correctly named "فرع الطوارئ" - a branch the patient had already
+    # been shown by name three turns earlier - and was rejected twice
+    # as an invented branch anyway, because scanning `state["messages"]`
+    # alone no longer surfaced that name as raw text by the time this
+    # turn's reply was checked. `tools._remember_list` already tracks
+    # every branch name ANY tool has ever returned in this session,
+    # independent of whichever list was shown most recently - fold it
+    # in here so this check can't go blind to a name the conversation
+    # was legitimately told about earlier.
+    for name in tools.get_known_entity_names(state.get("session_id"), "branch"):
+        parts.append(name)
+
     return _norm_ar(" | ".join(str(p) for p in parts))
 
 
@@ -2979,6 +2993,13 @@ def _doctor_names_from_tools(state: AgentState) -> set:
                     _collect(value)
 
         _collect(data)
+
+    # Same persistent-memory reasoning as `_known_branch_text` above -
+    # fold in every doctor name `tools._remember_list` has ever recorded
+    # for this session, not just what's still scannable in this turn's
+    # message history.
+    for name in tools.get_known_entity_names(state.get("session_id"), "doctor"):
+        names.add(_norm_ar(name))
 
     return {n for n in names if n}
 
