@@ -1487,9 +1487,11 @@ def _shape_doctor_list(raw_items: list, language: str = "ar") -> list:
 
 
 def _doctors_with_real_slots(state: AgentState, base_url: str, doctor_ids: list,
-                              branch_id: str) -> Optional[set]:
+                              branch_id: Optional[str] = None) -> Optional[set]:
     """Which of `doctor_ids` genuinely have at least one open (non-booked)
-    schedule slot at `branch_id` within the normal booking window - ONE
+    schedule slot - at `branch_id` if given, or across ALL branches when
+    `branch_id` is None (used by `find_available_doctors`'s clinic-wide/
+    no-branch-chosen search) - within the normal booking window. ONE
     batched call for the whole roster, not one per doctor.
 
     WHY THIS EXISTS: confirmed real production failure. The doctor-list
@@ -1557,7 +1559,8 @@ def _doctors_with_real_slots(state: AgentState, base_url: str, doctor_ids: list,
             continue
 
         result = api.get_doctor_schedule_slots(
-            base_url, doctor_ids=[doctor_id], branch_ids=[branch_id],
+            base_url, doctor_ids=[doctor_id],
+            branch_ids=[branch_id] if branch_id else None,
             from_date=now.isoformat(), to_date=window_end.isoformat(),
             is_booked=False, page_size=1000,
             language=conversation_language(state),
@@ -2599,6 +2602,37 @@ def find_available_doctors(
     # "nobody is available".
     available = [i for i in items if i.get("hasSlots") is not False]
 
+    # RESCUE DOCTORS THE hasSlots FLAG WRONGLY EXCLUDED.
+    #
+    # `hasSlots` is already trusted leniently (only excluded when
+    # explicitly False - see the comment above), but that still means a
+    # doctor with a stale/incorrect False flag never even reaches this
+    # list, no matter how the patient asks. CONFIRMED REAL PRODUCTION
+    # CLASS OF BUG: د. وائل عويس had a live, in-effect rota and genuinely
+    # open slots at a branch, yet a roster built from this same
+    # hasSlots-filtered field silently excluded him (see
+    # `_doctors_with_real_slots`'s docstring) - fixed there by
+    # cross-checking the real schedule-slots endpoint per doctor rather
+    # than trusting the flag. This applies that identical cross-check
+    # here, for every doctor this call is about to tell the patient
+    # "isn't available" - scoped to the same branch(es) this search
+    # already used, or clinic-wide when no branch was chosen - so a
+    # doctor who is actually bookable is never hidden by a bad flag.
+    excluded_ids = [i.get("id") for i in items if i.get("hasSlots") is False and i.get("id")]
+    if excluded_ids:
+        rescue_branch_id = branch_ids[0] if branch_ids else None
+        verified_ids = _doctors_with_real_slots(state, base_url, excluded_ids, rescue_branch_id)
+        if verified_ids:
+            rescued = [i for i in items if i.get("id") in verified_ids]
+            if rescued:
+                logger.info(
+                    "find_available_doctors: rescued %d doctor(s) whose hasSlots=False did not "
+                    "match real open slots: %s",
+                    len(rescued), [{"id": i.get("id"), "name": i.get("name")} for i in rescued],
+                )
+                already_in = {i.get("id") for i in available}
+                available = available + [i for i in rescued if i.get("id") not in already_in]
+
     logger.info(
         "find_available_doctors: specialty_ids=%s api_returned=%d after_hasSlots_filter=%d",
         specialty_ids, len(items), len(available),
@@ -2652,6 +2686,23 @@ def find_available_doctors(
         if broader_result["success"]:
             broader_items = (broader_result["data"] or {}).get("items", [])
             broader_available = [i for i in broader_items if i.get("hasSlots") is not False]
+
+            # Same rescue as the primary search above - a stale hasSlots
+            # flag must not hide a genuinely bookable doctor here either.
+            broader_excluded_ids = [i.get("id") for i in broader_items if i.get("hasSlots") is False and i.get("id")]
+            if broader_excluded_ids:
+                broader_verified_ids = _doctors_with_real_slots(state, base_url, broader_excluded_ids, None)
+                if broader_verified_ids:
+                    broader_rescued = [i for i in broader_items if i.get("id") in broader_verified_ids]
+                    if broader_rescued:
+                        logger.info(
+                            "find_available_doctors (broader search): rescued %d doctor(s) whose "
+                            "hasSlots=False did not match real open slots: %s",
+                            len(broader_rescued), [{"id": i.get("id"), "name": i.get("name")} for i in broader_rescued],
+                        )
+                        already_in_broader = {i.get("id") for i in broader_available}
+                        broader_available = broader_available + [i for i in broader_rescued if i.get("id") not in already_in_broader]
+
             logger.info(
                 "find_available_doctors: narrow search found 0, broadened to all specialties: api_returned=%d after_hasSlots_filter=%d",
                 len(broader_items), len(broader_available),
