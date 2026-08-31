@@ -6373,7 +6373,12 @@ def create_new_booking(
         # identity and hasn't been verified in this conversation (no
         # successful compare_phone match, no successful verify_otp). Go
         # complete that verification for this exact number BEFORE
-        # calling this tool again - never retry as-is."""
+        # calling this tool again - never retry as-is.
+    {"status": "missing_patient_name"}  # patient_full_name is empty or
+        # doesn't look like a real full name (at least two name parts).
+        # Go ask the patient for their full name FIRST - never call
+        # this tool with a placeholder, a single word, or an empty
+        # string just to see what the API says."""
 
     session_id = state.get("session_id")
     session = _get_booking_session(session_id)
@@ -6384,6 +6389,26 @@ def create_new_booking(
         return {"status": "missing_doctor"}
     if not branch_id:
         return {"status": "missing_branch"}
+
+    # SERVER-SIDE ENFORCEMENT, NOT JUST A PROMPT RULE. STEP NB6 already
+    # instructs asking for the patient's full name (at least two parts)
+    # before ever reaching STEP NB7/this tool - but nothing here
+    # actually checked that happened. CONFIRMED REAL PRODUCTION
+    # FAILURE: this tool was called with an empty patient_full_name,
+    # the API rejected it ("PatientFullName Required"), and the model
+    # only THEN went back to ask for the name - a wasted round trip to
+    # a real external booking API for a value that was never going to
+    # be accepted. Catching it here, before the API call, is faster and
+    # keeps the failure entirely within this project's own validation
+    # rather than depending on the booking system's error message.
+    name_parts = re.findall(r"[^\W\d_]{2,}", patient_full_name or "", re.UNICODE)
+    if len(name_parts) < 2:
+        logger.warning(
+            "create_new_booking: refusing to book with patient_full_name=%r "
+            "(session_id=%s) - not a real full name (need at least 2 parts)",
+            patient_full_name, session_id,
+        )
+        return {"status": "missing_patient_name"}
 
     # SERVER-SIDE ENFORCEMENT, NOT JUST A PROMPT RULE - same reasoning
     # as `lookup_appointment`'s equivalent check. STEP NB6 in the
@@ -6401,6 +6426,7 @@ def create_new_booking(
             session_id,
         )
         return {"status": "phone_not_verified"}
+
 
     base_url = _doctors_base_url(state)
     if not base_url:
