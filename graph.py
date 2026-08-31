@@ -436,13 +436,19 @@ def _build_available_days_directive(messages: list, session_id: str) -> str:
 
     single = len(days) == 1
 
-    if not single:
+    if single:
+        header = "أقرب موعد متاح"
+        if doctor_name:
+            header = f"أقرب موعد متاح عند {doctor_name}"
+        if branch_name:
+            header = f"{header} في {branch_name}"
+    else:
         header = "🗓️ المواعيد المتاحة"
         if doctor_name:
             header = f"🗓️ مواعيد {doctor_name} المتاحة"
         if branch_name:
             header = f"{header} في {branch_name}"
-        header += ":"
+    header += ":"
 
     lines = []
     for i, day in enumerate(days):
@@ -455,34 +461,21 @@ def _build_available_days_directive(messages: list, session_id: str) -> str:
         )
 
     if single:
-        # SAME LABELED-BLOCK SHAPE AS `resolve_available_day`'s own
-        # directive above ("👨‍⚕️ الطبيب / 📍 الفرع / 📅 اليوم / ⏰ الأوقات
-        # المتاحة") - this is the "SHOW THE SOONEST DAY" path for the
-        # exact same information reached a different way (the patient
-        # never named a weekday themselves; `list_available_days_for_
-        # booking` returned only one date on its own). Before this fix,
-        # the two paths produced two different-looking messages for
-        # what the patient experiences as the identical question -
-        # confirmed real inconsistency: one showed a plain "أقرب موعد
-        # متاح عند [doctor] في [branch]: [day] [date] — من [from] إلى
-        # [to]" line, the other showed this same information as a
-        # labeled block - same data, two different shapes depending on
-        # which path happened to produce it.
+        # PLAIN-PROSE SHAPE, NOT A LABELED BLOCK - explicit, direct
+        # request: "أقرب موعد متاح عند [doctor] في [branch]: [day] —
+        # [date] من [from] إلى [to] / هل يناسبك هذا الموعد؟", matching
+        # this exact reference screenshot rather than the emoji-labeled
+        # style used for OTHER message types (e.g. cancellation
+        # confirmations). Do not reintroduce the labeled-block shape
+        # here without checking first - it was tried and explicitly
+        # rejected.
         day = days[0]
         weekday = day.get("weekday_display") or day.get("weekday_name") or ""
-        date_display = day.get("date_display") or ""
-        first_time = day.get("firstTime") or ""
-        last_time = day.get("lastTime") or ""
-
-        block_lines = []
-        if doctor_name:
-            block_lines.append(f"👨\u200d⚕️ الطبيب: {doctor_name}")
-        if branch_name:
-            block_lines.append(f"📍 الفرع: {branch_name}")
-        block_lines.append(f"📅 اليوم: {weekday} {date_display}".rstrip())
-        if first_time and last_time:
-            block_lines.append(f"⏰ الأوقات المتاحة: من {first_time} إلى {last_time}")
-        block = "\n".join(block_lines)
+        block = (
+            f"{header}\n"
+            f"🗓️ {weekday} {day.get('date_display') or ''} — "
+            f"من {day.get('firstTime') or ''} إلى {day.get('lastTime') or ''}"
+        ).strip()
     else:
         block = header + "\n" + "\n".join(lines)
 
@@ -881,38 +874,51 @@ def _build_resolved_day_directive(messages: list, session_id: str) -> str:
     first_time = data.get("first_time_display") or ""
     last_time = data.get("last_time_display") or ""
 
-    # Same label order as everywhere else in this project, per the
-    # response contract: doctor -> branch -> day -> date -> time range.
-    lines = []
+    # PLAIN-PROSE SHAPE - explicit, direct request: "أقرب موعد متاح عند
+    # [doctor] في [branch]: [day] — [date] من [from] إلى [to] / هل
+    # يناسبك هذا الموعد؟", matching this exact reference screenshot -
+    # same shape as `_build_available_days_directive`'s single-day
+    # case above, so this information looks identical everywhere in
+    # the flow no matter which tool call produced it. Do not switch
+    # this to a labeled emoji block without checking first - it was
+    # tried and explicitly rejected.
+    header = "أقرب موعد متاح"
     if doctor_name:
-        lines.append(f"👨\u200d⚕️ الطبيب: {doctor_name}")
+        header = f"أقرب موعد متاح عند {doctor_name}"
     if branch_name:
-        lines.append(f"📍 الفرع: {branch_name}")
-    lines.append(f"📅 اليوم: {weekday} {date_display}".rstrip())
-    # The DAY's overall available-time RANGE, not one narrow slot in it.
-    # CONFIRMED REAL PRODUCTION CONFUSION this line fixes: without it,
+        header = f"{header} في {branch_name}"
+    header += ":"
+
+    # The DAY's overall available-time RANGE, not one narrow slot in
+    # it. CONFIRMED REAL PRODUCTION CONFUSION this fixes: without it,
     # the model would grab the single nearest open SLOT's own
     # start/end (e.g. "11:00 - 11:30") and present that 30-minute
     # window as if it were the whole day's offer, instead of the day's
-    # actual availability ("11:00 صباحًا - 3:00 مساءً"). Omitted
-    # entirely (rather than shown blank) when either time is missing,
-    # so an old/short-circuited result never prints a dangling "من  إلى".
-    if first_time and last_time:
-        lines.append(f"⏰ الأوقات المتاحة: من {first_time} إلى {last_time}")
-
-    block = "\n".join(lines)
+    # actual availability ("11:00 صباحًا - 3:00 مساءً").
+    time_range = f" — من {first_time} إلى {last_time}" if first_time and last_time else ""
+    block = f"{header}\n🗓️ {weekday} {date_display}{time_range}".strip()
 
     return (
         "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
         "The nearest genuinely-available date was just resolved. Your "
         "ENTIRE reply must be the exact text between the START/END "
-        "markers below, copied verbatim (translate the LABELS only if "
-        "the conversation is in another language - keep the emoji, the "
-        "date, the time range and the names unchanged either way), "
-        "followed by exactly ONE question asking whether that day/time "
-        "range works for them. The START/END marker lines themselves "
-        "are NOT part of the text to copy - never include them, or any "
-        "line of dashes/equals-signs, in your actual reply.\n\n"
+        "markers below, copied verbatim (translate connecting words "
+        "only if the conversation is in another language - keep the "
+        "emoji, the date, the time range and the names unchanged "
+        "either way), followed by exactly ONE question asking whether "
+        "that DAY works for them - e.g. \"هل يناسبك هذا اليوم؟\". The "
+        "START/END marker lines themselves are NOT part of the text to "
+        "copy - never include them, or any line of dashes/equals-signs, "
+        "in your actual reply.\n\n"
+        "DO NOT ask \"هل يناسبك هذا اليوم والوقت؟\" (\"does this day AND "
+        "TIME suit you\") or anything implying a specific time was "
+        "already offered - the block above shows the DAY's whole "
+        "working-hours RANGE (e.g. \"من 2:30 مساءً إلى 4:30 مساءً\"), "
+        "not one bookable appointment time. Asking about \"the time\" "
+        "here reads as if agreeing commits them to a specific slot, "
+        "when in fact you still need to call `get_available_slots_for_"
+        "booking` next and offer the actual soonest one - CONFIRMED "
+        "REAL PATIENT CONFUSION this fixes. Ask about the DAY only.\n\n"
         "NEVER replace the time-range line below with one single "
         "specific appointment time (e.g. a slot's own start-end such as "
         "\"11:00 - 11:30\") - that is one bookable option among many, "
@@ -3131,19 +3137,16 @@ _SOONEST_FIRST_CORRECTION_DIRECTIVE = (
     "The patient chose a DAY, and your previous draft answered with "
     "every time on it. That is a wall of options where one sentence "
     "would have finished the booking.\n\n"
-    "Rewrite it as a single concrete offer using this EXACT labeled "
-    "shape - the same one used everywhere else in this project for a "
-    "single day/time offer (doctor -> branch -> day -> time range), so "
-    "this never reads as a different, less polished message than the "
-    "rest of the flow:\n"
-    "    👨\u200d⚕️ الطبيب: [doctor name]\n"
-    "    📍 الفرع: [branch name]\n"
-    "    📅 اليوم: [weekday] [date]\n"
-    "    ⏰ الأوقات المتاحة: من [earliest time] إلى [latest time]\n"
-    "then one question: does this day/time work for them?\n"
+    "Rewrite it as a single concrete offer - the EARLIEST time from the "
+    "tool result you already have - plus one question, in this exact "
+    "plain shape (the same one used everywhere else in this project "
+    "for a single day/time offer):\n"
+    "    أقرب موعد متاح عند [doctor name] في [branch name]:\n"
+    "    🗓️ [weekday] [date] — [earliest time]\n"
+    "    هل يناسبك هذا الموعد؟\n"
     "Take the doctor, branch, date and time verbatim from the tool "
-    "result; invent nothing. Omit the doctor/branch lines only if that "
-    "information genuinely isn't available yet.\n\n"
+    "result; invent nothing. Omit \"عند [doctor]\"/\"في [branch]\" only "
+    "if that information genuinely isn't available yet.\n\n"
     "Only if they say it does NOT suit them do you show the rest of the "
     "day's times as a numbered list.\n\n"
     "CONFIRMED REAL PRODUCTION FAILURE: the patient answered \"الأحد\" "
@@ -5225,6 +5228,17 @@ _REPLY_VERIFIERS = (
         lambda reply, state: _DAY_ALREADY_NAMED_CORRECTION_DIRECTIVE,
         "reply re-asked which day, but the patient's own last message already named "
         "a day matching one in the just-shown day list",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            agent_name in ("cancel", "reschedule")
+            and _reply_skips_reference_or_phone_question(reply, state)
+        ),
+        lambda reply, state: _REFERENCE_OR_PHONE_CORRECTION_DIRECTIVE,
+        "cancel/reschedule reply asked a phone-specific question (same WhatsApp "
+        "number? / send your phone number) without STEP 1's reference-or-phone "
+        "question ever being asked, and the patient never supplied either "
+        "themselves",
     ),
     (
         lambda reply, state, agent_name: _reply_asks_for_a_phone_already_known(reply, state),
@@ -7420,6 +7434,126 @@ def _build_branch_services_affirmation_directive(messages: list, session_id: str
         "المستشفى\" and four specialty names, while the branch's real "
         "catalogue held two actual services.\n\n"
     )
+
+
+_SAME_WHATSAPP_QUESTION_RE = re.compile(
+    r"نفس\s*رقم\s*(?:ال)?واتساب|نفس\s*(?:ال)?رقم\s*(?:اللي|الذي|ده)|"
+    r"same\s*whatsapp\s*number|same\s*number\s*you"
+)
+
+_ASKS_FOR_PHONE_DIRECTLY_RE = re.compile(
+    r"رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?هاتف|mobile\s*number|phone\s*number"
+)
+
+# The STEP 1 question itself - "reference or phone?" - in any of the
+# forms the clinic's own dialect/templates might render it, in Arabic
+# or English. Matched LOOSELY (either keyword pair, in either order)
+# since the exact wording varies per clinic template and per LLM
+# phrasing.
+_REFERENCE_OR_PHONE_QUESTION_RE = re.compile(
+    r"(?:رقم\s*(?:ال)?حجز|(?:ال)?رقم\s*(?:ال)?مرجعي|reference\s*(?:number)?).{0,40}"
+    r"(?:رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?هاتف|phone\s*number)|"
+    r"(?:رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?هاتف|phone\s*number).{0,40}"
+    r"(?:رقم\s*(?:ال)?حجز|(?:ال)?رقم\s*(?:ال)?مرجعي|reference\s*(?:number)?)"
+)
+
+# A booking reference ("GBN-2026-06-20-151") or anything that looks
+# like a real phone number (8+ digits) in the patient's OWN message -
+# STEP 1's "smart detection" legitimately skips the question when
+# either is already present, so this guard must not fire in that case.
+_REF_OR_PHONE_GIVEN_RE = re.compile(r"[A-Za-z]{2,}-\d|\+?\d{8,}")
+
+_IDENTITY_VERIFICATION_TOOLS = (
+    "lookup_appointment", "compare_phone", "send_otp", "verify_otp", "check_booking_status",
+)
+
+
+def _reply_skips_reference_or_phone_question(reply_text: str, state: AgentState) -> bool:
+    """True when a cancel/reschedule reply jumps straight to a
+    phone-specific question - "same WhatsApp number?" or an open
+    "send your phone number" - without STEP 1's "reference number or
+    phone number?" question ever having been asked anywhere earlier in
+    this conversation, and without the patient's own message ever
+    having supplied a reference or a phone number themselves (which is
+    the one case STEP 1 is explicitly allowed to skip via its own
+    "smart detection" rule).
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient said "عاوزه اعدل
+    معاد" (wants to modify an appointment) - no reference, no phone -
+    and the very next message was "نكمل تعديل موعدك على نفس رقم
+    الواتساب ده؟", skipping straight past the reference-or-phone choice
+    STEP 1 exists to ask. The patient never got a chance to say they'd
+    rather identify the booking by its reference number."""
+
+    if not reply_text:
+        return False
+
+    folded = _norm_ar(reply_text)
+    asks_same_number = bool(_SAME_WHATSAPP_QUESTION_RE.search(folded))
+    asks_for_phone_directly = bool(_ASKS_FOR_PHONE_DIRECTLY_RE.search(folded))
+
+    if not (asks_same_number or asks_for_phone_directly):
+        return False
+
+    # The reply itself IS the "reference or phone?" question (presents
+    # both options together) - that's STEP 1 being asked correctly
+    # right now, not skipped. Without this, the question's own mention
+    # of "phone number" as one of the two choices was matching
+    # `_ASKS_FOR_PHONE_DIRECTLY_RE` and flagging STEP 1's own question
+    # as having skipped itself.
+    if _REFERENCE_OR_PHONE_QUESTION_RE.search(folded):
+        return False
+
+    messages = state.get("messages") or []
+
+    # Already past STEP 1 in this conversation - an identity-
+    # verification tool has already run, so a phone-specific follow-up
+    # here is a legitimate LATER step, not a skipped first one.
+    for msg in messages:
+        if getattr(msg, "name", None) in _IDENTITY_VERIFICATION_TOOLS:
+            return False
+
+    from langchain_core.messages import AIMessage as _AIMessage, HumanMessage as _HumanMessage
+
+    # STEP 1's own question already appeared somewhere earlier.
+    for msg in messages:
+        if isinstance(msg, _AIMessage):
+            content = getattr(msg, "content", "")
+            text = content if isinstance(content, str) else str(content or "")
+            if _REFERENCE_OR_PHONE_QUESTION_RE.search(_norm_ar(text)):
+                return False
+
+    # The patient already supplied a reference or a phone number
+    # themselves - STEP 1's smart-detection rule allows skipping the
+    # question in that case.
+    for msg in messages:
+        if isinstance(msg, _HumanMessage):
+            content = getattr(msg, "content", "")
+            text = content if isinstance(content, str) else str(content or "")
+            if _REF_OR_PHONE_GIVEN_RE.search(text):
+                return False
+
+    return True
+
+
+_REFERENCE_OR_PHONE_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "ASK \"REFERENCE OR PHONE?\" FIRST - DO NOT SKIP STEP 1\n"
+    "============================================================\n"
+    "Your previous draft jumped straight to a phone-specific question "
+    "(\"same WhatsApp number?\" or asking for the phone number directly) "
+    "without ever asking the patient whether they'd rather identify "
+    "their booking by its REFERENCE NUMBER or by PHONE NUMBER. The "
+    "patient's own message contained neither, so this choice is theirs "
+    "to make, not yours to assume.\n\n"
+    "Rewrite this reply to ask that question instead - naturally, in "
+    "this clinic's own dialect, e.g. \"تحب تلغي/تعدل الموعد برقم الحجز "
+    "ولا برقم الجوال؟\". Only once they answer \"phone\" do you move on "
+    "to the same-WhatsApp-number question.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: \"عاوزه اعدل معاد\" (no "
+    "reference, no phone) was answered with \"نكمل تعديل موعدك على نفس "
+    "رقم الواتساب ده؟\" - skipping the choice entirely.\n\n"
+)
 
 
 def _reply_asks_for_a_phone_already_known(reply_text: str, state: AgentState) -> bool:
