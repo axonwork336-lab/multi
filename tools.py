@@ -7604,7 +7604,7 @@ def request_human_handoff(
 # covers both "address" wording and "how do I get there" wording, in
 # Arabic and English.
 _LOCATION_REQUEST_CUE_RE = re.compile(
-    r"عنوان|فين|وين|أين|اين|موقع|خريط[هة]|كيف\s*(?:أ|ا)وصل|"
+    r"عنوان|فين|وين|أين|اين|موقع|لوكيشن|خريط[هة]|كيف\s*(?:أ|ا)وصل|"
     r"ازاي\s*(?:أ|ا)روح|إزاي\s*(?:أ|ا)روح|طريقه\s*(?:ال)?وصول|"
     r"location|address|map|direction|how\s*(?:do\s*i|to)\s*get\s*there|"
     r"where\s*is"
