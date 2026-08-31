@@ -7626,15 +7626,15 @@ _REFERENCE_OR_PHONE_CORRECTION_DIRECTIVE = (
 
 
 _CHOSE_PHONE_PATH_RE = re.compile(
-    r"^\s*(?:رقم\s*)?(?:ال)?جوال\s*$|^\s*(?:رقم\s*)?(?:ال)?هاتف\s*$|"
-    r"^\s*(?:رقم\s*)?(?:ال)?تليفون\s*$|^\s*(?:رقم\s*)?(?:ال)?موبايل\s*$|"
-    r"^\s*phone\s*(?:number)?\s*$|^\s*mobile\s*(?:number)?\s*$|"
-    r"^\s*telephone\s*(?:number)?\s*$"
+    r"^\s*ب?\s*(?:رقم\s*)?(?:ال)?جوال\s*$|^\s*ب?\s*(?:رقم\s*)?(?:ال)?هاتف\s*$|"
+    r"^\s*ب?\s*(?:رقم\s*)?(?:ال)?تليفون\s*$|^\s*ب?\s*(?:رقم\s*)?(?:ال)?موبايل\s*$|"
+    r"^\s*(?:by\s*)?phone\s*(?:number)?\s*$|^\s*(?:by\s*)?mobile\s*(?:number)?\s*$|"
+    r"^\s*(?:by\s*)?telephone\s*(?:number)?\s*$"
 )
 
 _CHOSE_REFERENCE_PATH_RE = re.compile(
-    r"^\s*(?:رقم\s*)?(?:ال)?حجز\s*$|^\s*(?:ال)?رقم\s*(?:ال)?مرجعي\s*$|"
-    r"^\s*reference\s*(?:number)?\s*$"
+    r"^\s*ب?\s*(?:رقم\s*)?(?:ال)?حجز\s*$|^\s*ب?\s*(?:ال)?رقم\s*(?:ال)?مرجعي\s*$|"
+    r"^\s*(?:by\s*)?reference\s*(?:number)?\s*$"
 )
 
 
