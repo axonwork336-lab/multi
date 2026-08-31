@@ -5263,6 +5263,23 @@ _REPLY_VERIFIERS = (
         "phone at STEP 1",
     ),
     (
+        lambda reply, state, agent_name: (
+            agent_name in ("booking", "concierge")
+            and _reply_asks_same_number_before_booking_ready(reply, state)
+        ),
+        lambda reply, state: _PREMATURE_SAME_NUMBER_CORRECTION_DIRECTIVE,
+        "new-booking reply asked STEP NB6's same-WhatsApp-number question before "
+        "a doctor was confirmed and a time slot was selected in the booking "
+        "session",
+    ),
+    (
+        lambda reply, state, agent_name: _reply_wrongly_scope_refuses_after_otp_failure(reply, state),
+        lambda reply, state: _OTP_FAILURE_SCOPE_REFUSAL_CORRECTION_DIRECTIVE,
+        "reply used the out-of-scope refusal right after a failed OTP attempt, "
+        "when the patient's message should have been treated as another OTP "
+        "retry instead",
+    ),
+    (
         lambda reply, state, agent_name: _reply_asks_for_a_phone_already_known(reply, state),
         lambda reply, state: _PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE,
         "reply asked for a phone number (or a booking reference instead) right after "
@@ -7722,6 +7739,132 @@ _REFERENCE_REOFFER_CORRECTION_DIRECTIVE = (
     "at STEP 1, said \"لا\" to \"نكمل تعديل موعدك على نفس رقم الواتساب "
     "ده؟\", and was then asked for \"رقم الجوال ... أو رقم الحجز الخاص "
     "بك\" - reopening a decision already made one turn earlier.\n\n"
+)
+
+
+_NEW_BOOKING_SAME_NUMBER_QUESTION_RE = re.compile(
+    r"نكمل\s*الحجز\s*.{0,10}نفس\s*رقم\s*(?:ال)?واتساب|"
+    r"continue\s*(?:the\s*)?booking\s*.{0,10}same\s*whatsapp"
+)
+
+
+def _reply_asks_same_number_before_booking_ready(reply_text: str, state: AgentState) -> bool:
+    """True when a NEW BOOKING reply asks "same WhatsApp number?"
+    (STEP NB6) before a doctor is confirmed AND a time slot is
+    actually selected in this booking session - i.e. before STEP NB6's
+    own documented precondition is met.
+
+    CONFIRMED REAL PRODUCTION FAILURE: the patient's very first message
+    was "حجز جديد" (new booking, no specialty/doctor/time mentioned at
+    all), and the very next reply was "نكمل الحجز على نفس رقم واتساب
+    هذا؟ ✅" - STEP NB6's phone question, before STEP NB1 (specialty or
+    doctor?) had even been asked once. When the patient said "اه" to
+    that premature question, the NEXT reply then asked "وش التخصص اللي
+    حابة تحجزين فيه؟" - the flow's actual FIRST question, now arriving
+    dead last and out of order, reading as nonsensical to the patient."""
+
+    if not reply_text:
+        return False
+
+    folded = _norm_ar(reply_text)
+
+    if not _NEW_BOOKING_SAME_NUMBER_QUESTION_RE.search(folded):
+        return False
+
+    session_id = state.get("session_id")
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+
+    doctor_ready = bool(session.get("doctor_id"))
+    slot_ready = bool(session.get("selected_slot"))
+
+    if doctor_ready and slot_ready:
+        return False
+
+    return True
+
+
+_PREMATURE_SAME_NUMBER_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "TOO EARLY FOR \"SAME WHATSAPP NUMBER?\" - NO DOCTOR/SLOT YET\n"
+    "============================================================\n"
+    "Your previous draft asked whether to continue the booking on the "
+    "same WhatsApp number - STEP NB6 - but no doctor is confirmed and/or "
+    "no time slot has been selected in this booking session yet. STEP "
+    "NB6 is explicitly the LAST step, only reached after a doctor AND a "
+    "specific time slot are both locked in.\n\n"
+    "Rewrite this reply to continue the flow from wherever it actually "
+    "is instead: if nothing has been chosen yet, ask STEP NB1's opening "
+    "question - whether they'd like to start by specialty or by doctor "
+    "name. Never ask for phone/WhatsApp confirmation before the "
+    "appointment itself (doctor, branch, day, time) is fully settled.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: \"حجز جديد\" (no specialty, no "
+    "doctor mentioned) was answered with \"نكمل الحجز على نفس رقم "
+    "واتساب هذا؟ ✅\" - the LAST step of the flow, asked as the FIRST "
+    "reply. The patient said yes, and the very next message then asked "
+    "\"وش التخصص اللي حابة تحجزين فيه؟\" - the flow's real first "
+    "question, arriving after the phone question instead of before it.\n\n"
+)
+
+
+def _reply_wrongly_scope_refuses_after_otp_failure(reply_text: str, state: AgentState) -> bool:
+    """True when the reply is the fixed out-of-scope refusal, but the
+    most recent tool call in this conversation was `verify_otp`
+    returning "otp_invalid" - meaning the patient's message should have
+    been treated as ANOTHER OTP attempt (per this project's own
+    explicit rule: "the next message after THAT is also automatically
+    treated as the OTP"), not judged to be an unrelated, out-of-scope
+    topic.
+
+    CONFIRMED REAL PRODUCTION FAILURE: `verify_otp` returned
+    "otp_invalid", the reply correctly said the code was wrong and
+    asked to try again - then the patient answered "لا صحيح انا
+    متاكده" (ambiguous pushback, not a 6-digit code) and got the
+    clinic's canned "عذرًا 🌷 أنا لطيفة... مختصة بمساعدتك في خدمات
+    المستشفى..." scope refusal, completely abandoning the OTP retry
+    the patient was still actually mid-way through."""
+
+    if not reply_text:
+        return False
+
+    templates = state.get("templates") or {}
+    if not _is_scope_refusal(reply_text, templates):
+        return False
+
+    for msg in reversed(state.get("messages") or []):
+        if getattr(msg, "name", None) != "verify_otp":
+            continue
+        content = getattr(msg, "content", "")
+        text = content if isinstance(content, str) else str(content or "")
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            data = None
+        return isinstance(data, dict) and data.get("status") == "otp_invalid"
+
+    return False
+
+
+_OTP_FAILURE_SCOPE_REFUSAL_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "THIS IS AN OTP RETRY, NOT AN OUT-OF-SCOPE MESSAGE\n"
+    "============================================================\n"
+    "Your previous draft used the out-of-scope refusal, but the most "
+    "recent thing that happened in this conversation was an INCORRECT "
+    "OTP code. The patient is still in the middle of verifying their "
+    "phone number - this exchange never left hospital-service scope, "
+    "even if their message doesn't look like a fresh 6-digit code.\n\n"
+    "Per this project's own rule: the message right after a failed OTP "
+    "is ALWAYS treated as another OTP attempt. Call `verify_otp` again "
+    "with the patient's exact message as the `otp` argument and the "
+    "SAME phone number as before. If it's invalid again, tell them "
+    "plainly and ask them to double-check the code that arrived and "
+    "resend it - or offer a human handoff if this keeps failing. Never "
+    "fall back to the generic capability menu here.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: after a wrong OTP, the patient "
+    "wrote \"لا صحيح انا متاكده\" (ambiguous pushback, not a code) and "
+    "was told \"عذرًا 🌷 أنا لطيفة... مختصة بمساعدتك في خدمات "
+    "المستشفى...\" - the generic scope refusal, abandoning the OTP "
+    "verification they were still actively going through.\n\n"
 )
 
 
