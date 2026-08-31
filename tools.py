@@ -1036,10 +1036,17 @@ def _get_booking_session(session_id: str) -> dict:
         "doctor_id": None, "branch_id": None, "service_id": None,
         "last_list": None,  # {"entity_type": "doctor"/"branch", "items": [shaped items]}
         "specialty_ids": None,  # remembered so later steps reuse the same specialties
+        # Every branch/doctor name any tool has EVER returned in this
+        # conversation, kept SEPARATE from "last_list" and never
+        # overwritten by a later list - see _remember_list below for why
+        # this exists alongside last_list rather than replacing it.
+        "known_branch_names": set(),
+        "known_doctor_names": set(),
     })
     session["_touched_at"] = time.monotonic()
     _prune_booking_sessions()
     return session
+
 
 
 def _remember_specialty_ids(session: dict, specialty_ids: Optional[list]) -> None:
@@ -1078,7 +1085,33 @@ def _remember_list(state: AgentState, entity_type: str, items: list) -> None:
     """Record the list of doctors/branches just returned to the model, so
     a later bare-number reply can be resolved against the SAME ordering
     the user actually saw. Every tool that returns a user-facing list
-    must call this - see the comment above _BOOKING_SESSIONS."""
+    must call this - see the comment above _BOOKING_SESSIONS.
+
+    ALSO folds any branch/doctor name in `items` into the session's
+    PERMANENT known-name memory (`known_branch_names`/
+    `known_doctor_names`), separate from and in addition to
+    `last_list`.
+
+    WHY THIS SECOND, NEVER-OVERWRITTEN STORE EXISTS: `last_list` holds
+    only the MOST RECENT list - the very next tool call (a different
+    branch's services, a different specialty's doctors) replaces it
+    outright, by design, since it exists purely to resolve THIS turn's
+    bare-number reply against THIS turn's list. graph.py's
+    invented-branch/invented-doctor guards need the opposite property:
+    "has this name ever legitimately come from a tool in this whole
+    conversation", which must NOT be forgotten the moment a newer list
+    is shown. Before this, those guards read only `state["messages"]`
+    (the raw chat history) - CONFIRMED REAL PRODUCTION FAILURE
+    (medtown, 2026-08-31): a reply correctly named "فرع الطوارئ" (a
+    branch the patient had already been shown by name three turns
+    earlier) and was rejected twice as an invented branch, forcing the
+    generic fallback error, because whatever the guard could still see
+    in that turn's message history no longer surfaced that name as
+    substring text. `last_list` had already moved on to that turn's
+    service list by the time the check ran, so it couldn't help either
+    - this dedicated accumulator is the fix: once a name is seen, it
+    stays known for the rest of the conversation, independent of
+    whatever else has been shown since."""
 
     session_id = state.get("session_id")
     if not session_id:
@@ -1087,10 +1120,43 @@ def _remember_list(state: AgentState, entity_type: str, items: list) -> None:
     session = _get_booking_session(session_id)
     session["last_list"] = {"entity_type": entity_type, "items": list(items)}
 
+    if entity_type in ("branch", "doctor"):
+        bucket = session.setdefault(
+            "known_branch_names" if entity_type == "branch" else "known_doctor_names",
+            set(),
+        )
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("name", "altName", "formatedName", "doctorName"):
+                value = item.get(key)
+                if value:
+                    bucket.add(str(value))
+
     logger.info(
         "_remember_list: session_id=%s entity_type=%s count=%d",
         session_id, entity_type, len(items),
     )
+
+
+def get_known_entity_names(session_id: Optional[str], entity_type: str) -> set:
+    """Public accessor for graph.py's invented-branch/invented-doctor
+    guards - every branch or doctor name any tool has returned in this
+    session so far, regardless of what the most recent list was. See
+    `_remember_list` for why this is tracked separately from
+    `last_list`. Returns an empty set for a missing/unknown session
+    rather than creating one - a read-only check should never have the
+    side effect of starting a fresh booking session."""
+
+    if not session_id:
+        return set()
+
+    session = _BOOKING_SESSIONS.get(session_id)
+    if not session:
+        return set()
+
+    key = "known_branch_names" if entity_type == "branch" else "known_doctor_names"
+    return set(session.get(key) or set())
 
 
 # Arabic-Indic (٠-٩) and Extended Arabic-Indic (۰-۹) digits -> ASCII.
