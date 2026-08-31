@@ -267,7 +267,7 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         (10, r"(?:فين|وين|اين|أين|ايه\s*عنوان|ما\s*هو\s*عنوان)\s*\w*\s*(?:الفرع|المستشفى|العياده|العيادة)"),
         (10, r"\b(?:where\s+is|what(?:'|’)?s\s+the\s+address\s+of)\b[^.\n]{0,25}"
              r"\b(?:branch|hospital|clinic)\b"),
-        (10, r"(?:ايه|إيه|ما\s*هي|شنو|وش)\s*(?:هي\s*)?(?:الخدمات|خدماتكم|التخصصات|تخصصاتكم)"),
+        (10, r"(?:ايه|إيه|ما\s*هي|شنو|وش)\s*(?:هي\s*)?(?:ال)?(?:خدمات|تخصصات)(?:كم|\s+\S+)?"),
         (10, r"\bwhat\s+(?:services|specialt(?:y|ies)|departments)\b"),
         # Unambiguous enough to interrupt another flow: nobody asks
         # about opening hours as part of confirming a cancellation.
