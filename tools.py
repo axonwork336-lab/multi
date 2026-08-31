@@ -4918,6 +4918,43 @@ def match_entity_for_booking(
     return response
 
 
+# Generic, universal hospital/clinic department words that carry a
+# single unambiguous standard Arabic rendering everywhere - as opposed
+# to a clinic-specific PROPER NOUN branch name (e.g. "Al Manar",
+# "Downtown"), which has no safe generic translation and must keep
+# falling through to whatever the API actually has. Only used as a
+# LAST RESORT below, when the API row has no altName at all.
+#
+# WHY THIS EXISTS: CONFIRMED REAL PRODUCTION FAILURE (medtown,
+# 2026-08-31, recurring across 3 separate turns/sessions) - the
+# "Emergency" branch has no Arabic altName on file in the API, so this
+# function correctly (per its own contract) fell back to the raw
+# English "Emergency". The model, correctly following its own
+# instruction to always answer in the conversation's language, then
+# said "فرع الطوارئ" in its Arabic reply - a completely legitimate
+# translation of a generic, universal term. But every invented-branch
+# guard checks the reply against what tools actually RETURNED, and
+# every tool result on file only ever said "Emergency" in English -
+# never "الطوارئ" anywhere - so a 100% correct reply was rejected
+# twice as a fabricated branch, every single time this branch came up.
+# Filling in the standard Arabic name here, at the source, keeps the
+# tool's own data and the model's own (correct) reply in agreement,
+# rather than teaching every downstream guard to guess at translation
+# equivalence on its own.
+_GENERIC_BRANCH_NAME_AR = {
+    "emergency": "الطوارئ",
+    "emergency department": "الطوارئ",
+    "er": "الطوارئ",
+    "reception": "الاستقبال",
+    "outpatient": "العيادات الخارجية",
+    "outpatient clinic": "العيادات الخارجية",
+    "pharmacy": "الصيدلية",
+    "laboratory": "المختبر",
+    "lab": "المختبر",
+    "radiology": "الأشعة",
+}
+
+
 def _arabic_preferred_name(shaped_entity: dict) -> str:
     """Pick the Arabic-preferred display name for a doctor/branch:
     `altName` is confirmed, across every specialty/doctor/branch endpoint
@@ -4930,7 +4967,16 @@ def _arabic_preferred_name(shaped_entity: dict) -> str:
     alt = (shaped_entity.get("altName") or "").strip()
     if alt:
         return alt
-    return (shaped_entity.get("formatedName") or shaped_entity.get("name") or "").strip()
+
+    fallback = (shaped_entity.get("formatedName") or shaped_entity.get("name") or "").strip()
+
+    # Only a generic institutional word, never a clinic-specific proper
+    # noun, gets auto-translated - see _GENERIC_BRANCH_NAME_AR above.
+    generic_ar = _GENERIC_BRANCH_NAME_AR.get(fallback.lower())
+    if generic_ar:
+        return generic_ar
+
+    return fallback
 
 
 def _service_name(slot_item: dict, language: str = "ar") -> str:
