@@ -5110,6 +5110,17 @@ _GENERIC_BRANCH_NAME_AR = {
 }
 
 
+def _looks_arabic_text(text: str) -> bool:
+    """Whether the text contains any Arabic script at all.
+
+    graph.py has its own `_looks_arabic`, but tools.py cannot import
+    graph (graph imports tools), so this small check is duplicated
+    rather than shared.
+    """
+
+    return bool(re.search(r"[\u0600-\u06FF]", text or ""))
+
+
 def _arabic_preferred_name(shaped_entity: dict) -> str:
     """Pick the Arabic-preferred display name for a doctor/branch:
     `altName` is confirmed, across every specialty/doctor/branch endpoint
@@ -5809,6 +5820,21 @@ def _parse_iso_date(value):
 _EFFECTIVE_FROM_CANDIDATE_KEYS = (
     "effectiveFrom", "fromDateTimeFrom", "effectiveDate", "effectiveFromDate",
     "validFrom", "startDate", "fromDate", "scheduleFrom", "startEffectiveDate",
+    # ANSWERED, 2026-08-31: the warning below finally fired on a real
+    # medtown row and printed its actual keys. There is no
+    # "effectiveFrom"-style field on this API at all - the row's
+    # validity window is `fromDateTime`/`toDateTime`, both of which
+    # api.py already marks as confirmed against a real response
+    # (observed: fromDateTime=2026-08-31T12:30:00+00:00,
+    # toDateTime=2026-09-30T19:30:00+00:00). Its DATE is therefore the
+    # "Effective From" the admin panel shows, and the future-rota
+    # exemption - dead in production until now, since every candidate
+    # above returned None - can finally fire.
+    #
+    # Deliberately LAST: if any deployment does expose a dedicated
+    # field under one of the names above, that stays authoritative and
+    # this fallback is never reached.
+    "fromDateTime",
 )
 
 _effective_from_field_unknown_logged = False
@@ -6728,10 +6754,32 @@ def get_doctor_schedule_for_booking(
                     match = next((b for b in (branches_result["data"] or {}).get("items", []) if b.get("id") == only_branch_id), None)
                     if match:
                         session["branch_display_name"] = _arabic_preferred_name(match)
+                    else:
+                        logger.warning(
+                            "get_doctor_schedule_for_booking: branch_id=%s not found in the Branches list - "
+                            "falling back to the schedule row's own branchName %r, which may be English",
+                            only_branch_id, only_branch_name,
+                        )
+                else:
+                    logger.warning(
+                        "get_doctor_schedule_for_booking: get_branches failed (status_code=%s error=%s) - "
+                        "falling back to the schedule row's own branchName %r, which may be English",
+                        branches_result.get("status_code"), branches_result.get("error"), only_branch_name,
+                    )
             except Exception:
                 logger.exception("get_doctor_schedule_for_booking: failed to enrich auto-confirmed branch name")
             if not session.get("branch_display_name"):
                 session["branch_display_name"] = only_branch_name
+            if conversation_language(state) != "en" and not _looks_arabic_text(session.get("branch_display_name") or ""):
+                # Not fatal, but it is exactly the shape that used to
+                # destroy an entire reply via graph.py's mixed-language
+                # greeting guard, and it reads as unprofessional either
+                # way - so make it visible rather than silent.
+                logger.warning(
+                    "get_doctor_schedule_for_booking: branch_display_name=%r has no Arabic characters "
+                    "while this conversation is in Arabic (branch_id=%s)",
+                    session.get("branch_display_name"), only_branch_id,
+                )
             logger.info("get_doctor_schedule_for_booking: auto-confirmed single branch_id=%s (%s) for doctor_id=%s", only_branch_id, session.get("branch_display_name"), doctor_id)
 
     doctor_display_name = session.get("doctor_display_name")
