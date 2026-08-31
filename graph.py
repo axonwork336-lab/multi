@@ -3322,6 +3322,27 @@ def _find_invented_branches(reply_text: str, state: AgentState) -> list:
         # Also accept a partial: "الشيخ زايد" mentioned as "زايد".
         if any(part in known for part in name.split() if len(part) >= 3):
             continue
+        # DEFENSE IN DEPTH for the same class of bug
+        # `_arabic_preferred_name` is now fixed at the source for
+        # (Emergency -> الطوارئ etc.) - this covers any STALE session
+        # still holding the old English-only name from before that fix
+        # was deployed, or any other generic institutional word this
+        # guard hasn't been told the translation of yet. If the
+        # patient's own reply is naming a branch the tools reported
+        # only in English, and the Arabic name given here is the known
+        # standard translation of that English word, it isn't invented
+        # - it's a correct translation of a real tool result. Checked
+        # per WORD, not just the full candidate, for the same reason
+        # the direct-match fallback above is per-word: the extracted
+        # candidate can carry trailing words from the sentence after
+        # the branch name ("الطوارئ يقدم خدمة") when the verb that
+        # follows isn't in `_NOT_A_BRANCH_NAME`.
+        translated_parts = {
+            en for en, ar in tools._GENERIC_BRANCH_NAME_AR.items()
+            if ar in name.split()
+        }
+        if translated_parts and any(_norm_ar(en) in known for en in translated_parts):
+            continue
         if name not in invented:
             invented.append(name)
 
@@ -7165,6 +7186,19 @@ def _branches_named_by_tools(state: AgentState) -> set:
                     name = item.get("name") or item.get("branchName")
                     if name:
                         names.add(str(name))
+
+    # Same persistent-memory fix as `_known_branch_text`/
+    # `_doctor_names_from_tools` above - a THIRD independent
+    # message-scanning implementation of "which branches has this
+    # conversation been told about", with the identical blind spot: a
+    # branch this session legitimately saw several turns ago can stop
+    # being visible here even though it was never actually withdrawn.
+    # This function only ever produces a false NEGATIVE (missing a real
+    # branch just means this particular guard stays quiet, rather than
+    # wrongly rejecting a correct reply the way the invented-branch/
+    # invented-doctor guards did) - lower severity, but the same fix
+    # closes it the same way.
+    names |= tools.get_known_entity_names(state.get("session_id"), "branch")
 
     return names
 
