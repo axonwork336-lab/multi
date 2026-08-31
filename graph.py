@@ -436,19 +436,13 @@ def _build_available_days_directive(messages: list, session_id: str) -> str:
 
     single = len(days) == 1
 
-    if single:
-        header = "أقرب موعد متاح"
-        if doctor_name:
-            header = f"أقرب موعد متاح عند {doctor_name}"
-        if branch_name:
-            header = f"{header} في {branch_name}"
-    else:
+    if not single:
         header = "🗓️ المواعيد المتاحة"
         if doctor_name:
             header = f"🗓️ مواعيد {doctor_name} المتاحة"
         if branch_name:
             header = f"{header} في {branch_name}"
-    header += ":"
+        header += ":"
 
     lines = []
     for i, day in enumerate(days):
@@ -460,17 +454,38 @@ def _build_available_days_directive(messages: list, session_id: str) -> str:
             f"{_numbered_prefix(i + 1)} {weekday} {date_display} — من {first_time} إلى {last_time}".strip()
         )
 
-    if len(days) == 1:
-        # A single date is not a list - numbering one item reads oddly.
+    if single:
+        # SAME LABELED-BLOCK SHAPE AS `resolve_available_day`'s own
+        # directive above ("👨‍⚕️ الطبيب / 📍 الفرع / 📅 اليوم / ⏰ الأوقات
+        # المتاحة") - this is the "SHOW THE SOONEST DAY" path for the
+        # exact same information reached a different way (the patient
+        # never named a weekday themselves; `list_available_days_for_
+        # booking` returned only one date on its own). Before this fix,
+        # the two paths produced two different-looking messages for
+        # what the patient experiences as the identical question -
+        # confirmed real inconsistency: one showed a plain "أقرب موعد
+        # متاح عند [doctor] في [branch]: [day] [date] — من [from] إلى
+        # [to]" line, the other showed this same information as a
+        # labeled block - same data, two different shapes depending on
+        # which path happened to produce it.
         day = days[0]
         weekday = day.get("weekday_display") or day.get("weekday_name") or ""
-        block = (
-            f"{header}\n"
-            f"🗓️ {weekday} {day.get('date_display') or ''} — "
-            f"من {day.get('firstTime') or ''} إلى {day.get('lastTime') or ''}"
-        ).strip()
+        date_display = day.get("date_display") or ""
+        first_time = day.get("firstTime") or ""
+        last_time = day.get("lastTime") or ""
+
+        block_lines = []
+        if doctor_name:
+            block_lines.append(f"👨\u200d⚕️ الطبيب: {doctor_name}")
+        if branch_name:
+            block_lines.append(f"📍 الفرع: {branch_name}")
+        block_lines.append(f"📅 اليوم: {weekday} {date_display}".rstrip())
+        if first_time and last_time:
+            block_lines.append(f"⏰ الأوقات المتاحة: من {first_time} إلى {last_time}")
+        block = "\n".join(block_lines)
     else:
         block = header + "\n" + "\n".join(lines)
+
 
     if data.get("has_more") and single:
         more_instruction = (
@@ -3116,12 +3131,19 @@ _SOONEST_FIRST_CORRECTION_DIRECTIVE = (
     "The patient chose a DAY, and your previous draft answered with "
     "every time on it. That is a wall of options where one sentence "
     "would have finished the booking.\n\n"
-    "Rewrite it as a single concrete offer - the EARLIEST time from the "
-    "tool result you already have - plus one question:\n"
-    "    the doctor, the branch, the weekday and date, the time\n"
-    "    then: does that suit you?\n"
+    "Rewrite it as a single concrete offer using this EXACT labeled "
+    "shape - the same one used everywhere else in this project for a "
+    "single day/time offer (doctor -> branch -> day -> time range), so "
+    "this never reads as a different, less polished message than the "
+    "rest of the flow:\n"
+    "    👨\u200d⚕️ الطبيب: [doctor name]\n"
+    "    📍 الفرع: [branch name]\n"
+    "    📅 اليوم: [weekday] [date]\n"
+    "    ⏰ الأوقات المتاحة: من [earliest time] إلى [latest time]\n"
+    "then one question: does this day/time work for them?\n"
     "Take the doctor, branch, date and time verbatim from the tool "
-    "result; invent nothing.\n\n"
+    "result; invent nothing. Omit the doctor/branch lines only if that "
+    "information genuinely isn't available yet.\n\n"
     "Only if they say it does NOT suit them do you show the rest of the "
     "day's times as a numbered list.\n\n"
     "CONFIRMED REAL PRODUCTION FAILURE: the patient answered \"الأحد\" "
