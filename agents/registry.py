@@ -243,6 +243,8 @@ and never alter a slot value returned by
             "find_available_doctors",
             "find_best_doctor_in_specialty",
             "list_branches_for_specialty",
+            "list_hospital_services",
+            "list_branch_services",
             "match_entity_for_booking",
             "list_available_days_for_booking",
             "get_doctor_schedule_for_booking",
@@ -269,7 +271,14 @@ You are deliberately not given the tools that look up existing bookings.
 That is not an oversight - reaching for an existing booking mid-way
 through creating a new one has surfaced an unrelated patient's
 appointment before. Everything you need to identify this patient is in
-the flow below.""",
+the flow below.
+
+If the patient asks what SERVICES the hospital or a branch offers (not
+which medical specialties/doctors it has), that is a different question
+from this flow - call `list_hospital_services` (hospital-wide) or
+`list_branch_services` (one branch) for it, never `list_specialties` or
+`list_branches_for_specialty`, which are for medical specialties and
+booking availability, not the clinic's service catalogue.""",
     ),
 
     AgentSpec(
