@@ -3101,6 +3101,16 @@ _SOONEST_FIRST_CORRECTION_DIRECTIVE = (
 )
 
 
+# Broader than `_DOCTOR_CUE_WORD_RE` (defined later, used for a
+# different purpose at the `match_entity_info` call site) - this one
+# needs to catch the plural/title forms a doctor-roster REPLY actually
+# uses ("الدكاترة", "الأطباء", "استشاري", "أخصائي"), not just the
+# singular "دكتور"/"طبيب" a patient's own message tends to use.
+_DOCTOR_LIST_CUE_RE = re.compile(
+    r"دكتور|دكتوره|د\.|طبيب|أطباء|اطباء|الدكاترة|دكاترة|استشاري|أخصائي|اخصائي|doctor"
+)
+
+
 def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
     """Doctor names presented in a numbered list that no tool result in
     this conversation ever returned.
@@ -3123,6 +3133,24 @@ def _find_invented_doctors(reply_text: str, state: AgentState) -> list:
     alone."""
 
     if not reply_text:
+        return []
+
+    # GATE - the reply must actually be about doctors before we treat any
+    # numbered list in it as a doctor roster to verify. Without this, the
+    # "is this a person name?" test below is a DENYLIST (reject only
+    # times/dates/weekdays/anything-with-a-digit) rather than an
+    # ALLOWLIST for doctor content, so it also fires on any other
+    # numbered list a reply might legitimately contain - specialties,
+    # services, symptoms, FAQ items - none of which are doctor names at
+    # all, just multi-word Arabic phrases with no digits in them.
+    # CONFIRMED REAL FALSE POSITIVE CLASS (found while fixing the branch
+    # false positive above, same root cause): a specialty list
+    # ("1️⃣ جراحة العظام", "2️⃣ طب الأطفال"...), a services list, and a
+    # symptom list were ALL flagged as "invented doctors" with zero
+    # doctor-related wording anywhere in the reply. `_find_invented_branches`
+    # already guards itself this way (it requires "فرع" to appear at
+    # all before scanning) - this mirrors that same pattern for doctors.
+    if not _DOCTOR_LIST_CUE_RE.search(reply_text):
         return []
 
     known = _doctor_names_from_tools(state)
