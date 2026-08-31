@@ -2204,6 +2204,41 @@ def _latin_word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z]{2,}", text or ""))
 
 
+# ARABIZI / FRANCO-ARABIC: Arabic typed in Latin script, using digits
+# for the Arabic letters that have no Latin equivalent - 2 for ء/أ,
+# 3 for ع, 5 for خ, 6 for ط, 7 for ح, 8 for غ, 9 for ص. Extremely
+# common in Egypt and the Gulf, and it is ARABIC, not English.
+#
+# The digit must sit INSIDE a word, or open one that is clearly a word
+# rather than a time-of-day form, so that ordinary English containing a
+# numeral - "I need 2 appointments", "book me for 3 pm", "3pm" - is
+# never mistaken for Arabizi. Hence the 3-letter minimum on the
+# word-initial case: "3ayez"/"3aleko" match, "3pm" does not.
+_ARABIZI_RE = re.compile(
+    r"[A-Za-z][2356789][A-Za-z]"       # digit inside a word:  mass2oo, a7gz
+    r"|[A-Za-z]{2,}[2356789]\b"        # digit ends a word:    kha6er -> also mab3
+    r"|\b[2356789][A-Za-z]{3,}"        # digit opens a word:   3ayez, 3aleko
+)
+# DELIBERATE GAP: a 2-letter tail after a leading digit stays English,
+# because "3am"/"3pm"/"5pm" are real English times and breaking those
+# would be worse than missing the rarer Franco spelling of "عم" in
+# "ezayak ya 3am". Every longer Franco word ("3ayez", "3aleko",
+# "3arabi") is still caught.
+
+
+def _looks_arabizi(text: str) -> bool:
+    """Whether Latin-script text is actually Arabic written in Franco.
+
+    CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-31): the first
+    message of a conversation was "mass2oo" (مسعود). Classified as
+    English on the strength of its Latin letters alone, it produced an
+    English greeting stapled to the model's own Arabic question - one
+    message, two languages, on the clinic's very first contact.
+    """
+
+    return bool(_ARABIZI_RE.search(text or ""))
+
+
 def _detect_target_language(messages: list) -> Optional[str]:
     """
     Determine which language THIS reply must be in, deterministically -
@@ -2237,7 +2272,9 @@ def _detect_target_language(messages: list) -> Optional[str]:
         if _looks_arabic(content):
             return "ar"
         if _has_latin_letters(content):
-            return "en"
+            # Latin letters alone do not mean English - Franco-Arabic is
+            # written in Latin script and is Arabic. See _looks_arabizi.
+            return "ar" if _looks_arabizi(content) else "en"
 
     return None
 
@@ -7887,7 +7924,16 @@ _PREMATURE_SAME_NUMBER_CORRECTION_DIRECTIVE = (
     "NB6 is explicitly the LAST step, only reached after a doctor AND a "
     "specific time slot are both locked in.\n\n"
     "Rewrite this reply to continue the flow from wherever it actually "
-    "is instead: if nothing has been chosen yet, ask STEP NB1's opening "
+    "is instead.\n\n"
+    "FIRST, USE WHAT THE PATIENT ALREADY TOLD YOU - do not throw it "
+    "away and do not restart from the menu. If their messages so far "
+    "already named a doctor, a specialty, a branch, or a day, carry "
+    "straight on from there: match the doctor with "
+    "`match_entity_for_booking` (a slightly misspelled name is still a "
+    "name - match it rather than asking them to retype it), or take up "
+    "the specialty/branch/day they gave, and ask only the next thing "
+    "genuinely still missing.\n\n"
+    "ONLY if nothing at all has been chosen yet, ask STEP NB1's opening "
     "question - whether they'd like to start by specialty or by doctor "
     "name. Never ask for phone/WhatsApp confirmation before the "
     "appointment itself (doctor, branch, day, time) is fully settled.\n\n"
@@ -7897,6 +7943,14 @@ _PREMATURE_SAME_NUMBER_CORRECTION_DIRECTIVE = (
     "reply. The patient said yes, and the very next message then asked "
     "\"وش التخصص اللي حابة تحجزين فيه؟\" - the flow's real first "
     "question, arriving after the phone question instead of before it.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE (2026-08-31): the opposite "
+    "mistake, made while correcting this one. The patient opened with "
+    "\"حجز مع دكتور احمد عقيا يوم الثلاثاء\" - a doctor AND a day - and "
+    "the corrected reply printed the full 7-item specialty menu, "
+    "discarding both. They answered \"دكتور احمد\" and were told to "
+    "write the doctor's full name, which they had already given twice. "
+    "Correcting a premature phone question must never cost the patient "
+    "information they already provided.\n\n"
 )
 
 
