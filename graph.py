@@ -5263,6 +5263,13 @@ _REPLY_VERIFIERS = (
         "phone at STEP 1",
     ),
     (
+        lambda reply, state, agent_name: _reply_reasks_identity_after_verification(reply, state),
+        lambda reply, state: _IDENTITY_REASK_CORRECTION_DIRECTIVE,
+        "reply asked for a phone number or booking reference even though this "
+        "session already has a verified phone AND lookup_appointment already "
+        "found a real booking earlier in the conversation",
+    ),
+    (
         lambda reply, state, agent_name: (
             agent_name in ("booking", "concierge")
             and _reply_asks_same_number_before_booking_ready(reply, state)
@@ -5409,12 +5416,6 @@ _REPLY_VERIFIERS = (
         lambda reply, state, agent_name: _reply_reoffers_doctor_roster_after_confirming_one(reply, state),
         lambda reply, state: _DOCTOR_ROSTER_CORRECTION_DIRECTIVE,
         "reply confirmed a doctor then offered the doctor roster again in the same message",
-    ),
-    (
-        lambda reply, state, agent_name: _reply_dumps_times_without_offering_soonest(reply, state),
-        lambda reply, state: _SOONEST_FIRST_CORRECTION_DIRECTIVE,
-        "reply answered a day choice with the full time list instead of offering the "
-        "soonest appointment first",
     ),
     (
         lambda reply, state, agent_name: bool(_find_invented_doctors(reply, state)),
@@ -7739,6 +7740,85 @@ _REFERENCE_REOFFER_CORRECTION_DIRECTIVE = (
     "at STEP 1, said \"لا\" to \"نكمل تعديل موعدك على نفس رقم الواتساب "
     "ده؟\", and was then asked for \"رقم الجوال ... أو رقم الحجز الخاص "
     "بك\" - reopening a decision already made one turn earlier.\n\n"
+)
+
+
+def _reply_reasks_identity_after_verification(reply_text: str, state: AgentState) -> bool:
+    """True when the reply asks for a phone number or booking reference
+    to identify the patient, even though identity is ALREADY fully
+    established for this session: a phone number has already been
+    verified (via `compare_phone`/`verify_otp`) AND `lookup_appointment`
+    has already found a real booking earlier in this same conversation.
+    Re-asking at that point isn't a scoping edge case - it's asking the
+    patient to prove who they are a second time after they already did.
+
+    WHY THIS IS SEPARATE FROM `_reply_skips_reference_or_phone_question`:
+    that guard requires the reply (or the last human message) to
+    mention "تعديل"/"إلغاء" wording, specifically so it doesn't misfire
+    on the unrelated new-booking flow's own "same number?" question.
+    That scoping is exactly why it MISSES this failure - many turns
+    into an active, fully-identified reschedule flow, a bare "لا"
+    carries none of that wording, yet the identity work was already
+    done several turns earlier and must never be re-requested.
+
+    CONFIRMED REAL PRODUCTION FAILURE: OTP succeeded, `lookup_appointment`
+    found the booking ("👤 الاسم: حنين ايمن..."), the flow proceeded all
+    the way to offering a specific reschedule time ("هل يناسبك هذا
+    الموعد؟"), the patient said "لا" (declining that TIME, nothing to
+    do with identity), and the very next reply was "أعطني رقم جوالك مع
+    رمز الدولة أو رقم الحجز عشان أقدر أساعدك بالخطوة الجاية" - discarding
+    a fully verified identity and a found booking to ask for both all
+    over again."""
+
+    if not reply_text:
+        return False
+
+    folded = _norm_ar(reply_text)
+    asks = bool(_ASKS_FOR_PHONE_DIRECTLY_RE.search(folded)) or bool(
+        _REFERENCE_OR_PHONE_QUESTION_RE.search(folded)
+    )
+    if not asks:
+        return False
+
+    session_id = state.get("session_id")
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+    if not session.get("verified_phones"):
+        return False
+
+    for msg in state.get("messages") or []:
+        if getattr(msg, "name", None) != "lookup_appointment":
+            continue
+        content = getattr(msg, "content", "")
+        text = content if isinstance(content, str) else str(content or "")
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and data.get("status") in ("found_one", "found_many"):
+            return True
+
+    return False
+
+
+_IDENTITY_REASK_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "IDENTITY IS ALREADY VERIFIED - DO NOT ASK FOR PHONE/REFERENCE AGAIN\n"
+    "============================================================\n"
+    "Your previous draft asked the patient for their phone number or "
+    "booking reference - but this session already has a verified phone "
+    "number AND `lookup_appointment` already found their booking earlier "
+    "in this same conversation. Whatever the patient just said, it was "
+    "not a request to re-identify themselves - continue the flow from "
+    "where it actually is instead (the next date/time question, the "
+    "confirmation step, or whatever comes next), never a fresh "
+    "identification request.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: a fully verified reschedule flow "
+    "(OTP succeeded, booking found, a specific new time offered) had the "
+    "patient decline that TIME with a bare \"لا\" - and the reply then "
+    "asked for the phone number or booking reference all over again, as "
+    "if none of the identification that already happened had happened. "
+    "\"لا\" to a time offer means \"show me another time\", not \"forget "
+    "who I am.\"\n\n"
 )
 
 
