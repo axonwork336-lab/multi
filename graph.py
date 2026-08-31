@@ -5253,6 +5253,16 @@ _REPLY_VERIFIERS = (
         "themselves",
     ),
     (
+        lambda reply, state, agent_name: (
+            agent_name in ("cancel", "reschedule", "concierge")
+            and _reply_reoffers_reference_after_phone_chosen(reply, state)
+        ),
+        lambda reply, state: _REFERENCE_REOFFER_CORRECTION_DIRECTIVE,
+        "reply re-offered the booking reference as an identification method "
+        "even though the patient already specifically chose to identify by "
+        "phone at STEP 1",
+    ),
+    (
         lambda reply, state, agent_name: _reply_asks_for_a_phone_already_known(reply, state),
         lambda reply, state: _PHONE_ALREADY_KNOWN_CORRECTION_DIRECTIVE,
         "reply asked for a phone number (or a booking reference instead) right after "
@@ -7600,6 +7610,104 @@ _REFERENCE_OR_PHONE_CORRECTION_DIRECTIVE = (
     "CONFIRMED REAL PRODUCTION FAILURE: \"عاوزه اعدل معاد\" (no "
     "reference, no phone) was answered with \"نكمل تعديل موعدك على نفس "
     "رقم الواتساب ده؟\" - skipping the choice entirely.\n\n"
+)
+
+
+_CHOSE_PHONE_PATH_RE = re.compile(
+    r"^\s*(?:رقم\s*)?(?:ال)?جوال\s*$|^\s*(?:رقم\s*)?(?:ال)?هاتف\s*$|"
+    r"^\s*phone\s*(?:number)?\s*$|^\s*mobile\s*(?:number)?\s*$"
+)
+
+_CHOSE_REFERENCE_PATH_RE = re.compile(
+    r"^\s*(?:رقم\s*)?(?:ال)?حجز\s*$|^\s*(?:ال)?رقم\s*(?:ال)?مرجعي\s*$|"
+    r"^\s*reference\s*(?:number)?\s*$"
+)
+
+
+def _reply_reoffers_reference_after_phone_chosen(reply_text: str, state: AgentState) -> bool:
+    """True when the reply re-offers the booking-reference option
+    ("...أو رقم الحجز") even though the patient already explicitly
+    chose to identify by PHONE at STEP 1, earlier in this same
+    conversation - re-opening a choice that was already made.
+
+    CONFIRMED REAL PRODUCTION FAILURE: STEP 1 asked "تحب تعدل موعدك
+    باستخدام رقم الحجز ولا رقم الجوال؟", the patient answered "رقم
+    الجوال" - a clear, specific choice - then said "لا" to the
+    same-WhatsApp-number follow-up. The next message asked "من فضلك
+    أرسل رقم الجوال مع رمز الدولة أو رقم الحجز الخاص بك..." - reference
+    number, back on the table, despite the patient never having been
+    given a reason to reconsider. Once "phone" is chosen, every
+    following question in this identification step must stay about
+    phone numbers only - a different NUMBER is fine to ask for, a
+    different METHOD is not, unless the patient brings it up again
+    themselves."""
+
+    if not reply_text:
+        return False
+
+    folded = _norm_ar(reply_text)
+
+    if not _REFERENCE_OR_PHONE_QUESTION_RE.search(folded):
+        return False
+
+    messages = state.get("messages") or []
+
+    # Already past STEP 1 with a real lookup underway - a reference
+    # number offered again here (e.g. a genuine "not found, try
+    # something else?" recovery) is a different, legitimate situation,
+    # not this one.
+    for msg in messages:
+        if getattr(msg, "name", None) in _IDENTITY_VERIFICATION_TOOLS:
+            return False
+
+    from langchain_core.messages import AIMessage as _AIMessage3, HumanMessage as _HumanMessage3
+
+    # Scan for the exact pattern: an AI message asking STEP 1's
+    # reference-or-phone question, immediately followed by a human
+    # reply that is a bare, specific choice of "phone" (not "reference",
+    # not something ambiguous - only a clean single-method pick counts).
+    chose_phone = False
+    asked_step1 = False
+    for msg in messages:
+        if isinstance(msg, _AIMessage3):
+            content = getattr(msg, "content", "")
+            text = content if isinstance(content, str) else str(content or "")
+            asked_step1 = bool(_REFERENCE_OR_PHONE_QUESTION_RE.search(_norm_ar(text)))
+        elif isinstance(msg, _HumanMessage3) and asked_step1:
+            content = getattr(msg, "content", "")
+            text = content if isinstance(content, str) else str(content or "")
+            folded_reply = _norm_ar(text)
+            if _CHOSE_PHONE_PATH_RE.search(folded_reply):
+                chose_phone = True
+            elif _CHOSE_REFERENCE_PATH_RE.search(folded_reply):
+                # They chose reference, not phone - re-offering both
+                # later would be a different (currently unaddressed)
+                # situation, not this bug.
+                chose_phone = False
+            asked_step1 = False
+
+    return chose_phone
+
+
+_REFERENCE_REOFFER_CORRECTION_DIRECTIVE = (
+    "============================================================\n"
+    "THE PATIENT ALREADY CHOSE \"PHONE\" - DON'T RE-OFFER \"REFERENCE\"\n"
+    "============================================================\n"
+    "Your previous draft asked for the phone number OR the booking "
+    "reference - but the patient already specifically answered \"رقم "
+    "الجوال\" (phone) when STEP 1 asked them to choose. Re-opening that "
+    "choice now reads as if their answer was never registered.\n\n"
+    "Rewrite the reply to ask ONLY for the phone number - e.g. \"من "
+    "فضلك أرسل رقم الجوال مع رمز الدولة\" - with no mention of the "
+    "booking reference as an alternative. If a phone-based lookup later "
+    "genuinely comes back empty, THAT is when offering the reference "
+    "number as a fallback becomes appropriate - not here, right after "
+    "they picked phone and simply declined the same-WhatsApp-number "
+    "shortcut.\n\n"
+    "CONFIRMED REAL PRODUCTION FAILURE: patient answered \"رقم الجوال\" "
+    "at STEP 1, said \"لا\" to \"نكمل تعديل موعدك على نفس رقم الواتساب "
+    "ده؟\", and was then asked for \"رقم الجوال ... أو رقم الحجز الخاص "
+    "بك\" - reopening a decision already made one turn earlier.\n\n"
 )
 
 
