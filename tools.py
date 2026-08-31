@@ -1510,23 +1510,39 @@ def _doctors_with_real_slots(state: AgentState, base_url: str, doctor_ids: list,
 
 def _doctors_at_branch(state: AgentState, base_url: str, branch_id: str) -> list:
     """Fetch the available doctors at one branch, narrowed to the
-    specialties this booking is already about (when known), and remember
-    the list for positional selection.
+    specialty AND service this booking is already about (when known),
+    and remember the list for positional selection.
 
     Exists because "which doctors are here" changes the moment a branch
     is confirmed - not every doctor works at every branch. Without this,
     the model would re-display doctor names it had shown BEFORE the
     branch was picked, which is both wrong (some of them don't work
     there) and unselectable (the remembered list at that point is the
-    BRANCH list, so a reply of "2" resolves to nothing)."""
+    BRANCH list, so a reply of "2" resolves to nothing).
+
+    CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-08-31): a booking
+    that started from a SERVICE pick ("جلسة إستشارة أخصائي التغذية")
+    never had `specialty_ids` set on the session - only `service_id`
+    was. The patient then typed a branch name directly ("النزهة"),
+    which resolves through this function - and this function only ever
+    filtered by `specialty_ids`, never by `service_id`, even though
+    `api.get_doctors` supports `service_ids` for exactly this case (see
+    its own docstring) and other call sites in this same file already
+    use it correctly. The result: this returned ALL 4 doctors who work
+    at that branch generally, with zero filtering for whether any of
+    them actually offer this specific service - and the model then
+    told the patient "no doctors available for this service", a claim
+    the (unfiltered) tool result never actually supported either way."""
 
     session = _get_booking_session(state.get("session_id"))
     specialty_ids = session.get("specialty_ids") or None
+    service_ids = [session["service_id"]] if session.get("service_id") else None
 
     now = datetime.utcnow()
     result = api.get_doctors(
         base_url,
         specialty_ids=specialty_ids,
+        service_ids=service_ids,
         branch_ids=[branch_id],
         has_published_service=True,
         has_service_schedule=True,
