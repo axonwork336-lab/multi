@@ -460,6 +460,16 @@ def _build_available_days_directive(messages: list, session_id: str) -> str:
             f"{_numbered_prefix(i + 1)} {weekday} {date_display} — من {first_time} إلى {last_time}".strip()
         )
 
+    # IF THIS DAY LIST IS THE ANSWER TO A DAY THEY NAMED AND COULDN'T
+    # HAVE, the correction leads the block. See
+    # `_rejected_day_lead_for_day_list` - by the time this directive
+    # runs, the `resolve_available_day` result that carried the bad news
+    # is no longer the last message, so nothing else would carry it into
+    # the reply and the patient's actual question would go unanswered.
+    rejected_day_lead = _rejected_day_lead_for_day_list(messages, session_id)
+    if rejected_day_lead:
+        header = rejected_day_lead + "\n" + header
+
     if single:
         # PLAIN-PROSE SHAPE, NOT A LABELED BLOCK - explicit, direct
         # request: "أقرب موعد متاح عند [doctor] في [branch]: [day] —
@@ -873,6 +883,42 @@ def _build_resolved_day_directive(messages: list, session_id: str) -> str:
 
     first_time = data.get("first_time_display") or ""
     last_time = data.get("last_time_display") or ""
+
+    # DID THE PATIENT CHOOSE THIS DAY, OR ARE WE OFFERING IT?
+    #
+    # The block below - "أقرب موعد متاح ... هل يناسبك هذا اليوم؟" - is
+    # written for the second case, where the assistant proposes a day
+    # and needs a yes. Sent to someone who asked for Tuesday by name, it
+    # asks them to approve their own choice, and it contradicts the
+    # GLOBAL HARD RULE that a SETTLED day is answered with its full time
+    # list ("whether the patient named it themselves or accepted a day
+    # you offered"). A day the patient named IS settled the moment the
+    # tool confirms it exists, so that turn owes them times, not another
+    # yes/no.
+    named = _named_weekday_in_latest_human(messages)
+    patient_chose_this_day = bool(
+        named and named["english"].lower() == str(data.get("weekday_name") or "").lower()
+    )
+
+    if patient_chose_this_day:
+        return (
+            "[INTERNAL INSTRUCTION - NOT FOR THE USER - READ CAREFULLY]\n"
+            "The patient asked for " + weekday + " themselves, and it is "
+            "genuinely available (" + date_display + "). The day is "
+            "SETTLED - they chose it, you confirmed it exists, and there "
+            "is nothing left to agree on.\n\n"
+            "Do NOT ask whether this day suits them. Do NOT ask whether "
+            "they would like to see the times. Both hand back a decision "
+            "they have already made, and the second is pure dead weight - "
+            "they named the day, so they obviously want its times.\n\n"
+            "Your ONLY next action is to call "
+            "`get_available_slots_for_booking` with this result's own "
+            "`from_date`/`to_date`, copied verbatim - never a date you "
+            "worked out yourself - and then show every time it returns, "
+            "numbered, in the same reply as a one-line confirmation of "
+            "the day.\n\n"
+            "Call the tool now.\n\n"
+        )
 
     # PLAIN-PROSE SHAPE - explicit, direct request: "أقرب موعد متاح عند
     # [doctor] في [branch]: [day] — [date] من [from] إلى [to] / هل
@@ -1357,6 +1403,21 @@ def _build_show_soonest_day_directive(messages: list, session_id: str) -> str:
     if not messages or not session_id:
         return ""
 
+    # THE PATIENT ASKED FOR A SPECIFIC DAY - STAND DOWN.
+    #
+    # This directive and `_build_named_day_directive` give directly
+    # opposite instructions ("show the soonest date" vs "check the day
+    # they named"), and both are correct in their own situation. When a
+    # day has actually been named, this one must not be in the prompt at
+    # all: it is by far the more emphatic of the two, and with both
+    # present it won - the patient asked for Tuesday and was shown
+    # Sunday, which is the exact complaint this pass exists to fix. Same
+    # precedent as the appointment-display / wrong-tool pair in
+    # `_run_agent`: when two directives contradict, one of them is
+    # suppressed in code rather than left to compete.
+    if _build_named_day_directive(messages, session_id):
+        return ""
+
     from langchain_core.messages import HumanMessage as _HumanMessage
 
     last = messages[-1]
@@ -1452,6 +1513,623 @@ def _build_show_soonest_day_directive(messages: list, session_id: str) -> str:
         "reply asked \"ممكن تخبرني اليوم اللي تفضله؟ مثلاً الجمعة، "
         "السبت؟\" - two weekdays that came from nowhere.\n\n"
         "Call the tool now.\n\n"
+    )
+
+
+# ============================================================
+# THE DAY THE PATIENT NAMED THEMSELVES
+# ============================================================
+#
+# WHY THIS WHOLE SECTION EXISTS: a booking request routinely arrives
+# with the day already in it -
+#
+#     "عاوزه احجز معاد مع دكتور احمد العقيل يوم التلات"
+#
+# and the flow used to throw the day away. NB3's directive
+# (`_build_show_soonest_day_directive`) fires the instant a doctor is
+# settled and says, in the strongest terms available, "call
+# `list_available_days_for_booking` and show the SOONEST date". That is
+# exactly right when the patient has expressed no preference, and
+# exactly wrong here: they named Tuesday, and they got offered Sunday.
+#
+# The two outcomes the patient actually needs are:
+#   - the doctor DOES have Tuesday open -> show Tuesday's times, rather
+#     than starting the day conversation over from the beginning;
+#   - the doctor does NOT work Tuesday -> say so in plain words, then
+#     show the days they DO work, exactly as the normal flow would.
+#
+# Neither is safe to answer from the model's own head, so both go
+# through `resolve_available_day`, which already distinguishes "found"
+# from "fully_booked" from "not_found". What was missing was anything
+# telling the model to call it at all on this turn, plus a deterministic
+# shape for the "he doesn't work that day" sentence.
+
+# The specialists that can actually start a NEW booking - i.e. the ones
+# bound to `match_entity_for_booking` AND `resolve_available_day`. Every
+# named-day / multi-intent rule below is written in terms of those two
+# calls, so it belongs only to these.
+_NEW_BOOKING_AGENTS = ("booking", "concierge")
+
+_DAY_INTENT_TOOLS = (
+    "resolve_available_day", "get_available_slots_for_booking",
+    "select_appointment_slot", "create_new_booking",
+)
+
+
+def _latest_human_index(messages: list) -> int:
+    """Index of the most recent HumanMessage, or -1."""
+
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "human":
+            return i
+    return -1
+
+
+def _named_weekday_in_latest_human(messages: list) -> Optional[dict]:
+    """The weekday the patient named in their OWN most recent message,
+    or None.
+
+    Deliberately reads only the latest human message: a day mentioned
+    five turns ago has either been acted on already or been superseded,
+    and treating it as a live request is how a patient ends up pushed
+    back onto a day they had moved off.
+
+    Colloquial spellings resolve here just as they do inside the tools -
+    `tools.resolve_weekday_index` is the single source of truth for what
+    counts as a day name, so a directive and a tool can never disagree
+    about whether "التلات" is Tuesday.
+    """
+
+    index = _latest_human_index(messages)
+    if index < 0:
+        return None
+
+    content = getattr(messages[index], "content", "")
+    text = content if isinstance(content, str) else str(content)
+    if not text.strip():
+        return None
+
+    weekday = tools.resolve_weekday_index(text)
+    if weekday is None:
+        return None
+
+    english = ["Monday", "Tuesday", "Wednesday", "Thursday",
+               "Friday", "Saturday", "Sunday"][weekday]
+
+    return {
+        "index": weekday,
+        "english": english,
+        "display": _ARABIC_DAY_NAMES.get(english.lower(), english),
+        "human_index": index,
+    }
+
+
+def _tool_results_since_latest_human(messages: list, tool_names: tuple) -> list:
+    """Every ToolMessage from `tool_names` that arrived AFTER the
+    patient's latest message - i.e. work done in response to what they
+    just said, not to something earlier in the conversation."""
+
+    start = _latest_human_index(messages)
+    if start < 0:
+        return []
+
+    return [
+        msg for msg in messages[start + 1:]
+        if getattr(msg, "name", None) in tool_names
+    ]
+
+
+def _build_named_day_directive(messages: list, session_id: str) -> str:
+    """The patient named a day. Route this turn through
+    `resolve_available_day` for THAT day instead of the soonest-date
+    path, and spell out what to do with each of its results.
+
+    Fires only while the day is still unanswered - as soon as
+    `resolve_available_day` (or the slots call, or the booking itself)
+    has run for this message, the day has been dealt with and the normal
+    directives take over again.
+
+    It fires whether or not the doctor is already in the booking
+    session. When they are not, the instruction is to confirm the doctor
+    FIRST and then check the day in the same turn - because the single
+    most common shape of this request names both at once, and splitting
+    it across two turns is exactly the "starting over from the
+    beginning" this is here to stop.
+    """
+
+    if not messages or not session_id:
+        return ""
+
+    named = _named_weekday_in_latest_human(messages)
+    if not named:
+        return ""
+
+    # Already handled on this turn - the day question is closed.
+    if _tool_results_since_latest_human(messages, _DAY_INTENT_TOOLS):
+        return ""
+
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+
+    # THE DAY IS ALREADY ON THE TABLE, WITH REAL DATES ATTACHED.
+    #
+    # When a day list has just been shown and the patient answers by
+    # naming one of ITS days, the dates are already in hand and
+    # `_build_day_confirmation_requires_tool_directive` already says the
+    # right thing: take that day's from_date/to_date verbatim and call
+    # `get_available_slots_for_booking`. Firing here as well would put a
+    # second, differently-worded instruction ("call
+    # `resolve_available_day`") beside it - the same
+    # competing-directives problem this whole area has been bitten by
+    # before, for the sake of re-deriving a date the tools already gave
+    # us. Days NOT in that list still come here, which is exactly what
+    # NB4 prescribes.
+    last_list = session.get("last_list") or {}
+    if last_list.get("entity_type") == "day":
+        for day in last_list.get("items") or []:
+            if str(day.get("weekday_name") or "").strip().lower() == named["english"].lower():
+                return ""
+
+    doctor_confirmed = bool(session.get("doctor_id"))
+
+    # A day only means something once there is a doctor to check it
+    # against. Without one - and without one even on the table - this is
+    # a day mentioned in some other context ("كنت جاي الخميس اللي فات"),
+    # not a booking preference, and forcing a tool call would be worse
+    # than leaving the turn alone.
+    doctor_on_the_table = doctor_confirmed
+    if not doctor_on_the_table:
+        for msg in reversed(messages):
+            if getattr(msg, "name", None) in (
+                "match_entity_for_booking", "find_available_doctors",
+                "find_best_doctor_in_specialty", "list_branches_for_specialty",
+            ):
+                doctor_on_the_table = True
+                break
+
+    if not doctor_on_the_table:
+        return ""
+
+    doctor_name = session.get("doctor_display_name") or ""
+    branch_name = session.get("branch_display_name") or ""
+    who = " (" + doctor_name + ")" if doctor_name else ""
+
+    confirm_first = "" if doctor_confirmed else (
+        "THE DOCTOR IS NOT IN THE BOOKING SESSION YET. Call "
+        "`match_entity_for_booking(user_input=<the doctor's name exactly "
+        "as the patient typed it>, entity_type=\"doctor\")` FIRST - that "
+        "call is what saves them - and then check the day, in this same "
+        "turn. Do not stop after confirming the doctor and make the "
+        "patient repeat a day they already gave you.\n\n"
+    )
+
+    fully_booked_line = (
+        "  - \"fully_booked\": the doctor DOES work " + named["display"]
+        + (" at " + branch_name if branch_name else "")
+        + ", but every slot is taken. Say exactly that, then call "
+        "`list_available_days_for_booking` in the same turn and show the "
+        "days that are open.\n"
+    )
+
+    return (
+        "============================================================\n"
+        "THE PATIENT NAMED A DAY - CHECK THAT DAY, NOT THE SOONEST ONE\n"
+        "============================================================\n"
+        "Their latest message names a specific weekday: "
+        + named["display"] + " (" + named["english"] + ").\n\n"
+        + confirm_first
+        + "Your ONLY next action for the day is:\n"
+        "    resolve_available_day(weekday_name=\"" + named["english"] + "\")\n\n"
+        "Do NOT call `list_available_days_for_booking` on this turn. That "
+        "tool answers \"when is the soonest?\" - a question the patient "
+        "did not ask. Calling it here offers them some other date and "
+        "silently drops the day they chose, which reads as if you had "
+        "not listened.\n\n"
+        "Do NOT ask them which day they want. They just told you. Do NOT "
+        "ask them to confirm the day back to you either - checking it IS "
+        "the confirmation.\n\n"
+        "Do NOT state, out of your own knowledge, whether the doctor"
+        + who + " works " + named["display"] + ". You do not know that "
+        "until the tool answers. Claiming the doctor does not come in on "
+        + named["display"] + " - or that they do - before this call is a "
+        "fabrication, and the most damaging kind here, because the "
+        "patient will plan their day around it.\n\n"
+        "WHAT TO DO WITH EACH RESULT:\n"
+        "  - \"found\": that day genuinely has open slots. Confirm the day "
+        "in one short line and, in the SAME turn, call "
+        "`get_available_slots_for_booking` with the result's own "
+        "`from_date`/`to_date` copied verbatim, then show the times. Do "
+        "not go back to a day list - the day is settled.\n"
+        + fully_booked_line
+        + "  - \"not_found\": the doctor has no clinic on " + named["display"]
+        + " here at all. Say exactly that - plainly, without apologising "
+        "at length - and then call `list_available_days_for_booking` in "
+        "the same turn and show the days they DO work. One message: the "
+        "correction and the real days together.\n"
+        "  - \"unrecognized_day\": ask which day they meant. Never guess.\n"
+        "  - \"missing_branch\": the branch has to be settled before a day "
+        "can be checked - handle the branch, then come straight back to "
+        "this day.\n\n"
+        "In every one of those cases the day the patient named is the "
+        "subject of your reply. Never answer it with a different date as "
+        "though the question had been \"when is your next opening?\".\n\n"
+    )
+
+
+# The exact opening sentence for "the day you asked for isn't bookable".
+# Deterministic for the same reason every other patient-facing block in
+# this file is: this sentence IS the answer to what they asked, and
+# written freehand it came out differently every time - and sometimes
+# not at all.
+_DAY_UNAVAILABLE_LEAD = {
+    ("not_found", "ar"): "{doctor} ما عنده عيادة يوم {day}{branch}.",
+    ("not_found", "en"): "{doctor} doesn't hold a clinic on {day}{branch}.",
+    ("fully_booked", "ar"): "{doctor} بيجي يوم {day}{branch}، بس كل المواعيد محجوزة.",
+    ("fully_booked", "en"): "{doctor} does work on {day}{branch}, but every slot is already taken.",
+}
+
+_DAY_UNAVAILABLE_NO_DOCTOR = {
+    ("not_found", "ar"): "ما فيه عيادة يوم {day}{branch}.",
+    ("not_found", "en"): "There is no clinic on {day}{branch}.",
+    ("fully_booked", "ar"): "يوم {day}{branch} كل المواعيد محجوزة.",
+    ("fully_booked", "en"): "{day}{branch} is fully booked.",
+}
+
+
+def _day_unavailable_lead(messages: list, session_id: str, data: dict) -> str:
+    """The one sentence that answers "what about the day I asked for?",
+    built from a `resolve_available_day` payload.
+
+    Shared by the directive that fires on that tool result AND by the
+    day-list directive that fires one tool call later - see
+    `_rejected_day_lead_for_day_list` for why the second one needs it.
+    """
+
+    status = data.get("status")
+    if status not in ("not_found", "fully_booked"):
+        return ""
+
+    named = _named_weekday_in_latest_human(messages)
+    session = tools._BOOKING_SESSIONS.get(session_id) or {}
+
+    # The day name comes from the TOOL when it supplied one
+    # ("fully_booked" does), and from the patient's own message
+    # otherwise ("not_found" carries no day back) - never from the
+    # model's memory of the conversation.
+    day_display = data.get("weekday_display") or (named or {}).get("display") or ""
+    if not day_display:
+        return ""
+
+    language = "en" if _detect_target_language(messages) == "en" else "ar"
+    doctor_name = session.get("doctor_display_name") or ""
+    branch_name = session.get("branch_display_name") or ""
+
+    if language == "ar":
+        branch_part = (" في " + branch_name) if branch_name else ""
+    else:
+        branch_part = (" at " + branch_name) if branch_name else ""
+
+    # A separate wording for the no-name case rather than formatting an
+    # empty {doctor} into the normal one: "الدكتور  ما عنده عيادة" with
+    # a hole where the name should be is worse than a sentence written
+    # for that situation in the first place.
+    table = _DAY_UNAVAILABLE_LEAD if doctor_name else _DAY_UNAVAILABLE_NO_DOCTOR
+    return table[(status, language)].format(
+        doctor=doctor_name, day=day_display, branch=branch_part,
+    )
+
+
+def _rejected_day_lead_for_day_list(messages: list, session_id: str) -> str:
+    """The same sentence, recovered on the NEXT tool call.
+
+    WHY THIS IS NEEDED AND WHY IT IS EASY TO MISS: the "he doesn't work
+    Tuesday" directive fires on the `resolve_available_day` result. The
+    model then correctly calls `list_available_days_for_booking`, and by
+    the time the reply is actually WRITTEN the last message is that
+    second tool result - so the first directive is long gone and only
+    the day-list block remains. Without this, the finished reply shows
+    the real days and never mentions Tuesday at all: the patient asked
+    a direct question and simply never got an answer to it.
+
+    Scans back only as far as the patient's own latest message, so a day
+    rejected earlier in the conversation cannot resurface as a preamble
+    to an unrelated day list later on.
+    """
+
+    for msg in reversed(_tool_results_since_latest_human(messages, ("resolve_available_day",))):
+        try:
+            data = json.loads(msg.content)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            lead = _day_unavailable_lead(messages, session_id, data)
+            if lead:
+                return lead
+    return ""
+
+
+def _build_day_unavailable_directive(messages: list, session_id: str) -> str:
+    """Fires on the `resolve_available_day` result that says the named
+    day is not bookable - either the doctor does not work it
+    ("not_found") or it is full ("fully_booked").
+
+    Pins BOTH halves of the answer: the exact sentence explaining what
+    happened to the day they asked for, and the instruction to fetch and
+    show the real days in the same turn - rather than stopping at the
+    bad news, or asking them to name another day to guess at.
+    """
+
+    if not messages:
+        return ""
+
+    last = messages[-1]
+    if getattr(last, "name", None) != "resolve_available_day":
+        return ""
+
+    try:
+        data = json.loads(last.content)
+    except (ValueError, TypeError):
+        return ""
+
+    status = data.get("status")
+
+    if status == "unrecognized_day":
+        return (
+            "============================================================\n"
+            "THAT WASN'T A DAY OF THE WEEK - ASK, DO NOT GUESS\n"
+            "============================================================\n"
+            "The word passed as the weekday was not recognised as a day. "
+            "Ask the patient which day they meant, in one short question. "
+            "Do NOT pick a day for them, and do NOT fall back to showing "
+            "the soonest available date as if no day had been mentioned.\n\n"
+        )
+
+    if status not in ("not_found", "fully_booked"):
+        return ""
+
+    lead = _day_unavailable_lead(messages, session_id, data)
+    if not lead:
+        return ""
+
+    return (
+        "============================================================\n"
+        "THE DAY THEY ASKED FOR ISN'T BOOKABLE - SAY SO, THEN SHOW THE REAL DAYS\n"
+        "============================================================\n"
+        "Open your reply with EXACTLY this sentence, unchanged:\n\n"
+        "    " + lead + "\n\n"
+        "Then, in this SAME turn, call `list_available_days_for_booking` "
+        "and show what it returns, formatted by the directive that "
+        "arrives with it. The patient asked about one specific day; they "
+        "are owed a straight answer about that day AND a way forward, in "
+        "the same message.\n\n"
+        "Do NOT stop at the bad news and wait. Do NOT ask them to name "
+        "another day - having no way of knowing which days exist is what "
+        "put them here. Do NOT name any other day yourself before that "
+        "tool has returned; you do not yet know a single one of them.\n\n"
+        "Do NOT apologise beyond what the sentence above already does, "
+        "and do not add a second question after the day list's own.\n\n"
+    )
+
+
+# ============================================================
+# ONE MESSAGE, SEVERAL ANSWERS
+# ============================================================
+#
+# WHY: the booking flow is written as a ladder - specialty, doctor,
+# branch, day, time, phone, name - and the model climbs it one rung per
+# message. That is right when the patient supplies one thing at a time.
+# It is wrong, and reads as though nobody is listening, when a single
+# WhatsApp message supplies four of them at once:
+#
+#     "عاوزه احجز معاد مع دكتور احمد العقيل يوم التلات في فرع الدقي"
+#
+# Answering that with "تحب تبدأ بالتخصص ولا بالدكتور؟" makes the patient
+# say again what they already said. The ladder is not the problem; the
+# problem is starting at the bottom of it when the patient has already
+# climbed most of the way.
+#
+# This directive does no resolving of its own - it never claims a doctor
+# or branch EXISTS, only that the patient MENTIONED one, quoting their
+# own words back. Whether the name is real is still decided by
+# `match_entity_for_booking`, exactly as before. What it changes is
+# which rung the turn starts on, and it names each piece explicitly so
+# the model cannot ask for one of them again in the same breath.
+
+# A phone number: at least 9 digits, allowing the separators people
+# actually type. Deliberately not a strict format check - that is
+# `validate_phone_format`'s job; this only answers "did they give one?".
+_MULTI_INTENT_PHONE_RE = re.compile(r"(?:\+?\d[\d\s\-()]{7,}\d)")
+
+_MULTI_INTENT_EMAIL_RE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+
+# An explicit clock time: "10:30", "الساعة 10", "10 صباحا", "3 pm".
+_MULTI_INTENT_TIME_RE = re.compile(
+    r"\d{1,2}\s*:\s*\d{2}|"
+    r"(?:الساعه|الساعة)\s*\d{1,2}|"
+    r"\d{1,2}\s*(?:صباحا|صباحًا|مساء|مساءً|ظهرا|ظهرًا|am|pm)\b",
+    re.IGNORECASE,
+)
+
+# The cue words that introduce a name, and the words that end it. The
+# stop list is what keeps "دكتور احمد العقيل يوم التلات" from being read
+# as a doctor called "احمد العقيل يوم التلات".
+_DOCTOR_CUE_RE = re.compile(
+    r"(?:الدكتوره|الدكتورة|الدكتور|دكتوره|دكتورة|دكتور|د\.|استشاري|استشارية|dr\.?|doctor)\s+",
+    re.IGNORECASE,
+)
+_BRANCH_CUE_RE = re.compile(r"(?:فرع|الفرع|branch)\s+", re.IGNORECASE)
+_SPECIALTY_CUE_RE = re.compile(
+    r"(?:تخصص|التخصص|عياده|عيادة|قسم|specialty|clinic)\s+", re.IGNORECASE,
+)
+
+_FRAGMENT_STOP_WORDS = (
+    "يوم", "في", "فرع", "الفرع", "الساعه", "الساعة", "بكره", "بكرة",
+    "عشان", "علشان", "لان", "لأن", "ومحتاج", "ومحتاجه", "واحجز",
+    "وعايز", "وعاوز", "on", "at", "in", "branch", "day", "please",
+    "لو", "ممكن", "بس", "او", "أو", "ولا",
+)
+
+
+def _fragment_after_cue(text: str, cue_re) -> str:
+    """The words following a cue like "دكتور", stopped at the first word
+    that clearly starts something else ("يوم", "في", "فرع", a digit).
+
+    Returns the patient's own characters, untouched - this is quoted
+    back to the model as "what they wrote", never treated as a resolved
+    entity."""
+
+    match = cue_re.search(text or "")
+    if not match:
+        return ""
+
+    tail = (text or "")[match.end():]
+    words = []
+    for word in re.split(r"\s+", tail.strip()):
+        clean = word.strip(".,،؟?!:؛()[]")
+        if not clean:
+            break
+        if clean.lower() in _FRAGMENT_STOP_WORDS:
+            break
+        if re.search(r"\d", clean):
+            break
+        words.append(clean)
+        if len(words) >= 4:
+            break
+
+    return " ".join(words).strip()
+
+
+def _build_multi_intent_directive(messages: list, session_id: str) -> str:
+    """Lists, in the system prompt, every distinct piece of booking
+    information the patient's latest message contains - and forbids
+    asking for any of them again.
+
+    Fires only when there are at least TWO. One piece of information is
+    the ordinary case the flow already handles well; two or more is the
+    case where it used to ask for something it had just been told.
+    """
+
+    if not messages:
+        return ""
+
+    index = _latest_human_index(messages)
+    if index < 0:
+        return ""
+
+    content = getattr(messages[index], "content", "")
+    text = content if isinstance(content, str) else str(content)
+    text = text.strip()
+    if not text:
+        return ""
+
+    # Nothing to harvest from a bare number, a "نعم", or a one-word
+    # reply - and those are exactly the messages where a false reading
+    # would do damage, because they are ANSWERS to a question rather
+    # than fresh requests.
+    if len(text.split()) < 3:
+        return ""
+
+    found = []
+
+    doctor_fragment = _fragment_after_cue(text, _DOCTOR_CUE_RE)
+    if doctor_fragment:
+        found.append((
+            "A DOCTOR",
+            doctor_fragment,
+            "resolve it with `match_entity_for_booking(user_input=\""
+            + doctor_fragment + "\", entity_type=\"doctor\")`. Never ask "
+            "them to send the doctor's name again.",
+        ))
+
+    branch_fragment = _fragment_after_cue(text, _BRANCH_CUE_RE)
+    if branch_fragment:
+        found.append((
+            "A BRANCH",
+            branch_fragment,
+            "resolve it with `match_entity_for_booking(user_input=\""
+            + branch_fragment + "\", entity_type=\"branch\")`. Never ask "
+            "\"which branch?\" after this.",
+        ))
+
+    specialty_fragment = _fragment_after_cue(text, _SPECIALTY_CUE_RE)
+    if specialty_fragment:
+        found.append((
+            "A SPECIALTY OR SERVICE",
+            specialty_fragment,
+            "act on it directly - it is more specific than the question "
+            "\"تحب تبدأ بالتخصص ولا بالدكتور؟\", which must not be asked "
+            "once this is on the table.",
+        ))
+
+    named = _named_weekday_in_latest_human(messages)
+    if named:
+        found.append((
+            "A DAY",
+            named["display"] + " (" + named["english"] + ")",
+            "check THAT day with `resolve_available_day(weekday_name=\""
+            + named["english"] + "\")` - not the soonest available date, "
+            "and never by asking them which day they want.",
+        ))
+
+    if _MULTI_INTENT_TIME_RE.search(text):
+        found.append((
+            "A PREFERRED TIME",
+            _MULTI_INTENT_TIME_RE.search(text).group(0).strip(),
+            "hold on to it. When the real slots come back, point out the "
+            "one nearest what they asked for instead of making them read "
+            "the whole list again. If nothing is near it, say so.",
+        ))
+
+    phone_match = _MULTI_INTENT_PHONE_RE.search(text)
+    if phone_match:
+        found.append((
+            "A PHONE NUMBER",
+            phone_match.group(0).strip(),
+            "use this one. Do not ask for a phone number again, and do "
+            "not ask whether to use the WhatsApp number instead.",
+        ))
+
+    email_match = _MULTI_INTENT_EMAIL_RE.search(text)
+    if email_match:
+        found.append((
+            "AN EMAIL",
+            email_match.group(0).strip(),
+            "use it as given; email is optional, so never ask twice.",
+        ))
+
+    if len(found) < 2:
+        return ""
+
+    lines = []
+    for label, value, instruction in found:
+        lines.append("  - " + label + ": \"" + value + "\"\n      -> " + instruction)
+
+    return (
+        "============================================================\n"
+        "THEY ANSWERED SEVERAL QUESTIONS AT ONCE - USE ALL OF IT\n"
+        "============================================================\n"
+        "The patient's latest message carries more than one piece of "
+        "booking information. Everything below is something they have "
+        "ALREADY told you:\n\n"
+        + "\n".join(lines) + "\n\n"
+        "Start from the earliest step that is still genuinely unanswered "
+        "AFTER all of the above is taken into account - not from the "
+        "beginning of the flow. Asking for any item on that list is "
+        "asking them to repeat themselves, and it is the single fastest "
+        "way to make this conversation feel automated and deaf.\n\n"
+        "Chain the tool calls in THIS turn rather than spreading them "
+        "over one message each: resolve the doctor, then the branch if "
+        "they named one, then the day, and get as far down the flow as "
+        "the information allows before you write anything. The "
+        "one-question-per-message rule governs what you SAY, not how "
+        "many tools you may call - it was never a reason to hand a step "
+        "back to the patient.\n\n"
+        "Each quoted value above is the patient's own wording, not a "
+        "verified record. Resolve every one of them through its tool as "
+        "usual, and if a tool cannot match one, deal with THAT - do not "
+        "silently start over, and do not assume a name is real because "
+        "it is quoted here.\n\n"
+        "Your reply still ends with at most ONE question, and only about "
+        "something genuinely still missing.\n\n"
     )
 
 
@@ -3472,11 +4150,47 @@ _DATE_IN_REPLY_RE = re.compile(r"(?<![\w-])\d{1,2}[-/]\d{1,2}[-/]\d{2,4}(?![\w-]
 # Same class of problem: a reference or an id can carry "...151:30...".
 _TIME_IN_REPLY_RE = re.compile(r"(?<![\w:])\d{1,2}:\d{2}(?![\w:])")
 
+# Weekday words that, appearing in a REPLY, must be backed by a real
+# availability tool result (see `_reply_invents_availability`).
+#
+# The colloquial spellings matter as much as the formal ones here: a
+# reply written in the patient's own Egyptian register ("الدكتور متاح
+# التلات") carried no formal day name at all, so the fabricated-day
+# check simply did not see it. Every form the model might echo back
+# from a patient's message belongs in this map, not just the MSA ones.
 _WEEKDAY_WORDS = {
-    "الاثنين": "Monday", "الإثنين": "Monday", "الثلاثاء": "Tuesday",
-    "الأربعاء": "Wednesday", "الاربعاء": "Wednesday", "الخميس": "Thursday",
-    "الجمعة": "Friday", "السبت": "Saturday", "الأحد": "Sunday", "الاحد": "Sunday",
+    "الاثنين": "Monday", "الإثنين": "Monday", "الاتنين": "Monday",
+    "الإتنين": "Monday", "التنين": "Monday",
+    "الثلاثاء": "Tuesday", "التلات": "Tuesday",
+    "التلاتاء": "Tuesday", "الثلثاء": "Tuesday",
+    "الأربعاء": "Wednesday", "الاربعاء": "Wednesday",
+    "الخميس": "Thursday",
+    "الجمعة": "Friday", "الجمعه": "Friday",
+    "السبت": "Saturday",
+    "الأحد": "Sunday", "الاحد": "Sunday",
 }
+# DELIBERATELY ABSENT: "الحد", "الثلاث", "الاربع". They are real
+# colloquial day names, but each is also an ordinary Arabic word in its
+# own right ("الحد الأقصى", "الفروع الثلاث", "الفروع الاربع"), and even
+# with word boundaries they would flag correct replies as inventing a
+# day. Parsing what the PATIENT typed still understands all three -
+# that happens in `tools.resolve_weekday_index`, which matches whole
+# words in a message the model did not write. This map only governs
+# what counts as a day CLAIM in the assistant's own reply, where a
+# false positive is the expensive direction.
+
+# WORD-BOUNDARY matching, not substring. The colloquial day names are
+# short enough to hide inside ordinary words - "الحد" sits inside
+# "الحدود"/"الحد الأقصى", "الثلاث" inside "الثلاثة" - and a substring
+# hit there would flag a perfectly correct reply as inventing a day,
+# which costs the patient a wasted correction round or, twice in a row,
+# the generic fallback message. An Arabic letter is a \w character, so
+#  does the right thing on both sides of these tokens.
+_WEEKDAY_WORD_RES = {
+    word: re.compile(r"" + re.escape(word) + r"")
+    for word in _WEEKDAY_WORDS
+}
+
 
 _AVAILABILITY_TOOLS = (
     "list_available_days_for_booking", "get_available_slots_for_booking",
@@ -4345,7 +5059,7 @@ def _reply_invents_availability(reply_text, state) -> bool:
     # with no availability tool called at all - it carried no digits, so
     # a date/time-only check saw nothing wrong while the patient was
     # being offered three days the doctor may not work at all.
-    weekdays = [d for d in _WEEKDAY_WORDS if d in reply_text]
+    weekdays = [d for d, pattern in _WEEKDAY_WORD_RES.items() if pattern.search(reply_text)]
 
     if not dates and not times and not weekdays:
         return False
@@ -5267,7 +5981,229 @@ def _verifier_tool_retries_exhausted(state: AgentState) -> bool:
     return False
 
 
+# ==========================================================
+# The day the patient named, ignored or answered from memory
+# ==========================================================
+#
+# These two close the last gap around a named day. The directives above
+# tell the model what to do BEFORE it writes; these catch the finished
+# reply when it did something else anyway - which is the only class of
+# error a pre-write directive structurally cannot prevent, because there
+# is no tool call left to shape.
+
+# "The doctor works / doesn't work on <day>" - a claim about a roster,
+# stated as fact. Also catches the softer forms ("متاح يوم", "بيجي يوم")
+# that carry exactly the same weight for the patient.
+_DAY_ROSTER_CLAIM_RE = re.compile(
+    r"(?:ما|مش|مو|لا)\s*(?:عنده|عندها|بيجي|بتجي|يجي|تجي|متاح|متاحه|متاحة)[^.\n؟?]{0,20}يوم|"
+    r"(?:عنده|عندها|بيجي|بتجي|متاح|متاحه|متاحة)\s*(?:عياده|عيادة)?\s*يوم|"
+    r"(?:يعمل|تعمل|does\s*not\s*work|doesn'?t\s*work|works)\s*(?:on\s*)?"
+)
+
+
+def _reply_ignores_named_day(reply_text: str, state: AgentState) -> bool:
+    """True when the patient named a specific weekday and the reply
+    talks about availability WITHOUT that day ever having been checked.
+
+    THE FAILURE THIS CATCHES, in the patient's words: "لو انا قولتله
+    عاوزه احجز معاد مع دكتور احمد العقيل يوم التلات" and the reply comes
+    back offering some other date, or asking which day they would like,
+    or announcing from nowhere that the doctor does not come in on
+    Tuesday. All three have the same root - the day was never checked -
+    and all three read as not having been listened to.
+
+    Narrow on purpose. It requires ALL of:
+      - the patient's own latest message names a weekday;
+      - `resolve_available_day` has NOT run since that message (once it
+        has, the day HAS been checked and whatever the reply says about
+        it is grounded);
+      - the reply is actually about days/dates/availability - it names a
+        weekday, prints a date, asks which day, or makes a roster claim.
+
+    A reply that simply moves the booking along without touching the day
+    (asking for a phone number, confirming a name) is left alone.
+    """
+
+    if not reply_text:
+        return False
+
+    named = _named_weekday_in_latest_human(state.get("messages") or [])
+    if not named:
+        return False
+
+    messages = state.get("messages") or []
+
+    # The day was checked properly on this turn - nothing to catch.
+    if _tool_results_since_latest_human(messages, ("resolve_available_day",)):
+        return False
+
+    normalized = _norm_ar(reply_text)
+
+    mentions_other_weekday = any(
+        pattern.search(reply_text)
+        for word, pattern in _WEEKDAY_WORD_RES.items()
+        if _WEEKDAY_WORDS[word] != named["english"]
+    )
+    prints_a_date = bool(_DATE_IN_REPLY_RE.search(reply_text))
+    asks_which_day = bool(_ASKS_WHICH_DAY_RE.search(normalized))
+    claims_roster = bool(_DAY_ROSTER_CLAIM_RE.search(normalized))
+
+    return bool(mentions_other_weekday or prints_a_date or asks_which_day or claims_roster)
+
+
+def _named_day_correction_directive(reply_text: str, state: AgentState) -> str:
+    named = _named_weekday_in_latest_human(state.get("messages") or []) or {}
+    display = named.get("display", "")
+    english = named.get("english", "")
+
+    return (
+        "============================================================\n"
+        "THEY ASKED ABOUT " + display.upper() + " - CHECK IT, DO NOT WORK AROUND IT\n"
+        "============================================================\n"
+        "Your previous draft answered a question about " + display + " with "
+        "another date, with a question about which day they want, or with "
+        "a claim about the doctor's roster - and " + display + " was never "
+        "actually checked.\n\n"
+        "Call `resolve_available_day(weekday_name=\"" + english + "\")` now. "
+        "Then:\n"
+        "  - \"found\": call `get_available_slots_for_booking` with its own "
+        "from_date/to_date and show that day's times.\n"
+        "  - \"not_found\" / \"fully_booked\": say plainly what the result "
+        "says about " + display + ", then call "
+        "`list_available_days_for_booking` and show the real days in the "
+        "same message.\n\n"
+        "You may not state whether the doctor works " + display + " until "
+        "that tool has answered - not from the conversation, not from a "
+        "schedule you saw earlier, not from inference.\n\n"
+        "Call the tool now instead of rewriting the sentence.\n\n"
+    )
+
+
+# ==========================================================
+# Re-asking for something the patient just supplied
+# ==========================================================
+
+# NB1-Q1's own question. Legitimate as an opener; a failure once the
+# patient has already named a doctor, specialty or service.
+_PATH_CHOICE_QUESTION_RE = re.compile(
+    r"تبدا\s*بالتخصص|تبدأ\s*بالتخصص|بالتخصص\s*ولا\s*بالدكتور|"
+    r"start\s*with\s*(?:the\s*)?(?:specialty|speciality)"
+)
+
+
+def _reply_reasks_something_just_given(reply_text: str, state: AgentState) -> bool:
+    """True when the reply asks for a piece of information the patient's
+    OWN latest message already contained.
+
+    This is the verifier form of `_build_multi_intent_directive`: that
+    directive tells the model what it has been given, this one checks
+    that it did not hand one of those items straight back.
+
+    Restricted to the three questions that are unambiguous when the
+    corresponding information is present in the same message:
+      - the specialty-vs-doctor opener, when a doctor/specialty/service
+        was named;
+      - "which branch?", when a branch was named;
+      - "which day?", when a day was named.
+
+    Every other kind of question is left alone - a booking that has a
+    doctor and a day still legitimately needs a phone number and a name,
+    and a verifier that fired on those would block the flow rather than
+    fix it.
+    """
+
+    if not reply_text:
+        return False
+
+    messages = state.get("messages") or []
+    index = _latest_human_index(messages)
+    if index < 0:
+        return False
+
+    content = getattr(messages[index], "content", "")
+    text = content if isinstance(content, str) else str(content)
+    if len(text.split()) < 3:
+        return False
+
+    normalized = _norm_ar(reply_text)
+
+    if _PATH_CHOICE_QUESTION_RE.search(normalized):
+        if (_fragment_after_cue(text, _DOCTOR_CUE_RE)
+                or _fragment_after_cue(text, _SPECIALTY_CUE_RE)):
+            return True
+
+    if _GENERIC_BRANCH_QUESTION_RE.search(normalized):
+        if _fragment_after_cue(text, _BRANCH_CUE_RE):
+            return True
+
+    if _ASKS_WHICH_DAY_RE.search(normalized):
+        if tools.resolve_weekday_index(text) is not None:
+            return True
+
+    return False
+
+
+def _reasked_information_correction_directive(reply_text: str, state: AgentState) -> str:
+    messages = state.get("messages") or []
+    index = _latest_human_index(messages)
+    content = getattr(messages[index], "content", "") if index >= 0 else ""
+    text = content if isinstance(content, str) else str(content)
+
+    supplied = []
+    doctor_fragment = _fragment_after_cue(text, _DOCTOR_CUE_RE)
+    if doctor_fragment:
+        supplied.append("the doctor: \"" + doctor_fragment + "\"")
+    branch_fragment = _fragment_after_cue(text, _BRANCH_CUE_RE)
+    if branch_fragment:
+        supplied.append("the branch: \"" + branch_fragment + "\"")
+    specialty_fragment = _fragment_after_cue(text, _SPECIALTY_CUE_RE)
+    if specialty_fragment:
+        supplied.append("the specialty/service: \"" + specialty_fragment + "\"")
+    weekday = tools.resolve_weekday_index(text)
+    if weekday is not None:
+        english = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                   "Friday", "Saturday", "Sunday"][weekday]
+        supplied.append("the day: " + _ARABIC_DAY_NAMES.get(english.lower(), english))
+
+    listed = "\n".join("    - " + item for item in supplied)
+
+    return (
+        "============================================================\n"
+        "YOU ASKED FOR SOMETHING THEY ALREADY TOLD YOU\n"
+        "============================================================\n"
+        "Your previous draft asked the patient for a piece of "
+        "information their own last message already contained:\n\n"
+        + listed + "\n\n"
+        "Rewrite the turn. Act on what they gave you - resolve each item "
+        "through its own tool (`match_entity_for_booking` for a doctor or "
+        "branch, `resolve_available_day` for a day) and carry on from the "
+        "first step that is genuinely still unanswered.\n\n"
+        "Do not ask for any of the items above again. If a tool cannot "
+        "match one of them, say what could not be found and offer the "
+        "real options - that is a different message from asking the "
+        "question over as though they had never answered it.\n\n"
+    )
+
+
 _REPLY_VERIFIERS = (
+    (
+        lambda reply, state, agent_name: (
+            agent_name in _NEW_BOOKING_AGENTS
+            and _reply_ignores_named_day(reply, state)
+        ),
+        lambda reply, state: _named_day_correction_directive(reply, state),
+        "reply discussed availability while the day the patient explicitly named was "
+        "never checked with resolve_available_day",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            agent_name in _NEW_BOOKING_AGENTS
+            and _reply_reasks_something_just_given(reply, state)
+        ),
+        lambda reply, state: _reasked_information_correction_directive(reply, state),
+        "reply asked for a doctor/branch/day that the patient's own last message "
+        "already supplied",
+    ),
     (
         lambda reply, state, agent_name: _reply_asks_for_a_slot_already_locked_in(reply, state),
         lambda reply, state: _selected_slot_correction_directive(reply, state),
@@ -8483,6 +9419,34 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     schedule_display_directive = _build_schedule_display_directive(state["messages"])
     day_confirmation_directive = _build_day_confirmation_requires_tool_directive(state["messages"])
     show_soonest_directive = _build_show_soonest_day_directive(state["messages"], state.get("session_id"))
+
+    # THE DAY THE PATIENT NAMED. `_build_show_soonest_day_directive`
+    # already stands itself down when this one fires (see its own
+    # comment) - the two say opposite things and must never both be in
+    # the prompt.
+    #
+    # SCOPED TO THE SPECIALISTS THAT ACTUALLY HOLD THESE TOOLS. Every
+    # instruction below names `match_entity_for_booking` and
+    # `resolve_available_day`; `cancel`, `medical`, `faq` and
+    # `complaint` are not bound to either, so handing them these
+    # directives would order a call they cannot make. `reschedule` DOES
+    # have `resolve_available_day`, but it runs its own day flow (STEPs
+    # R3-R5) against an EXISTING booking, and a second, differently
+    # worded set of day rules competing with that is how contradictory
+    # directives caused trouble in the first place.
+    booking_side = agent_name in _NEW_BOOKING_AGENTS
+    named_day_directive = (
+        _build_named_day_directive(state["messages"], state.get("session_id"))
+        if booking_side else ""
+    )
+    day_unavailable_directive = (
+        _build_day_unavailable_directive(state["messages"], state.get("session_id"))
+        if booking_side else ""
+    )
+    multi_intent_directive = (
+        _build_multi_intent_directive(state["messages"], state.get("session_id"))
+        if booking_side else ""
+    )
     booking_confirmation_directive = _build_booking_confirmation_requires_tool_directive(state["messages"], state.get("session_id"))
     booking_success_directive = _build_booking_success_display_directive(state["messages"], state.get("templates"))
 
@@ -8565,7 +9529,14 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + empty_branch_booking_directive
         + branches_only_directive + empty_day_directive
         + appointment_display_directive + schedule_display_directive
-        + wrong_tool_directive + day_confirmation_directive + show_soonest_directive
+        + wrong_tool_directive + day_confirmation_directive
+        # MULTI-INTENT FIRST, then the day rules: the first says which
+        # rung of the flow this turn starts on, the second says what to
+        # do about the day specifically. Both come AFTER the day-pick /
+        # day-confirmation directives above, which resolve a pick from a
+        # list already shown and are about a narrower situation.
+        + multi_intent_directive + named_day_directive + day_unavailable_directive
+        + show_soonest_directive
         + booking_confirmation_directive + booking_success_directive
         + terminal_success_directive
         + scoped_prompt
