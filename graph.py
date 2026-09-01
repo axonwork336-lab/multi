@@ -1550,6 +1550,11 @@ def _build_show_soonest_day_directive(messages: list, session_id: str) -> str:
 # calls, so it belongs only to these.
 _NEW_BOOKING_AGENTS = ("booking", "concierge")
 
+# The specialists that can look an EXISTING booking up - i.e. the ones
+# bound to `lookup_appointment`. The reference/phone rules are written
+# in terms of that call, so they belong only to these.
+_EXISTING_BOOKING_AGENTS = ("cancel", "reschedule", "concierge")
+
 _DAY_INTENT_TOOLS = (
     "resolve_available_day", "get_available_slots_for_booking",
     "select_appointment_slot", "create_new_booking",
@@ -6091,6 +6096,33 @@ _PATH_CHOICE_QUESTION_RE = re.compile(
 )
 
 
+# Tools that RESOLVE something the patient named. Once one of these has
+# run for the current message, the information was not ignored - it was
+# looked up. Whatever the reply says next is a RESULT, not a re-ask.
+_ENTITY_RESOLUTION_TOOLS = (
+    "match_entity_for_booking", "match_entity_info",
+    "list_branches_for_specialty", "find_available_doctors",
+    "find_branches_offering_service", "find_best_doctor_in_specialty",
+    "list_specialties", "list_branch_services", "resolve_available_day",
+    "list_available_days_for_booking",
+)
+
+# "I don't have a branch by that name", "I couldn't find a doctor called
+# ...". A reply that opens this way is ANSWERING the thing they named -
+# the opposite of pretending they never said it.
+_NOT_FOUND_STATEMENT_RE = re.compile(
+    r"معنديش|ما\s*عندي|مفيش|ما\s*في\s*(?:عندنا)?|ما\s*لقي(?:ت|نا)|لم\s*(?:اجد|نجد)|"
+    r"لا\s*يوجد|مش\s*موجود|غير\s*موجود|"
+    r"(?:don'?t|do\s*not)\s*have|(?:couldn'?t|could\s*not|can'?t)\s*find|"
+    r"no\s+(?:branch|doctor|clinic)\s+(?:called|named|by\s+that\s+name)"
+)
+
+# An actual list of options in the reply - emoji digits or "1." / "2)".
+# Showing the real alternatives is the correct answer to a name that did
+# not match; it is not a question handed back.
+_SHOWS_A_LIST_RE = re.compile(r"[1-9]️?⃣|(?:^|\n)\s*[1-9][.)\-]\s+")
+
+
 def _reply_reasks_something_just_given(reply_text: str, state: AgentState) -> bool:
     """True when the reply asks for a piece of information the patient's
     OWN latest message already contained.
@@ -6110,6 +6142,22 @@ def _reply_reasks_something_just_given(reply_text: str, state: AgentState) -> bo
     doctor and a day still legitimately needs a phone number and a name,
     and a verifier that fired on those would block the flow rather than
     fix it.
+
+    THREE STAND-DOWNS, all learned from one confirmed production
+    failure. The patient asked about "فرع النيل"; the tools found no
+    such branch; the reply was:
+
+        معنديش فرع اسمه النيل. لكن عندنا هالفروع المتاحة حاليًا:
+        1️⃣ المنار
+        2️⃣ النزهة
+        هل تحب تعرف تفاصيل أي فرع؟
+
+    - a completely correct answer. This verifier flagged it anyway
+    ("الفروع المتاحة" matches the generic-branch-question pattern, and
+    "النيل" was in their message), the corrected retry was flagged
+    again, and the patient received "حدث خطأ تقني 😕" instead. A good
+    reply was destroyed by a guard meant to protect it, which is worse
+    than the bug the guard exists for.
     """
 
     if not reply_text:
@@ -6123,6 +6171,22 @@ def _reply_reasks_something_just_given(reply_text: str, state: AgentState) -> bo
     content = getattr(messages[index], "content", "")
     text = content if isinstance(content, str) else str(content)
     if len(text.split()) < 3:
+        return False
+
+    # STAND-DOWN 1: it WAS acted on. A resolution tool ran for this very
+    # message, so the reply is reporting what that tool found.
+    if _tool_results_since_latest_human(messages, _ENTITY_RESOLUTION_TOOLS):
+        return False
+
+    # STAND-DOWN 2: the reply says the thing they named was not found.
+    # That is an answer about their input, not a request to repeat it.
+    if _NOT_FOUND_STATEMENT_RE.search(_norm_ar(reply_text)):
+        return False
+
+    # STAND-DOWN 3: the reply shows the real options. Listing what
+    # actually exists is how a patient recovers from naming something
+    # that does not - it is the fix, not the failure.
+    if _SHOWS_A_LIST_RE.search(reply_text):
         return False
 
     normalized = _norm_ar(reply_text)
@@ -6185,7 +6249,749 @@ def _reasked_information_correction_directive(reply_text: str, state: AgentState
     )
 
 
+# ============================================================
+# MESSAGES THE SCOPE REFUSAL MUST NEVER ANSWER
+# ============================================================
+#
+# WHY THIS EXISTS: two kinds of message look "out of scope" to the model
+# because no tool can answer them, and both were being met with the
+# clinic's generic deflection - "عذرًا 🌷 أنا [name]، المساعدة
+# الافتراضية في [clinic]، ومختصة بمساعدتك في خدمات المستشفى مثل حجز أو
+# تعديل المواعيد..."
+#
+#   1. ASKING WHAT MEDICATION OR DOSE TO TAKE. CONFIRMED IN PRODUCTION:
+#      a patient described a bad headache and fever, got a good medical
+#      guidance reply, then pushed - "Just tell me the normal adult
+#      dose, everyone knows it anyway." - and received the service menu.
+#      Refusing the dose is right. Answering a person in pain with a
+#      list of the things you CAN do instead is not: it reads as being
+#      brushed off, and it drops both the reason and the offer of real
+#      help.
+#
+#   2. SAYING THEY WANT TO HARM THEMSELVES. The same deflection here is
+#      far worse than unhelpful.
+#
+# The medication ban and the crisis response already existed - but only
+# inside the MEDICAL GUIDANCE section of the prompt, which reaches the
+# `medical` and `concierge` specialists and nobody else. Neither message
+# above scores on any router cue (`score_message` returns {} for "Just
+# tell me the normal adult dose" and for "I want to kill myself"), so
+# whichever specialist happened to be active kept the turn - and most of
+# them had never been told any of this.
+#
+# These directives are therefore built in `_run_agent`, which every
+# specialist runs, and keyed on the MESSAGE rather than on which agent
+# won the routing.
+
+_MEDICATION_REQUEST_RE = re.compile(
+    # Arabic - "give me a medicine", "what do I take", "how many pills",
+    # "what dose", "prescribe me something", "a painkiller".
+    r"(?:ادي|اديني|اعطيني|عطيني|هات|هاتي|وصف|وصفلي|اكتبلي|اكتب\s*لي)\w*\s*"
+    r"(?:\w+\s+){0,2}(?:دوا|دواء|علاج|مسكن|حبوب|برشام)|"
+    r"(?:اخد|اخذ|اشرب|اتناول|استخدم|اعطي|اديه|اسقي)\s*(?:\w+\s+){0,2}"
+    r"(?:ايه|ايش|وش|شنو|كام|قد\s*ايه)|"
+    r"(?:ايه|ايش|وش|شنو|اي|أي)\s*(?:ال)?(?:دوا|دواء|علاج|مسكن|حبوب|برشام)|"
+    r"(?:كام|قد\s*ايه|كم)\s*(?:\w+\s+){0,2}(?:حبه|حبة|قرص|مسكن|جرعه|جرعة|مره|مرة)|"
+    r"(?:ال)?(?:جرعه|جرعة|الجرعات)|"
+    r"(?:دوا|دواء|علاج|مسكن)\s*(?:\w+\s+){0,2}(?:للصداع|للحراره|للحرارة|للالم|للوجع|مناسب)|"
+    # English.
+    r"\b(?:what|which)\s+(?:medicine|medication|drug|painkiller|tablet|pill)s?\b|"
+    r"\bwhat\s+(?:should|can|do)\s+i\s+take\b|"
+    r"\bhow\s+(?:many|much|often)\b[^.\n?]{0,30}"
+    r"\b(?:painkiller|paracetamol|panadol|ibuprofen|tablet|pill|dose|mg)\w*|"
+    r"\b(?:dose|dosage|dosing)\b|"
+    r"\bprescribe\s+(?:me\s+)?(?:a|some|any)?\s*\w*|"
+    r"\b(?:give|recommend)\s+me\s+(?:a\s+|some\s+|any\s+)?"
+    r"(?:medicine|medication|drug|painkiller|tablet|pill|something|anything)|"
+    r"\bis\s+it\s+(?:safe|ok(?:ay)?)\s+to\s+take\b",
+    re.IGNORECASE,
+)
+
+_CRISIS_RE = re.compile(
+    # Arabic, including the colloquial future prefix ("هنتحر" = "I'm
+    # going to kill myself") that a stem-only pattern misses.
+    r"(?:ه|ح|سا|سأ)?انتحر|(?:ه|ح)نتحر|الانتحار|"
+    r"(?:عايز|عاوز|بدي|ابي|ابغى|نفسي)\s*(?:\w+\s+){0,2}(?:اموت|امو ت|انهي\s*حياتي|اقتل\s*نفسي)|"
+    r"(?:مش|ما|مو)\s*(?:عايز|عاوز|بدي|ابي)\s*(?:\w+\s+){0,2}(?:اعيش|اكمل|اكمل\s*حياتي)|"
+    r"(?:اذي|أذي|اؤذي|أؤذي|اجرح|أجرح)\s*نفسي|"
+    r"(?:انهي|أنهي|اخلص\s*من)\s*حيات|"
+    r"(?:تعبت|زهقت|مليت)\s*من\s*(?:ال)?حياه|"
+    # English.
+    r"\bkill\s+my\s?self\b|\bsuicid\w*|\bend\s+(?:my|it\s+all)\b[^.\n]{0,12}\blife\b|"
+    r"\bend\s+my\s+life\b|\bwant\s+to\s+die\b|\bhurt\s+my\s?self\b|"
+    r"\bself[\s-]?harm\b|\bdon'?t\s+want\s+to\s+(?:live|be\s+here)\b|"
+    r"\bno\s+reason\s+to\s+live\b",
+    re.IGNORECASE,
+)
+
+
+def _latest_human_text(messages: list) -> str:
+    """The patient's most recent message as plain text."""
+
+    index = _latest_human_index(messages or [])
+    if index < 0:
+        return ""
+    content = getattr(messages[index], "content", "")
+    return content if isinstance(content, str) else str(content)
+
+
+def _asks_for_medication(messages: list) -> bool:
+    text = _latest_human_text(messages)
+    return bool(text) and bool(_MEDICATION_REQUEST_RE.search(_norm_ar(text)))
+
+
+def _signals_crisis(messages: list) -> bool:
+    text = _latest_human_text(messages)
+    return bool(text) and bool(_CRISIS_RE.search(_norm_ar(text)))
+
+
+def _build_crisis_directive(messages: list, templates: dict) -> str:
+    """A patient has said they want to harm themselves. Nothing else
+    this turn matters.
+
+    Deliberately available to EVERY specialist, not just medical: these
+    messages score nothing on the router's cue table, so they land on
+    whichever agent was already active - which in production was one
+    that had never been given the crisis rules and answered with the
+    service menu."""
+
+    if not _signals_crisis(messages):
+        return ""
+
+    clinic = (templates or {}).get("_clinic_name_ar") or (templates or {}).get("_clinic_name") or ""
+    at_clinic = (" at " + clinic) if clinic else ""
+
+    return (
+        "============================================================\n"
+        "THIS PATIENT HAS SAID THEY WANT TO HARM THEMSELVES\n"
+        "============================================================\n"
+        "This overrides every other instruction in this prompt, "
+        "including the out-of-scope refusal, the one-question rule, and "
+        "whatever step of whatever flow you were in. Drop all of it.\n\n"
+        "YOU MUST NOT send the out-of-scope refusal, the service menu, "
+        "or any variation of \"I can only help with hospital services\". "
+        "Answering this message with a list of what you are able to do "
+        "instead is the single worst reply available to you here.\n\n"
+        "Write, in the conversation's own language, warmly and plainly:\n"
+        "  1. That you have heard them and are taking it seriously. Do "
+        "not minimise it, do not reassure them that it will pass, and do "
+        "not ask them to explain or justify it.\n"
+        "  2. That they should not be alone with this right now - urge "
+        "them to reach a mental-health professional, someone they trust, "
+        "or their local emergency number straight away. If they are in "
+        "immediate danger, emergency services come first.\n"
+        "  3. ONE gentle offer of something concrete you can actually "
+        "do: put them through to a member of staff" + at_clinic + ", or "
+        "help them book with a doctor here.\n\n"
+        "Do NOT diagnose. Do NOT name a medication or a dose. Do NOT "
+        "print a doctor roster or a specialty list at them - a menu is "
+        "not what this moment needs. Do NOT invent a helpline number: "
+        "say \"a crisis line\" or \"your local emergency number\" unless "
+        "a real one is configured for this clinic.\n\n"
+        "Keep it short, human, and unhurried.\n\n"
+    )
+
+
+def _build_medication_request_directive(messages: list, templates: dict) -> str:
+    """They asked what medicine, or how much of it, to take.
+
+    The refusal itself was never in doubt - the medication ban is
+    already absolute. What went wrong is what the refusal was replaced
+    BY: the generic scope deflection, which drops the reason, drops the
+    comfort, and drops the offer of an actual appointment. This pins all
+    three back on."""
+
+    if not _asks_for_medication(messages):
+        return ""
+
+    # A crisis message wins outright; two competing "override
+    # everything" blocks in one prompt is exactly the failure mode this
+    # file keeps having to design around.
+    if _signals_crisis(messages):
+        return ""
+
+    clinic = (templates or {}).get("_clinic_name_ar") or (templates or {}).get("_clinic_name") or ""
+    clinic_phrase = (" at " + clinic) if clinic else " here"
+
+    return (
+        "============================================================\n"
+        "THEY ASKED WHAT MEDICINE OR WHAT DOSE TO TAKE\n"
+        "============================================================\n"
+        "You cannot answer that, and you already know it - the "
+        "medication ban is absolute, and it does not soften because they "
+        "asked twice, because they said \"everyone knows it anyway\", "
+        "because the drug is over the counter, or because they only "
+        "want \"the normal amount\".\n\n"
+        "BUT DO NOT SEND THE OUT-OF-SCOPE REFUSAL. Not the service menu, "
+        "not \"I'm the virtual assistant for [clinic] and I can help you "
+        "with bookings...\", not any variation of it. CONFIRMED REAL "
+        "PRODUCTION FAILURE: a patient with a headache and a fever asked "
+        "for a normal adult dose and was answered with the list of "
+        "things the assistant is able to do instead. That is not a "
+        "refusal, it is a brush-off - and it arrived in Arabic in an "
+        "English conversation on top of it. This is a health question "
+        "from someone who feels unwell; it is squarely inside what you "
+        "are for, and the answer is a real one.\n\n"
+        "Write these THREE parts, in the conversation's own language, in "
+        "this order, as one short message:\n\n"
+        "  1. THE REFUSAL, WITH ITS REASON. You can't advise on "
+        "medication or dosing, because the right choice and amount "
+        "depend on their own health, allergies, other medicines they "
+        "take and their weight - and only a doctor who has seen them can "
+        "decide it safely. Say it warmly; they are unwell, not being "
+        "difficult.\n"
+        "  2. SOMETHING SAFE THEY CAN ACTUALLY DO NOW. Rest, fluids, a "
+        "quiet dark room for a headache, keeping an eye on the symptom - "
+        "non-drug comfort only. If the symptom has any warning sign "
+        "attached (very high fever, a sudden severe headache, confusion, "
+        "trouble breathing, vision changes), say plainly that this needs "
+        "urgent care today.\n"
+        "  3. ONE offer: helping them book an appointment" + clinic_phrase
+        + " to see a doctor about it. That is the question the message "
+        "ends on - and the only question in it.\n\n"
+        "NEVER name a drug, a brand, a generic name, a dose, a "
+        "frequency, or a \"safe\" amount, not even to say which one you "
+        "are declining to recommend. Naming it is recommending it.\n\n"
+        "If they ask again after this, hold the same line in fewer words "
+        "and keep the offer of an appointment open. Do not escalate to "
+        "the scope refusal on the second or third ask - repetition does "
+        "not turn a health question into an off-topic one.\n\n"
+    )
+
+
+def _reply_scope_refuses_a_health_message(reply_text: str, state: AgentState) -> bool:
+    """True when the finished reply is the generic out-of-scope
+    deflection and the message it answers was about the patient's
+    health - a medication question, or a crisis.
+
+    The last line of defence for the two directives above: they shape
+    the turn before it is written, this catches the turn that ignored
+    them. Narrow by design - it fires only on the refusal text itself,
+    identified by `_is_scope_refusal`, so an ordinary reply that happens
+    to mention what the assistant can help with is untouched."""
+
+    if not reply_text:
+        return False
+
+    messages = state.get("messages") or []
+    if not (_asks_for_medication(messages) or _signals_crisis(messages)):
+        return False
+
+    return _is_scope_refusal(reply_text, state.get("templates") or {})
+
+
+def _health_message_refusal_correction(reply_text: str, state: AgentState) -> str:
+    messages = state.get("messages") or []
+    templates = state.get("templates") or {}
+
+    if _signals_crisis(messages):
+        return (
+            "============================================================\n"
+            "YOU SENT THE SERVICE MENU TO SOMEONE IN CRISIS\n"
+            "============================================================\n"
+            "Your previous draft answered a patient who said they want "
+            "to harm themselves with the out-of-scope refusal - a list "
+            "of the things you are able to help with instead.\n\n"
+            "Rewrite it completely.\n\n"
+        ) + _build_crisis_directive(messages, templates)
+
+    return (
+        "============================================================\n"
+        "YOU BRUSHED OFF A HEALTH QUESTION WITH THE SERVICE MENU\n"
+        "============================================================\n"
+        "Your previous draft answered someone who is unwell and asked "
+        "about medication with the generic out-of-scope refusal. "
+        "Declining the dose was right; replacing the whole answer with a "
+        "list of your own capabilities was not - it drops the reason, "
+        "the comfort, and the offer of an appointment.\n\n"
+        "Rewrite it as the three parts below.\n\n"
+    ) + _build_medication_request_directive(messages, templates)
+
+
+# ============================================================
+# THE IDENTIFIER IS ALREADY IN THE MESSAGE
+# ============================================================
+#
+# STEP 1 of the cancel/reschedule flow says it in plain words: if the
+# message already contains a booking reference or a phone number, use it
+# and skip the "reference or phone?" question. It was not followed.
+#
+# CONFIRMED REAL PRODUCTION FAILURE (medtown, session
+# 201003365691+medtown2, 2026-09-01 09:00):
+#
+#   patient : تعديل موعد برقم GuestBookingNum-2026-09-01-076
+#   reply   : نكمل تعديل موعدك على نفس رقم الواتساب ده؟ ✅
+#   patient : لا برقم حجز  GuestBookingNum-2026-09-01-076
+#   reply   : ممكن رقم جوالك مع رمز الدولة أو رقم الحجز تكتبه لي،
+#             عشان أقدر أجيب بيانات موعدك؟
+#
+# The reference was in the very first message, repeated in the second,
+# and asked for a third time. `_reply_skips_reference_or_phone_question`
+# already knew it was there - but only used that to STAND ITSELF DOWN.
+# Nothing anywhere told the model to go and use it.
+#
+# This is the same failure as the booking side's named-day problem, in a
+# different flow: information the patient supplied, discarded because
+# the flow starts at its own step 1 rather than at the first step that
+# is genuinely unanswered. So it gets the same treatment - a directive
+# that states what was supplied, and a verifier that catches the reply
+# which asks for it anyway.
+
+# A booking reference: letters, then at least one hyphen-joined group,
+# with a digit somewhere in it. Covers "GBN-2026-06-20-151" and
+# "GuestBookingNum-2026-09-01-076" without matching ordinary hyphenated
+# words ("مستشفى ميدتاون", "walk-in").
+_BOOKING_REF_RE = re.compile(r"\b[A-Za-z]{2,}[A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b")
+
+# A phone number the patient typed. Checked only AFTER any reference has
+# been cut out of the text: "GuestBookingNum-2026-09-01-076" ends in
+# fourteen digits and three hyphens, and would otherwise be read as a
+# phone number as well as a reference.
+_SUPPLIED_PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{7,}\d")
+
+
+def _booking_reference_in(text: str) -> str:
+    """The booking reference in this text, or "" - returned exactly as
+    the patient typed it, so it can be passed straight to
+    `lookup_appointment` without anyone retyping it."""
+
+    for candidate in _BOOKING_REF_RE.findall(text or ""):
+        if any(ch.isdigit() for ch in candidate):
+            return candidate
+    return ""
+
+
+def _supplied_phone_in(text: str) -> str:
+    """A phone number in this text, or "" - with any booking reference
+    removed first (see `_SUPPLIED_PHONE_RE`)."""
+
+    remainder = text or ""
+    reference = _booking_reference_in(remainder)
+    if reference:
+        remainder = remainder.replace(reference, " ")
+
+    match = _SUPPLIED_PHONE_RE.search(remainder)
+    return match.group(0).strip() if match else ""
+
+
+def _build_supplied_identifier_directive(messages: list) -> str:
+    """The patient's own latest message contains the booking reference
+    (or the phone number) needed to find their appointment. Use it.
+
+    Stands down as soon as an identity tool has run for this message -
+    at that point the identifier HAS been used and the flow is past
+    STEP 1, where phone questions become legitimate again."""
+
+    if not messages:
+        return ""
+
+    text = _latest_human_text(messages)
+    if not text:
+        return ""
+
+    reference = _booking_reference_in(text)
+    phone = "" if reference else _supplied_phone_in(text)
+
+    if not (reference or phone):
+        return ""
+
+    # Already acted on this turn.
+    if _tool_results_since_latest_human(messages, _IDENTITY_VERIFICATION_TOOLS):
+        return ""
+
+    if reference:
+        supplied = "A BOOKING REFERENCE: " + reference
+        action = (
+            "    lookup_appointment(ref_number=\"" + reference + "\")\n\n"
+            "Copy it exactly as written above - do not reformat it, "
+            "do not strip the prefix, do not retype it from memory.\n\n"
+            "A REFERENCE SKIPS IDENTITY VERIFICATION ENTIRELY. No OTP, "
+            "no phone comparison, no \"is this the same WhatsApp "
+            "number?\" - STEP 2 exists for the phone path and this is "
+            "not the phone path. Go straight to showing them the "
+            "booking.\n\n"
+        )
+    else:
+        supplied = "A PHONE NUMBER: " + phone
+        action = (
+            "    validate_phone_format, then compare_phone, then "
+            "lookup_appointment - with THIS number.\n\n"
+            "Do not ask them to send a phone number, and do not ask "
+            "whether to use the WhatsApp number instead: they chose one "
+            "by typing it.\n\n"
+        )
+
+    return (
+        "============================================================\n"
+        "THEY ALREADY GAVE YOU WHAT YOU NEED TO FIND THE BOOKING\n"
+        "============================================================\n"
+        "Their latest message contains " + supplied + "\n\n"
+        "Your ONLY next action is:\n"
+        + action +
+        "DO NOT ask \"reference number or phone number?\". That question "
+        "exists to find out which one they have; they have just told "
+        "you, in the message you are replying to. STEP 1 says in as many "
+        "words to skip it in exactly this case.\n\n"
+        "DO NOT ask for the reference or the phone number again in any "
+        "wording, and do not ask them to \"confirm\" it. CONFIRMED REAL "
+        "PRODUCTION FAILURE: a patient opened with \"تعديل موعد برقم "
+        "GuestBookingNum-2026-09-01-076\", was asked whether to continue "
+        "on the same WhatsApp number, replied \"لا برقم حجز "
+        "GuestBookingNum-2026-09-01-076\" - and was then asked for their "
+        "phone number or a booking reference. The same reference, asked "
+        "for three times in a row.\n\n"
+        "If the lookup comes back \"not_found\", THAT is worth a reply - "
+        "say the reference did not match anything and ask them to check "
+        "it. That is a different message from asking for it as though "
+        "they had never answered.\n\n"
+    )
+
+
+_ASKS_FOR_REF_OR_PHONE_RE = re.compile(
+    r"رقم\s*(?:ال)?حجز|رقم\s*(?:ال)?جوال|رقم\s*(?:ال)?موبايل|رقم\s*(?:ال)?تليفون|"
+    r"رقم\s*(?:ال)?هاتف|رمز\s*(?:ال)?دوله|"
+    r"booking\s*reference|reference\s*number|phone\s*number|mobile\s*number"
+)
+
+
+def _reply_reasks_an_identifier_already_supplied(reply_text: str, state: AgentState) -> bool:
+    """True when the reply asks for a booking reference or a phone
+    number that the patient's own latest message already contains.
+
+    The verifier half of `_build_supplied_identifier_directive`. Narrow:
+    it needs the reply to actually be ASKING (a question mark, or one of
+    the request phrasings) and the identifier to be present in the very
+    message being answered - a reference mentioned ten turns ago does
+    not count, because the conversation may legitimately have moved to a
+    different booking since."""
+
+    if not reply_text:
+        return False
+
+    messages = state.get("messages") or []
+    text = _latest_human_text(messages)
+    if not text:
+        return False
+
+    if not (_booking_reference_in(text) or _supplied_phone_in(text)):
+        return False
+
+    # Already looked it up on this turn - anything the reply asks for
+    # now is a legitimate later step, not a re-ask.
+    if _tool_results_since_latest_human(messages, _IDENTITY_VERIFICATION_TOOLS):
+        return False
+
+    folded = _norm_ar(reply_text)
+    asking = "?" in reply_text or "؟" in reply_text
+    return bool(asking and _ASKS_FOR_REF_OR_PHONE_RE.search(folded))
+
+
+def _supplied_identifier_correction(reply_text: str, state: AgentState) -> str:
+    return (
+        "============================================================\n"
+        "YOU ASKED FOR THE REFERENCE THEY JUST GAVE YOU\n"
+        "============================================================\n"
+        "Your previous draft asked for a booking reference or a phone "
+        "number. It is in the message you are replying to.\n\n"
+    ) + _build_supplied_identifier_directive(state.get("messages") or [])
+
+
+# ============================================================
+# "CANCEL IT" / "CHANGE IT" - THE ONE THEY JUST BOOKED
+# ============================================================
+#
+# A patient who has just finished booking and then says "الغيه",
+# "الغي الحجز ده", "عدله" or "change it" is talking about the
+# appointment still on their screen. Answering that with STEP 1's
+# "reference number or phone number?" - or worse, the OTP dance - makes
+# them identify a booking the assistant created itself thirty seconds
+# earlier.
+#
+# WHY IT HAPPENS: `create_new_booking` deliberately wipes the booking
+# session on success (so the NEXT booking starts clean), and the
+# reference it returns then exists nowhere except inside a ToolMessage
+# in the history. The cancel/reschedule specialist that the router
+# hands the turn to starts at its own STEP 1, which knows nothing about
+# any of it. Nothing was carrying the reference across that handover.
+#
+# The same applies one step earlier: a booking the patient has just been
+# SHOWN by `lookup_appointment` is equally "this one" when they say
+# "cancel it" next.
+
+_CANCEL_OR_CHANGE_INTENT_RE = re.compile(
+    # Arabic. `\w*` matters: the object pronoun attaches to the verb, so
+    # "ألغيه", "ألغيها", "عدله", "أجله" are each a single word - the
+    # very phrasings this directive exists for.
+    r"(?:^|\s)(?:الغ|ابطل|بطل)\w*|"
+    r"(?:^|\s)(?:عدل|اعدل|غير|اغير|اجل|اؤجل|انقل|قدم)\w*|"
+    r"(?:ال)?(?:الغاء|تعديل|تاجيل|تغيير)\b|"
+    r"\bcancel\b|\breschedul\w*|\bpostpon\w*|"
+    r"\b(?:change|move|shift)\s+(?:it|this|that|the\s+(?:booking|appointment))\b",
+    re.IGNORECASE,
+)
+
+
+def _just_created_booking_reference(messages: list) -> str:
+    """The reference of a booking `create_new_booking` made in THIS
+    conversation, or "".
+
+    Returns "" once that booking has been cancelled - there is nothing
+    left to point a later "cancel it" at, and silently re-targeting an
+    already-cancelled booking would be worse than asking.
+    """
+
+    for index in range(len(messages or []) - 1, -1, -1):
+        message = messages[index]
+        if getattr(message, "name", None) != "create_new_booking":
+            continue
+        try:
+            data = json.loads(message.content)
+        except (ValueError, TypeError):
+            continue
+        if not (isinstance(data, dict) and data.get("status") == "success"):
+            continue
+
+        # Cancelled since? Then it is gone.
+        for later in messages[index + 1:]:
+            if getattr(later, "name", None) == "cancel_appointment":
+                try:
+                    later_data = json.loads(later.content)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(later_data, dict) and later_data.get("status") == "success":
+                    return ""
+
+        return str(data.get("booking_ref") or "")
+
+    return ""
+
+
+def _reference_of_the_booking_on_screen(messages: list) -> str:
+    """The reference of whichever booking this conversation is currently
+    about - the one just created, or failing that the one most recently
+    looked up and shown."""
+
+    created = _just_created_booking_reference(messages)
+    if created:
+        return created
+
+    appointment = _last_appointment_record(messages)
+    return str(appointment.get("ref") or appointment.get("bookingRefNum") or "")
+
+
+def _build_just_booked_directive(messages: list) -> str:
+    """They said "cancel it"/"change it" about a booking already on the
+    table. Point the flow at that booking instead of starting STEP 1
+    over."""
+
+    if not messages:
+        return ""
+
+    text = _latest_human_text(messages)
+    if not text:
+        return ""
+
+    if not _CANCEL_OR_CHANGE_INTENT_RE.search(_norm_ar(text)):
+        return ""
+
+    # They typed a reference of their own - that one wins, and
+    # `_build_supplied_identifier_directive` is already handling it.
+    # Two directives naming two different references would be worse
+    # than either alone.
+    if _booking_reference_in(text):
+        return ""
+
+    reference = _reference_of_the_booking_on_screen(messages)
+    if not reference:
+        return ""
+
+    # Already fetched on this turn.
+    if _tool_results_since_latest_human(messages, _IDENTITY_VERIFICATION_TOOLS):
+        return ""
+
+    just_created = bool(_just_created_booking_reference(messages))
+
+    which = (
+        "the appointment you booked for them a moment ago, in this same "
+        "conversation"
+        if just_created else
+        "the appointment you looked up and showed them earlier in this "
+        "conversation"
+    )
+
+    identity_note = (
+        "THEIR IDENTITY IS NOT IN QUESTION. You created this booking for "
+        "them minutes ago, on a number that was already verified to make "
+        "it. Do not send an OTP, do not compare phone numbers, and do "
+        "not ask whether to continue on the same WhatsApp number.\n\n"
+        if just_created else
+        "If this booking was found earlier by a verified phone number or "
+        "by its reference, that verification still stands - do not "
+        "restart it.\n\n"
+    )
+
+    return (
+        "============================================================\n"
+        "\"IT\" MEANS THE BOOKING ALREADY ON THE TABLE\n"
+        "============================================================\n"
+        "Their latest message asks to cancel or change a booking, and "
+        "they did not name one - because they are talking about " + which
+        + ".\n\n"
+        "Its reference is:\n"
+        "    " + reference + "\n\n"
+        "Your ONLY next action is:\n"
+        "    lookup_appointment(ref_number=\"" + reference + "\")\n\n"
+        "Copy the reference exactly as written above. Do not retype it "
+        "from memory and do not reformat it.\n\n"
+        "DO NOT ask \"reference number or phone number?\". That question "
+        "finds out WHICH booking they mean; there is only one on the "
+        "table and they just referred to it. Asking a patient to "
+        "identify an appointment you made for them a moment ago reads as "
+        "though the conversation restarted.\n\n"
+        + identity_note +
+        "After the lookup, continue the normal flow from the step that "
+        "shows them the booking and asks for confirmation - cancelling "
+        "still needs an explicit yes, and a reschedule still needs a new "
+        "day and time. Nothing about this shortcut skips a confirmation; "
+        "it only skips re-identifying a booking that was never in doubt.\n\n"
+        "If the lookup comes back \"not_found\", say so plainly and ask "
+        "them to check the reference - do not fall back to asking for "
+        "their phone number as if the last few minutes had not happened.\n\n"
+    )
+
+
+def _reply_reasks_which_booking_when_only_one_is_on_the_table(
+    reply_text: str, state: AgentState,
+) -> bool:
+    """True when the reply asks which booking they mean, while the
+    conversation has exactly one on the table and their message just
+    referred to it."""
+
+    if not reply_text:
+        return False
+
+    messages = state.get("messages") or []
+    if not _build_just_booked_directive(messages):
+        return False
+
+    folded = _norm_ar(reply_text)
+    asking = "?" in reply_text or "؟" in reply_text
+    if not asking:
+        return False
+
+    return bool(
+        _ASKS_FOR_REF_OR_PHONE_RE.search(folded)
+        or _SAME_WHATSAPP_QUESTION_RE.search(folded)
+    )
+
+
+def _just_booked_correction(reply_text: str, state: AgentState) -> str:
+    return (
+        "============================================================\n"
+        "YOU ASKED WHICH BOOKING - THERE IS ONLY ONE\n"
+        "============================================================\n"
+        "Your previous draft asked the patient to identify a booking "
+        "that is already on the table in this conversation.\n\n"
+    ) + _build_just_booked_directive(state.get("messages") or [])
+
+
+# ==========================================================
+# What a verifier is actually protecting against
+# ==========================================================
+#
+# The zero-tolerance fallback - swapping a twice-flagged reply for
+# "حدث خطأ تقني 😕" - is exactly right for ONE kind of failure and
+# exactly wrong for the other.
+#
+#   SAFETY  the reply ASSERTS SOMETHING UNTRUE: a doctor who does not
+#           exist, a date no tool returned, a booking that was never
+#           made, a medication. A patient can act on any of these and
+#           be harmed by it. If the model cannot produce a clean version
+#           in two attempts, saying nothing is genuinely better.
+#
+#   FLOW    the reply asks the wrong QUESTION, or asks at the wrong
+#           step: re-requesting a reference they already gave, offering
+#           the soonest date instead of the day they named, handing back
+#           the specialty question. Clumsy, and worth one corrective
+#           retry - but every word in it is true, and the patient can
+#           still act on it. Replacing it with a technical error turns a
+#           slightly awkward turn into a dead one.
+#
+# CONFIRMED REAL PRODUCTION FAILURE (medtown, 2026-09-01 09:12): a
+# FLOW verifier misfired on a completely correct reply - "معنديش فرع
+# اسمه النيل. لكن عندنا هالفروع المتاحة حاليًا: 1️⃣ المنار 2️⃣ النزهة" -
+# fired again on the retry, and the patient received "حدث خطأ تقني 😕.
+# تحاول مرة ثانية؟" instead of their answer. The verifier's own comment
+# already says a verifier being wrong should cost one wasted call and
+# never the whole conversation; for FLOW checks, this is what makes that
+# true.
+#
+# SAFETY is the DEFAULT. An entry in `_REPLY_VERIFIERS` that does not
+# say otherwise keeps today's strict behaviour exactly, so nothing
+# loosens by omission - only the entries explicitly tagged below change.
+_SAFETY = "safety"
+_FLOW = "flow"
+
+# Tagged by the distinctive part of each entry's own description, so the
+# table itself stays a plain list of triples and this classification
+# lives in one readable place instead of being scattered through it.
+_FLOW_VERIFIER_MARKERS = (
+    "already contained",
+    "already on the table",
+    "never checked with resolve_available_day",
+    "already supplied",
+    "generic out-of-scope service menu",
+    "already been locked in",
+    "just-shown day list",
+    "reference-or-phone question ever being asked",
+    "already specifically chose to identify by",
+    "already has a verified phone",
+    "before a doctor was confirmed and a time slot was selected",
+    "should have been treated as another OTP retry",
+    "right after the patient agreed to proceed on the channel number",
+    "instead of showing the doctors",
+    "instead of showing that doctor's own schedule",
+    "printed the specialty catalogue",
+    "re-send a full name that already had at least two parts",
+    "offered the doctor roster again",
+    "instead of continuing",
+)
+
+
+def _verifier_severity(description: str) -> str:
+    """SAFETY unless the description matches a known FLOW marker."""
+
+    for marker in _FLOW_VERIFIER_MARKERS:
+        if marker in description:
+            return _FLOW
+    return _SAFETY
+
+
 _REPLY_VERIFIERS = (
+    (
+        lambda reply, state, agent_name: _reply_scope_refuses_a_health_message(reply, state),
+        lambda reply, state: _health_message_refusal_correction(reply, state),
+        "reply answered a medication question or a self-harm disclosure with the "
+        "generic out-of-scope service menu",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            agent_name in _EXISTING_BOOKING_AGENTS
+            and _reply_reasks_which_booking_when_only_one_is_on_the_table(reply, state)
+        ),
+        lambda reply, state: _just_booked_correction(reply, state),
+        "reply asked the patient to identify a booking that is already on the table "
+        "in this conversation",
+    ),
+    (
+        lambda reply, state, agent_name: (
+            agent_name in _EXISTING_BOOKING_AGENTS
+            and _reply_reasks_an_identifier_already_supplied(reply, state)
+        ),
+        lambda reply, state: _supplied_identifier_correction(reply, state),
+        "reply asked for a booking reference or phone number that the patient's own "
+        "last message already contained",
+    ),
     (
         lambda reply, state, agent_name: (
             agent_name in _NEW_BOOKING_AGENTS
@@ -7932,7 +8738,7 @@ _CANCELLATION_CORRECTION_DIRECTIVE = (
 )
 
 
-def _build_out_of_scope_block(templates: dict) -> str:
+def _build_out_of_scope_block(templates: dict, language: str = "ar") -> str:
     """The clinic's scope refusal, as ONE fixed text.
 
     Built from the client's own agent/clinic name so it is branded, and
@@ -7941,18 +8747,48 @@ def _build_out_of_scope_block(templates: dict) -> str:
     polite deflection each turn.
 
     A client can author their own via `msg_out_of_scope`.
+
+    ENGLISH CONVERSATIONS GET AN ENGLISH BLOCK. This text used to be
+    Arabic and nothing else, so the one message in the whole system that
+    is pinned word-for-word was also the one guaranteed to come out in
+    the wrong language. CONFIRMED IN PRODUCTION: a conversation held
+    entirely in English received the full Arabic paragraph. Everything
+    else in this file goes to some length to keep a reply in the
+    patient's own language; this was quietly exempt from all of it.
     """
 
     authored = (templates or {}).get("msg_out_of_scope")
     if authored and authored.strip():
         return authored.replace("\r\n", "\n").replace("\r", "\n").strip()
 
+    templates = templates or {}
+
+    if language == "en":
+        agent_name = (
+            templates.get("_agent_name")
+            or templates.get("_agent_name_ar")
+            or "the virtual assistant"
+        )
+        clinic_name = (
+            templates.get("_clinic_name")
+            or templates.get("_clinic_name_ar")
+            or "the hospital"
+        )
+        return (
+            f"I'm sorry 🌷 I'm {agent_name}, the virtual assistant at "
+            f"{clinic_name}, and I can help you with the hospital's own "
+            "services - booking, changing or cancelling appointments, "
+            "choosing the right specialty or doctor, questions about our "
+            "services, filing a complaint, or putting you through to "
+            "customer service.\n"
+            "I'd be glad to help with any of those 😊"
+        )
+
     # The block is Arabic, so the ARABIC name fields come first. Using
     # `_agent_name`/`_clinic_name` here put "أنا Latifa، المساعدة
     # الافتراضية في Dar El Oyoun Hospitals" into an otherwise Arabic
     # sentence - a Latin-script name mid-sentence in RTL text, in the
     # one message that is supposed to be the clinic's most polished.
-    templates = templates or {}
     agent_name = (
         templates.get("_agent_name_ar")
         or templates.get("_agent_name")
@@ -7973,7 +8809,7 @@ def _build_out_of_scope_block(templates: dict) -> str:
     )
 
 
-def _build_scope_directive(templates: dict) -> str:
+def _build_scope_directive(templates: dict, language: str = "ar") -> str:
     """Always present, deliberately short.
 
     CONFIRMED REAL PRODUCTION FAILURE: asked "موسم الرياض خلص ولا لسه"
@@ -7986,7 +8822,7 @@ def _build_scope_directive(templates: dict) -> str:
     stated with confidence and no source.
     """
 
-    block = _build_out_of_scope_block(templates)
+    block = _build_out_of_scope_block(templates, language)
 
     return (
         "============================================================\n"
@@ -8187,8 +9023,19 @@ def _is_scope_refusal(reply_text: str, templates: dict) -> bool:
     if _SCOPE_REFUSAL_ANCHOR_RE.search(_norm_ar(reply_text)):
         return True
 
-    block = _build_out_of_scope_block(templates)
-    return bool(block) and _normalize_for_compare(block) in _normalize_for_compare(reply_text)
+    # BOTH LANGUAGES, always. The block is language-specific now, but
+    # this function's callers are not: the greeting guard passes no
+    # language, and a verifier can be looking at a draft written in the
+    # other one. Checking only the "current" language would let the
+    # refusal through unrecognised in exactly the mixed-language cases
+    # these guards exist for.
+    normalized_reply = _normalize_for_compare(reply_text)
+    for candidate_language in ("ar", "en"):
+        block = _build_out_of_scope_block(templates, candidate_language)
+        if block and _normalize_for_compare(block) in normalized_reply:
+            return True
+
+    return False
 
 
 _BRANCH_DENIAL_RE = re.compile(
@@ -9484,7 +10331,35 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
     branch_question_directive = _build_branch_question_directive(
         state["messages"], state.get("session_id"), agent_name,
     )
-    scope_directive = _build_scope_directive(state.get("templates") or {})
+    scope_directive = _build_scope_directive(
+        state.get("templates") or {}, target_language or "ar",
+    )
+
+    # HEALTH MESSAGES THE SCOPE REFUSAL MUST NOT ANSWER. Built for every
+    # specialist, not just `medical`: neither of these messages scores
+    # on any router cue, so they stay with whichever agent was already
+    # active - and that is exactly how a patient asking for a dose ended
+    # up with the service menu.
+    supplied_identifier_directive = (
+        _build_supplied_identifier_directive(state["messages"])
+        if agent_name in _EXISTING_BOOKING_AGENTS else ""
+    )
+
+    # "الغيه" / "عدله" about the booking already on the table. Suppressed
+    # when the patient typed a reference of their own - that one wins,
+    # and the directive above is already acting on it.
+    just_booked_directive = (
+        _build_just_booked_directive(state["messages"])
+        if (agent_name in _EXISTING_BOOKING_AGENTS
+            and not supplied_identifier_directive) else ""
+    )
+
+    crisis_directive = _build_crisis_directive(
+        state["messages"], state.get("templates") or {},
+    )
+    medication_directive = _build_medication_request_directive(
+        state["messages"], state.get("templates") or {},
+    )
     review_phone_directive = _build_review_card_phone_directive(state, state.get("session_id"))
     selected_slot_directive = _build_selected_slot_directive(state.get("session_id"))
 
@@ -9520,7 +10395,8 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         + branches_info_directive
         + bare_doctor_directive + show_all_doctors_directive
         + doctor_branches_directive + branch_question_directive
-        + review_phone_directive + selected_slot_directive + scope_directive
+        + review_phone_directive + selected_slot_directive
+        + supplied_identifier_directive + just_booked_directive + scope_directive
         + empty_branch_directive + branch_pick_directive + day_pick_directive
         + negation_directive
         + service_chosen_directive + service_named_directive
@@ -9550,6 +10426,12 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
         # explicitly overriding) channel-identity directive AFTER it
         # gives it the final word for this turn.
         + channel_identity_directive
+        # LAST, and in this order. Both override the scope refusal, and
+        # the scope refusal is itself deliberately emphatic - the same
+        # reason channel identity had to be moved down here. Crisis goes
+        # after medication because if a message is somehow both, the
+        # crisis response is the only acceptable reply.
+        + medication_directive + crisis_directive
     )
 
     if not state.get("greeted"):
@@ -9757,25 +10639,46 @@ def _run_agent(state: AgentState, agent_name: str) -> dict:
                 continue
 
             if check(retry.content, state, agent_name):
-                # ZERO-TOLERANCE FALLBACK.
+                # FAILED THE SAME CHECK TWICE. What happens now depends
+                # on WHAT the check protects - see `_verifier_severity`.
+                severity = _verifier_severity(description)
+
+                if severity == _FLOW:
+                    # Every word of this reply is true; it just asks the
+                    # wrong question or sits at the wrong step. Sending
+                    # it costs the patient one clumsy turn. Sending
+                    # "حدث خطأ تقني" costs them the answer entirely, and
+                    # if the verifier itself is the thing that is wrong -
+                    # which twice in a row strongly suggests - it costs
+                    # them a perfectly good answer.
+                    #
+                    # CONFIRMED REAL PRODUCTION FAILURE this prevents:
+                    # "معنديش فرع اسمه النيل. لكن عندنا هالفروع المتاحة
+                    # حاليًا: 1️⃣ المنار 2️⃣ النزهة" - correct, useful,
+                    # and replaced with a technical error because a flow
+                    # check misread it as re-asking a question.
+                    logger.error(
+                        "agent[%s]: FLOW check failed twice (%s) - keeping the reply "
+                        "rather than replacing it with the technical-error message. "
+                        "THE VERIFIER IS PROBABLY WRONG HERE; nothing it guards is "
+                        "unsafe to send. Reply: %r",
+                        agent_name, description, normalized,
+                    )
+                    continue
+
+                # ZERO-TOLERANCE FALLBACK, for SAFETY checks only.
                 #
-                # Before this change, failing the SAME check twice (once
-                # on the original draft, once on the corrective retry)
+                # Before this existed, failing the SAME check twice
                 # still ended with the original, already-flagged reply
-                # going out to the patient unmodified - the `continue`
-                # here fell through to the bottom of the loop with
-                # `normalized` untouched. CONFIRMED REAL PRODUCTION
+                # going out unmodified. CONFIRMED REAL PRODUCTION
                 # FAILURE: the branch-name verifier logged this exact
                 # "STILL failed after correction" error and the patient
                 # was sent the flagged reply anyway five seconds later.
                 #
-                # A verifier firing twice in a row means the model
-                # cannot self-correct this claim right now - the safer
-                # move is to never let an unverified, twice-flagged claim
-                # reach the patient at all, even if that means a generic
-                # "try again" instead of a fluent (but unverified) reply.
-                # A slightly worse turn is a much better outcome than a
-                # confidently wrong one.
+                # A safety verifier firing twice means the model cannot
+                # stop asserting something no tool supports. A generic
+                # "try again" is a much better outcome than a
+                # confidently wrong claim the patient may act on.
                 logger.error(
                     "agent[%s]: reply STILL failed the same check after correction (%s) - "
                     "replacing with the safe fallback message rather than sending the "
