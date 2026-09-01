@@ -211,6 +211,41 @@ _CUES: Dict[str, List[Tuple[int, str]]] = {
         (6, r"(?:الوجع|الالم)\s*(?:مش|ما)\s*(?:بيروح|يروح|بينتهي)"),
         (3, r"(?:نصيحه\s*طبيه|استشاره\s*طبيه|توجيه\s*طبي)"),
         (3, r"\bmedical\s+(?:advice|guidance|consultation)\b"),
+
+        # ASKING FOR A MEDICINE OR A DOSE, and SAYING THEY WANT TO
+        # HARM THEMSELVES. Neither scored anything at all before, so
+        # both stayed with whichever specialist happened to be active
+        # - and most of them had never been given the medication ban
+        # or the crisis rules, which live in the MEDICAL GUIDANCE
+        # section of the prompt. CONFIRMED IN PRODUCTION: "Just tell
+        # me the normal adult dose, everyone knows it anyway" scored
+        # {} and was answered with the service menu.
+        #
+        # THE TWO ARE WEIGHTED DIFFERENTLY, on purpose.
+        #
+        # CRISIS (12) switches even mid-flow. A patient who says they
+        # want to hurt themselves has stopped booking, and everything
+        # else genuinely must stop with them.
+        #
+        # MEDICATION (7) does NOT - it sits deliberately below
+        # _SWITCH_THRESHOLD (8), so it can pick `medical` when nothing
+        # is active but cannot interrupt a flow in progress. A patient
+        # halfway through a booking who asks "الجرعة كام؟" wants the
+        # answer AND their booking; switching specialists mid-flow
+        # would hand the turn to an agent with no booking tools and no
+        # booking prompt, and the question does not need it - graph.py
+        # builds the medication directive for EVERY specialist, keyed
+        # on the message rather than on who won the routing. So the
+        # booking agent answers the medication question properly and
+        # carries straight on. The weight only decides who takes a turn
+        # that nothing else already owns.
+        (7, r"(?:ال)?(?:جرعه|جرعة)|\b(?:dose|dosage|dosing)\b"),
+        (7, r"(?:اخد|اخذ|اشرب|اتناول)\s*(?:ايه|ايش|وش|شنو|كام)"),
+        (7, r"(?:ادي|اديني|اعطيني|عطيني|وصفلي|اكتبلي)\w*\s*(?:\w+\s+){0,2}(?:دوا|دواء|علاج|مسكن|حبوب)"),
+        (7, r"\bwhat\s+(?:should|can|do)\s+i\s+take\b"),
+        (7, r"\bhow\s+(?:many|much|often)\b[^.\n?]{0,30}\b(?:painkiller|paracetamol|panadol|ibuprofen|tablet|pill|dose|mg)\w*"),
+        (12, r"(?:ه|ح|سا|سأ)?انتحر|(?:ه|ح)نتحر|الانتحار|\bsuicid\w*|\bkill\s+my\s?self\b|\bend\s+my\s+life\b|\bwant\s+to\s+die\b"),
+        (12, r"(?:اذي|أذي|اؤذي|أؤذي)\s*نفسي|\bhurt\s+my\s?self\b|\bself[\s-]?harm\b"),
     ],
 
     "complaint": [
