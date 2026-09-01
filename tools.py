@@ -2764,19 +2764,150 @@ def _resolve_doctor_id(state: AgentState, ref_number: str, language: Optional[st
     return {"status": "found", "doctor_id": doctor_id}
 
 
+# WEEKDAY VOCABULARY - deliberately much wider than "correct" Arabic.
+#
+# WHY: this map is the ONLY thing standing between "the patient named a
+# day" and "the day was silently thrown away". Every spelling that
+# fails to resolve here makes `resolve_available_day` return an error,
+# and the model then falls back to showing the soonest date instead -
+# i.e. it ignores the day the patient actually asked for.
+#
+# CONFIRMED REAL GAP: "عاوزه احجز معاد مع دكتور احمد العقيل يوم التلات"
+# - "التلات" is how Tuesday is written in everyday Egyptian, and it was
+# not in this map at all, so the request resolved to nothing. The same
+# was true of "الاتنين", "الاربع", "الحد", "الجمعه" and every other
+# form people actually type. Formal MSA spellings are the exception in
+# a WhatsApp message, not the rule.
+#
+# Keys are matched against `_fold_weekday_token`'s output, so hamza
+# forms (أ/إ/آ -> ا), ta-marbuta (ة -> ه), tatweel, diacritics and the
+# leading "ال" are already normalised away by the time a lookup runs -
+# every key below is written in that same folded form.
 _WEEKDAY_NAMES = {
-    # English (case-insensitive)
-    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-    "friday": 4, "saturday": 5, "sunday": 6,
-    # Arabic
-    "الاثنين": 0, "الإثنين": 0, "اثنين": 0,
-    "الثلاثاء": 1, "ثلاثاء": 1,
-    "الأربعاء": 2, "الاربعاء": 2, "أربعاء": 2, "اربعاء": 2,
-    "الخميس": 3, "خميس": 3,
-    "الجمعة": 4, "جمعة": 4,
-    "السبت": 5, "سبت": 5,
-    "الأحد": 6, "الاحد": 6, "أحد": 6, "احد": 6,
+    # English + common short forms (case-insensitive)
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+
+    # Arabic - MSA, Egyptian and Gulf colloquial, all in folded form.
+    "اثنين": 0, "الاثنين": 0, "تنين": 0, "التنين": 0, "اتنين": 0, "الاتنين": 0,
+    "ثلاثاء": 1, "الثلاثاء": 1, "تلاتاء": 1, "التلاتاء": 1,
+    "ثلاث": 1, "الثلاث": 1, "تلات": 1, "التلات": 1, "ثلثاء": 1, "الثلثاء": 1,
+    "اربعاء": 2, "الاربعاء": 2, "اربع": 2, "الاربع": 2, "روبع": 2, "الروبع": 2,
+    "خميس": 3, "الخميس": 3,
+    "جمعه": 4, "الجمعه": 4, "جمعة": 4,
+    "سبت": 5, "السبت": 5,
+    "احد": 6, "الاحد": 6, "حد": 6, "الحد": 6,
+
+    # Arabizi / franco-arabe, as typed on a Latin keyboard.
+    "eltalat": 1, "talat": 1, "eltalata": 1, "talata": 1,
+    "eltnen": 0, "etnen": 0, "itnin": 0, "elitnen": 0,
+    "elarbaa": 2, "arbaa": 2, "arbe3": 2, "elarbe3": 2,
+    "elkhamis": 3, "khamis": 3, "el5amis": 3, "5amis": 3,
+    "elgomaa": 4, "gomaa": 4, "goma3a": 4, "elgom3a": 4, "gom3a": 4,
+    "elsabt": 5, "sabt": 5, "essabt": 5,
+    "elhad": 6, "had": 6, "elahad": 6, "ahad": 6,
 }
+
+# Arabic letters that different keyboards/habits render differently.
+# Folding them means one map entry covers every variant instead of the
+# map needing a row per spelling.
+_WEEKDAY_FOLD_MAP = {
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ة": "ه",
+    "ى": "ي", "ئ": "ي",
+    "ؤ": "و",
+}
+
+_WEEKDAY_DIACRITICS_RE = re.compile(r"[ً-ْـ]")
+
+# Punctuation, quotes and whitespace clinging to either end of a word -
+# stripped so "(التلات)" and "التلات،" fold to the same key.
+_WEEKDAY_EDGE_PUNCT_RE = re.compile(r"^[\s\W_]+|[\s\W_]+$", re.UNICODE)
+
+
+def _fold_weekday_token(text: Optional[str]) -> str:
+    """Normalise one word so every spelling of a weekday lands on the
+    same `_WEEKDAY_NAMES` key: strip diacritics/tatweel, unify hamza and
+    ta-marbuta, drop surrounding punctuation, lowercase Latin text.
+
+    The leading "ال" is NOT stripped here - both the bare and the
+    prefixed forms are listed explicitly in the map instead, because
+    blind prefix-stripping would turn unrelated words ("الحجز") into
+    near-misses for real day names."""
+
+    if not text:
+        return ""
+
+    folded = _WEEKDAY_DIACRITICS_RE.sub("", str(text).strip())
+    folded = "".join(_WEEKDAY_FOLD_MAP.get(ch, ch) for ch in folded)
+    folded = _WEEKDAY_EDGE_PUNCT_RE.sub('', folded)
+    return folded.lower()
+
+
+# Day names that are ALSO ordinary Arabic words. Read out of a longer
+# sentence they produce real false positives - "ايه الحد الأقصى للحجز؟"
+# is a question about a limit, not a request for Sunday, and
+# "الفروع الثلاث" is a count, not Tuesday. Inside a longer text these
+# only count as a day when something marks them as one.
+_AMBIGUOUS_WEEKDAY_KEYS = frozenset({
+    "حد", "الحد", "ثلاث", "الثلاث", "اربع", "الاربع",
+    "تنين", "التنين", "سبت", "جمعه", "احد",
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun", "thur",
+})
+
+# The words that mark the next token as a day of the week.
+_WEEKDAY_CUE_WORDS = frozenset({
+    "يوم", "اليوم", "ايام", "الايام", "يومي", "بيوم", "ليوم",
+    "day", "on", "this", "next", "coming",
+})
+
+
+def resolve_weekday_index(weekday_text: Optional[str]) -> Optional[int]:
+    """Weekday index (Monday=0 .. Sunday=6) for ANY spelling a patient
+    or the model might use, or None when the text names no weekday.
+
+    Accepts a bare day name ("التلات"), a short phrase around one
+    ("يوم التلات", "on tuesday"), or a whole sentence - the words are
+    folded one at a time and the first that resolves wins. Word-level
+    matching (rather than substring) is what stops "الجمعية" from being
+    read as Friday.
+
+    A token in `_AMBIGUOUS_WEEKDAY_KEYS` only counts when the text is
+    JUST that word (someone answering "الحد" to "which day?" means
+    Sunday and nothing else) or when a cue word marks it as a day
+    ("يوم الحد"). Anywhere else in a sentence it is ignored, because the
+    cost of reading "الحد الأقصى" as Sunday - a booking steered onto a
+    day nobody asked for - is far higher than the cost of missing one
+    unusual phrasing, which merely falls back to the normal flow.
+    """
+
+    if not weekday_text:
+        return None
+
+    whole = _fold_weekday_token(weekday_text)
+    if whole in _WEEKDAY_NAMES:
+        # The entire message IS the day name - no ambiguity to resolve.
+        return _WEEKDAY_NAMES[whole]
+
+    words = [w for w in re.split(r"[\s/،,]+", str(weekday_text)) if w]
+
+    for position, word in enumerate(words):
+        folded = _fold_weekday_token(word)
+        index = _WEEKDAY_NAMES.get(folded)
+        if index is None:
+            continue
+        if folded not in _AMBIGUOUS_WEEKDAY_KEYS:
+            return index
+        previous = _fold_weekday_token(words[position - 1]) if position else ""
+        if previous in _WEEKDAY_CUE_WORDS:
+            return index
+
+    return None
 
 
 @tool
@@ -2808,8 +2939,7 @@ def get_next_weekday_date(
     {"status": "found", "date": "YYYY-MM-DD", "weekday_name": "Thursday"}
     {"status": "error"}  # unrecognized weekday name or bad after_date"""
 
-    key = (weekday_name or "").strip().lower()
-    target_weekday = _WEEKDAY_NAMES.get(key)
+    target_weekday = resolve_weekday_index(weekday_name)
 
     if target_weekday is None:
         logger.warning("get_next_weekday_date: unrecognized weekday_name=%r", weekday_name)
@@ -5373,8 +5503,23 @@ def resolve_available_day(
         # leaves full days out so nobody is invited to pick one, and
         # this status is what comes back when they ask anyway.
     {"status": "not_found"}  # the doctor does not work that weekday here at all
+        # Say EXACTLY that - the doctor has no clinic on that weekday at
+        # this branch - and then, in the SAME turn, call
+        # `list_available_days_for_booking` and show the days they DO
+        # have. Never answer a named day by quietly showing the soonest
+        # date as if the patient had not named one.
+    {"status": "unrecognized_day", "weekday_text": "..."}
+        # `weekday_name` was not a day of the week at all. Ask which day
+        # they meant - do NOT guess one, and do NOT fall through to
+        # showing the soonest date.
     {"status": "missing_doctor"} / {"status": "missing_branch"}
-    {"status": "not_configured"} / {"status": "error"}"""
+    {"status": "not_configured"} / {"status": "error"}
+
+    WEEKDAY SPELLING: pass the patient's own word through unchanged if
+    you like - Egyptian/Gulf colloquial ("التلات", "الاتنين", "الحد"),
+    MSA ("الثلاثاء"), English ("Tuesday"/"tue") and franco-arabe
+    ("eltalat") all resolve. You never need to translate or "correct"
+    the day name before calling."""
 
     session_id = state.get("session_id")
     session = _get_booking_session(session_id)
@@ -5384,11 +5529,17 @@ def resolve_available_day(
     if not doctor_id:
         return {"status": "missing_doctor"}
 
-    key = (weekday_name or "").strip().lower()
-    target_weekday = _WEEKDAY_NAMES.get(key)
+    target_weekday = resolve_weekday_index(weekday_name)
     if target_weekday is None:
+        # NOT "error" - the two need completely different handling.
+        # "error" means the lookup itself broke and the patient should
+        # be told something went wrong; THIS means the word was not
+        # recognised as a day at all, and the only correct response is
+        # to ask which day they meant. Falling back to "show the
+        # soonest date" is exactly how a day the patient named used to
+        # get silently discarded.
         logger.warning("resolve_available_day: unrecognized weekday_name=%r", weekday_name)
-        return {"status": "error"}
+        return {"status": "unrecognized_day", "weekday_text": weekday_name}
 
     base_url = _doctors_base_url(state)
     if not base_url:
@@ -5539,7 +5690,22 @@ def resolve_available_day(
                 "weekday_display": _display_weekday_name(target_weekday, conversation_language(state)),
             }
 
-        return {"status": "not_found"}
+        # THE WEEKDAY RIDES BACK EVEN ON A MISS.
+        #
+        # The reply to a "not_found" has to NAME the day - "الدكتور ما
+        # عنده عيادة يوم الثلاثاء" - and graph.py's
+        # `_reply_invents_availability` verifier flags any weekday in a
+        # reply that appears in no availability-tool result. A bare
+        # {"status": "not_found"} therefore made the one correct answer
+        # to this situation look like a fabricated day, and the verifier
+        # would reject it twice and fall through to the generic error
+        # message. Echoing the resolved day back keeps the check honest
+        # and costs nothing.
+        return {
+            "status": "not_found",
+            "weekday_name": _ENGLISH_WEEKDAY_BY_INDEX.get(target_weekday, ""),
+            "weekday_display": _display_weekday_name(target_weekday, conversation_language(state)),
+        }
 
     candidates.sort()
     chosen_dt = candidates[0]
